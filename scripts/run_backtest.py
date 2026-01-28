@@ -52,7 +52,7 @@ DEFAULT_MARGIN_MAINT = Decimal("0.025")
 DEFAULT_BOOK_TYPE = "L2_MBP"
 
 REQUIRED_FIELDS = {
-    "run_id",
+    "backtest_id",
     "schema_version",
     "requested_by",
     "strategy_file",
@@ -121,8 +121,8 @@ def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> Path:
         raise ValueError("RunSpec strategy_file must be a non-empty string.")
     strategy_path = _resolve_strategy_file(run_spec_path, run_spec["strategy_file"])
 
-    if not isinstance(run_spec.get("run_id"), str) or not run_spec["run_id"].strip():
-        raise ValueError("RunSpec run_id must be a non-empty string.")
+    if not isinstance(run_spec.get("backtest_id"), str) or not run_spec["backtest_id"].strip():
+        raise ValueError("RunSpec backtest_id must be a non-empty string.")
 
     _validate_time_order(run_spec["start"], run_spec["end"])
     return strategy_path
@@ -441,9 +441,9 @@ def _migrate_legacy_catalog_data(
                 )
 
 
-def _build_status_payload(run_id: str, run_spec: dict) -> dict:
+def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
     return {
-        "run_id": run_id,
+        "backtest_id": backtest_id,
         "requested_by": run_spec["requested_by"],
         "strategy_entry": run_spec["strategy_entry"],
         "strategy_file": run_spec["strategy_file"],
@@ -466,13 +466,13 @@ def main() -> int:
     run_spec = _load_run_spec(run_spec_path)
     strategy_file_path = _validate_run_spec(run_spec, run_spec_path)
 
-    run_id = run_spec["run_id"]
+    backtest_id = run_spec["backtest_id"]
     log_root = os.environ.get("BACKTEST_LOGS_PATH", "/opt/backtest_logs")
-    log_dir = Path(log_root) / run_id
+    log_dir = Path(log_root) / backtest_id
     status_path = log_dir / "status.json"
 
     started_at = datetime.now(timezone.utc).isoformat()
-    status = _build_status_payload(run_id, run_spec)
+    status = _build_status_payload(backtest_id, run_spec)
     status.update({"status": "running", "started_at": started_at})
     _write_status(status_path, status)
 

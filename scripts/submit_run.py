@@ -72,14 +72,14 @@ def extract_run_id(response_body: str) -> str | None:
         data = json.loads(response_body)
     except json.JSONDecodeError:
         return None
-    if isinstance(data, dict) and data.get("run_id"):
-        return str(data["run_id"])
+    if isinstance(data, dict) and data.get("backtest_id"):
+        return str(data["backtest_id"])
     return None
 
 
-def write_run_id_history(run_id: str, history_path: Path) -> None:
+def write_run_id_history(backtest_id: str, history_path: Path) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    new_line = f"{timestamp} {run_id}\n"
+    new_line = f"{timestamp} {backtest_id}\n"
     if history_path.exists():
         existing = history_path.read_text(encoding="utf-8")
     else:
@@ -132,12 +132,12 @@ def main() -> int:
         with urllib.request.urlopen(req) as resp:
             body = resp.read().decode("utf-8")
             print(body)
-            run_id = extract_run_id(body)
-            if run_id:
+            backtest_id = extract_run_id(body)
+            if backtest_id:
                 history_path = Path(__file__).resolve().parent / "backtest_run_id_history"
-                write_run_id_history(run_id, history_path)
+                write_run_id_history(backtest_id, history_path)
             else:
-                print("run_id not found in response; skip writing history", file=sys.stderr)
+                print("backtest_id not found in response; skip writing history", file=sys.stderr)
             return 0
     except urllib.error.HTTPError as exc:
         print(exc.read().decode("utf-8"))

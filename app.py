@@ -90,7 +90,7 @@ BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.99.101.120:1
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
 BACKTEST_LOGS_PATH = env_or_default("BACKTEST_LOGS_PATH", "/backtests/{backtest_docker_run_id}/logs")
-BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/runs/backtest/{backtest_id}")
+BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 
 RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
 
@@ -235,10 +235,10 @@ def write_mapping(mapping: dict[str, Any]) -> None:
         json.dump(mapping, handle, ensure_ascii=True, indent=2)
 
 
-def update_mapping(run_id: str, backtest_docker_run_id: str) -> None:
+def update_mapping(backtest_id: str, backtest_docker_run_id: str) -> None:
     with MAPPING_LOCK:
         mapping = read_mapping()
-        mapping[run_id] = {"backtest_docker_run_id": backtest_docker_run_id, "created_at": utc_now()}
+        mapping[backtest_id] = {"backtest_docker_run_id": backtest_docker_run_id, "created_at": utc_now()}
         write_mapping(mapping)
 
 
@@ -276,17 +276,17 @@ def backtest_headers() -> dict[str, str]:
 
 
 def submit_to_backtest(
-    run_id: str,
+    backtest_id: str,
     run_spec_bytes: bytes,
     strategy_filename: str,
     strategy_bytes: bytes,
     runner_bytes: bytes,
 ) -> str:
     url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_SUBMIT_PATH}"
-    logger.info("submit_to_backtest start run_id=%s url=%s", run_id, url)
+    logger.info("submit_to_backtest start backtest_id=%s url=%s", backtest_id, url)
     # backtest docker 最新接口字段名：backtest_id / runer / strategies / configs
     form_body, content_type = build_multipart_form(
-        fields=[("backtest_id", run_id)],
+        fields=[("backtest_id", backtest_id)],
         files=[
             ("runer", "run_backtest.py", "text/x-python", runner_bytes),
             ("strategies", strategy_filename, "text/x-python", strategy_bytes),
@@ -302,47 +302,47 @@ def submit_to_backtest(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8")
         logger.warning(
-            "backtest_http_error run_id=%s status=%s detail=%s",
-            run_id,
+            "backtest_http_error backtest_id=%s status=%s detail=%s",
+            backtest_id,
             exc.code,
             detail[:200] if detail else "",
         )
         raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
     except Exception as exc:
-        logger.exception("backtest_request_failed run_id=%s", run_id)
+        logger.exception("backtest_request_failed backtest_id=%s", backtest_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     backtest_docker_run_id = payload.get("run_id")
     if not backtest_docker_run_id:
-        logger.warning("backtest_id_missing run_id=%s payload_keys=%s", run_id, sorted(payload.keys()))
+        logger.warning("backtest_id_missing backtest_id=%s payload_keys=%s", backtest_id, sorted(payload.keys()))
         raise HTTPException(status_code=502, detail="backtest_docker_run_id missing from response")
-    logger.info("submit_to_backtest success run_id=%s backtest_docker_run_id=%s", run_id, backtest_docker_run_id)
+    logger.info("submit_to_backtest success backtest_id=%s backtest_docker_run_id=%s", backtest_id, backtest_docker_run_id)
     return str(backtest_docker_run_id)
 
 
-def fetch_backtest_status(run_id: str) -> dict[str, Any]:
-    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_STATUS_PATH.format(backtest_id=run_id)}"
+def fetch_backtest_status(backtest_id: str) -> dict[str, Any]:
+    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_STATUS_PATH.format(backtest_id=backtest_id)}"
     req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
     try:
-        logger.info("fetch_backtest_status start backtest_id=%s url=%s", run_id, url)
+        logger.info("fetch_backtest_status start backtest_id=%s url=%s", backtest_id, url)
         with urllib.request.urlopen(req) as resp:
             body = resp.read()
             payload = json.loads(body.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8")
         logger.warning(
-            "fetch_backtest_status_http_error run_id=%s status=%s detail=%s",
-            run_id,
+            "fetch_backtest_status_http_error backtest_id=%s status=%s detail=%s",
+            backtest_id,
             exc.code,
             detail[:200] if detail else "",
         )
         raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
     except Exception as exc:
-        logger.exception("fetch_backtest_status_failed run_id=%s", run_id)
+        logger.exception("fetch_backtest_status_failed backtest_id=%s", backtest_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     if not isinstance(payload, dict):
-        logger.warning("fetch_backtest_status_invalid_payload backtest_id=%s", run_id)
+        logger.warning("fetch_backtest_status_invalid_payload backtest_id=%s", backtest_id)
         raise HTTPException(status_code=502, detail="backtest status invalid response")
 
     return {
@@ -391,30 +391,30 @@ async def create_run(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # 3) 生成 run_id，并在本地保存上传内容，便于排查与追踪
-    run_id = make_run_id()
-    logger.info("create_run_generated run_id=%s", run_id)
+    backtest_id = make_run_id()
+    logger.info("create_run_generated backtest_id=%s", backtest_id)
 
-    run_dir = RUN_STORAGE_PATH / run_id
+    run_dir = RUN_STORAGE_PATH / backtest_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # 4) 保存策略文件（只保留文件名，避免路径穿越）
     strategy_filename = Path(strategy_file.filename or "strategy.py").name
     strategy_bytes = await strategy_file.read()
     if not strategy_bytes:
-        logger.warning("create_run_empty_strategy run_id=%s", run_id)
+        logger.warning("create_run_empty_strategy backtest_id=%s", backtest_id)
         raise HTTPException(status_code=400, detail="strategy_file is empty")
     strategy_path = run_dir / strategy_filename
     strategy_path.write_bytes(strategy_bytes)
 
     # 5) 将 run_spec 中的 strategy_file 更新为实际保存的文件名，并落盘
     run_spec_payload["strategy_file"] = strategy_filename
-    run_spec_payload["run_id"] = run_id
+    run_spec_payload["backtest_id"] = backtest_id
     run_spec_path = run_dir / "run_spec.json"
     run_spec_bytes = json.dumps(run_spec_payload, ensure_ascii=True, indent=2).encode("utf-8")
     run_spec_path.write_bytes(run_spec_bytes)
     logger.info(
-        "create_run_saved run_id=%s strategy_filename=%s run_spec_bytes=%s strategy_bytes=%s",
-        run_id,
+        "create_run_saved backtest_id=%s strategy_filename=%s run_spec_bytes=%s strategy_bytes=%s",
+        backtest_id,
         strategy_filename,
         len(run_spec_bytes),
         len(strategy_bytes),
@@ -422,75 +422,75 @@ async def create_run(
 
     # 6) 从本仓库读取 run_backtest.py，并一并转发给 backtest docker
     if not RUNNER_PATH.is_file():
-        logger.error("create_run_missing_runner run_id=%s path=%s", run_id, RUNNER_PATH)
+        logger.error("create_run_missing_runner backtest_id=%s path=%s", backtest_id, RUNNER_PATH)
         raise HTTPException(status_code=500, detail="run_backtest.py not found")
     runner_bytes = RUNNER_PATH.read_bytes()
 
     # 7) 调用 backtest docker 提交任务，获取 backtest_docker_run_id
     backtest_docker_run_id = submit_to_backtest(
-        run_id=run_id,
+        backtest_id=backtest_id,
         run_spec_bytes=run_spec_bytes,
         strategy_filename=strategy_filename,
         strategy_bytes=strategy_bytes,
         runner_bytes=runner_bytes,
     )
 
-    # 8) 维护 run_id -> backtest_docker_run_id 映射，供日志下载与状态查询
-    update_mapping(run_id, backtest_docker_run_id)
-    logger.info("create_run_submitted run_id=%s backtest_docker_run_id=%s", run_id, backtest_docker_run_id)
+    # 8) 维护 backtest_id -> backtest_docker_run_id 映射，供日志下载与状态查询
+    update_mapping(backtest_id, backtest_docker_run_id)
+    logger.info("create_run_submitted backtest_id=%s backtest_docker_run_id=%s", backtest_id, backtest_docker_run_id)
 
     return JSONResponse(
         {
-            "run_id": run_id,
+            "backtest_id": backtest_id,
             "backtest_docker_run_id": backtest_docker_run_id,
             "status": "submitted",
         }
     )
 
 
-@app.get("/runs/{run_id}")
-async def get_run(run_id: str, x_api_key: str | None = Header(default=None)) -> JSONResponse:
+@app.get("/runs/{backtest_id}")
+async def get_run(backtest_id: str, x_api_key: str | None = Header(default=None)) -> JSONResponse:
     require_api_key(x_api_key)
-    logger.info("get_run_requested run_id=%s", run_id)
+    logger.info("get_run_requested backtest_id=%s", backtest_id)
     with MAPPING_LOCK:
         mapping = read_mapping()
-    entry = mapping.get(run_id)
+    entry = mapping.get(backtest_id)
     if not entry:
-        logger.warning("get_run_not_found run_id=%s", run_id)
-        raise HTTPException(status_code=404, detail="run_id not found")
+        logger.warning("get_run_not_found backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=404, detail="backtest_id not found")
     if isinstance(entry, dict):
-        payload = {"run_id": run_id, **entry}
+        payload = {"backtest_id": backtest_id, **entry}
     else:
-        payload = {"run_id": run_id, "backtest_docker_run_id": entry}
+        payload = {"backtest_id": backtest_id, "backtest_docker_run_id": entry}
     return JSONResponse(payload)
 
 
-@app.get("/runs/backtest/{run_id}")
-async def get_backtest_status(run_id: str) -> JSONResponse:
-    logger.info("get_backtest_status_requested backtest_id=%s", run_id)
-    payload = fetch_backtest_status(run_id)
+@app.get("/runs/backtest/{backtest_id}")
+async def get_backtest_status(backtest_id: str) -> JSONResponse:
+    logger.info("get_backtest_status_requested backtest_id=%s", backtest_id)
+    payload = fetch_backtest_status(backtest_id)
     return JSONResponse(payload)
 
 
-@app.get("/runs/{run_id}/logs")
-async def get_logs(run_id: str, x_api_key: str | None = Header(default=None)) -> Response:
+@app.get("/runs/{backtest_id}/logs")
+async def get_logs(backtest_id: str, x_api_key: str | None = Header(default=None)) -> Response:
     require_api_key(x_api_key)
-    logger.info("get_logs_requested run_id=%s", run_id)
+    logger.info("get_logs_requested backtest_id=%s", backtest_id)
     with MAPPING_LOCK:
         mapping = read_mapping()
-    entry = mapping.get(run_id)
+    entry = mapping.get(backtest_id)
     if not entry:
-        logger.warning("get_logs_run_id_not_found run_id=%s", run_id)
-        raise HTTPException(status_code=404, detail="run_id not found")
+        logger.warning("get_logs_run_id_not_found backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=404, detail="backtest_id not found")
     backtest_docker_run_id = entry.get("backtest_docker_run_id") if isinstance(entry, dict) else entry
     if not backtest_docker_run_id:
-        logger.warning("get_logs_backtest_id_missing run_id=%s", run_id)
-        raise HTTPException(status_code=404, detail="backtest_docker_run_id not found for run_id")
+        logger.warning("get_logs_backtest_id_missing backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=404, detail="backtest_docker_run_id not found for backtest_id")
 
     url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_LOGS_PATH.format(backtest_docker_run_id=backtest_docker_run_id)}"
     req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
     try:
-        logger.info("get_logs_fetching run_id=%s backtest_docker_run_id=%s url=%s", run_id, backtest_docker_run_id, url)
+        logger.info("get_logs_fetching backtest_id=%s backtest_docker_run_id=%s url=%s", backtest_id, backtest_docker_run_id, url)
         with urllib.request.urlopen(req) as resp:
             data = resp.read()
             content_type = resp.headers.get("Content-Type", "application/octet-stream")
@@ -501,15 +501,15 @@ async def get_logs(run_id: str, x_api_key: str | None = Header(default=None)) ->
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8")
         logger.warning(
-            "get_logs_http_error run_id=%s backtest_docker_run_id=%s status=%s detail=%s",
-            run_id,
+            "get_logs_http_error backtest_id=%s backtest_docker_run_id=%s status=%s detail=%s",
+            backtest_id,
             backtest_docker_run_id,
             exc.code,
             detail[:200] if detail else "",
         )
         raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
     except Exception as exc:
-        logger.exception("get_logs_request_failed run_id=%s backtest_docker_run_id=%s", run_id, backtest_docker_run_id)
+        logger.exception("get_logs_request_failed backtest_id=%s backtest_docker_run_id=%s", backtest_id, backtest_docker_run_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return Response(content=data, media_type=content_type, headers=headers)
