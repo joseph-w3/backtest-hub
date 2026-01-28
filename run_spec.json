@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "requested_by": "researcher_001",
+  "strategy_artifact": "/opt/backtest/strategy_artifacts/wheels/strategies-2026.1.27.3-py3-none-any.whl",
+  "strategy_entry": "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnostics",
+  "strategy_config_path": "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnosticsConfig",
+  "strategy_config": {
+    "order_quantity": "1000",
+    "log_interval_minutes": 10.0
+  },
+  "margin_init": 0.05,
+  "margin_maint": 0.025,
+  "spot_maker_fee": 0.001,
+  "spot_taker_fee": 0.001,
+  "futures_maker_fee": 0.001,
+  "futures_taker_fee": 0.001,
+  "symbols": [
+    "ACTUSDT",
+    "ACTUSDT-PERP",
+    "DOTUSDT",
+    "DOTUSDT-PERP"
+  ],
+  "start": "2025-11-10T00:00:00Z",
+  "end": "2025-11-11T00:00:00Z",
+  "chunk_size": 200000,
+  "seed": 12345,
+  "tags": {
+    "purpose": "example"
+  }
+}
