@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "requested_by": "researcher_001",
-  "strategy_artifact": "/opt/backtest/strategy_artifacts/wheels/strategies-2026.1.27.3-py3-none-any.whl",
+  "strategy_file": "spot_futures_arb_diagnostics.py",
   "strategy_entry": "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnostics",
   "strategy_config_path": "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnosticsConfig",
   "strategy_config": {
@@ -20,8 +20,8 @@
     "DOTUSDT",
     "DOTUSDT-PERP"
   ],
-  "start": "2025-11-10T00:00:00Z",
-  "end": "2025-11-11T00:00:00Z",
+  "start": "2025-11-10T00:00:00.000Z",
+  "end": "2025-11-11T23:59:59.999Z",
   "chunk_size": 200000,
   "seed": 12345,
   "tags": {

@@ -3,54 +3,103 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import secrets
-import subprocess
 import threading
-import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, Response
 
 app = FastAPI()
-logger = logging.getLogger("host_api")
-if not logger.handlers:
-    logging.basicConfig(level=logging.INFO)
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
-MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
+
+def setup_logging() -> logging.Logger:
+    logger = logging.getLogger("backtest_hub")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S%z",
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+logger = setup_logging()
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    logger.info("app_started")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = perf_counter()
+    request_id = request.headers.get("X-Request-ID") or request.headers.get("X-Request-Id")
+    client_host = request.client.host if request.client else "-"
+    path = request.url.path
+    if request.url.query:
+        path = f"{path}?{request.url.query}"
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (perf_counter() - start) * 1000
+        logger.exception(
+            "request_failed method=%s path=%s client=%s duration_ms=%.2f request_id=%s",
+            request.method,
+            path,
+            client_host,
+            duration_ms,
+            request_id or "-",
+        )
+        raise
+    duration_ms = (perf_counter() - start) * 1000
+    logger.info(
+        "request_completed method=%s path=%s status=%s client=%s duration_ms=%.2f request_id=%s",
+        request.method,
+        path,
+        response.status_code,
+        client_host,
+        duration_ms,
+        request_id or "-",
+    )
+    return response
+
 
 def env_or_default(name: str, default: str) -> str:
     value = os.getenv(name)
     return value if value else default
 
 
+BASE_DIR = Path(__file__).resolve().parent
 DATA_MOUNT_PATH = Path(env_or_default("DATA_MOUNT_PATH", "/opt/backtest"))
-STRATEGY_ARTIFACTS_PATH = Path(
-    env_or_default("STRATEGY_ARTIFACTS_PATH", str(DATA_MOUNT_PATH / "strategy_artifacts"))
-)
-BACKTEST_LOGS_PATH = Path(env_or_default("BACKTEST_LOGS_PATH", "/opt/backtest_logs"))
-HOST_API_AUDIT_LOG = Path(
-    env_or_default("HOST_API_AUDIT_LOG", str(DATA_MOUNT_PATH / "audit" / "host_api_audit.jsonl"))
-)
-
+RUN_STORAGE_PATH = Path(env_or_default("RUN_STORAGE_PATH", str(DATA_MOUNT_PATH / "runs")))
+RUN_MAPPING_PATH = Path(env_or_default("RUN_MAPPING_PATH", str(DATA_MOUNT_PATH / "run_mapping.json")))
 HOST_API_KEY = os.getenv("HOST_API_KEY", "")
-BACKTEST_CONTAINER_NAME = env_or_default("BACKTEST_CONTAINER_NAME", "backtest")
-BACKTEST_MAX_CONCURRENCY = int(env_or_default("BACKTEST_MAX_CONCURRENCY", "5"))
-BACKTEST_PYTHON = env_or_default("BACKTEST_PYTHON", "/usr/local/quantvenv/bin/python")
-BACKTEST_RUNNER_PATH = env_or_default("BACKTEST_RUNNER_PATH", "nautilus_trader/scripts/run_backtest.py")
 
-if BACKTEST_MAX_CONCURRENCY < 1:
-    BACKTEST_MAX_CONCURRENCY = 1
+BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.99.101.120:10001")
+BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
+BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
+BACKTEST_LOGS_PATH = env_or_default("BACKTEST_LOGS_PATH", "/backtests/{backtest_docker_run_id}/logs")
+
+RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
+
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
+MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
 
 ALLOWED_FIELDS = {
     "schema_version",
     "requested_by",
-    "strategy_artifact",
+    "strategy_file",
     "strategy_entry",
     "strategy_config_path",
     "strategy_config",
@@ -68,30 +117,9 @@ ALLOWED_FIELDS = {
     "tags",
 }
 
-REQUIRED_FIELDS = {
-    "schema_version",
-    "requested_by",
-    "strategy_artifact",
-    "strategy_entry",
-    "strategy_config_path",
-    "strategy_config",
-    "margin_init",
-    "margin_maint",
-    "spot_maker_fee",
-    "spot_taker_fee",
-    "futures_maker_fee",
-    "futures_taker_fee",
-    "symbols",
-    "start",
-    "end",
-    "chunk_size",
-    "seed",
-    "tags",
-}
+REQUIRED_FIELDS = set(ALLOWED_FIELDS)
 
-RUN_QUEUE: queue.Queue[dict[str, Any]] = queue.Queue()
-ACTIVE_RUNS: dict[str, Path] = {}
-ACTIVE_LOCK = threading.Lock()
+MAPPING_LOCK = threading.Lock()
 
 
 def utc_now() -> str:
@@ -104,65 +132,24 @@ def parse_iso8601(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def parse_decimal_field(field: str, value: object) -> Decimal:
-    if isinstance(value, Decimal):
-        parsed = value
-    elif isinstance(value, (int, float, str)):
-        try:
-            parsed = Decimal(str(value))
-        except Exception as exc:
-            raise ValueError(f"{field} must be a decimal-compatible value") from exc
-    else:
-        raise ValueError(f"{field} must be a decimal-compatible value")
+def parse_decimal_field(field: str, value: object) -> None:
+    if not isinstance(value, (int, float, str)):
+        raise ValueError(f"{field} must be a number or string")
+    try:
+        parsed = float(value)
+    except Exception as exc:
+        raise ValueError(f"{field} must be a decimal-compatible value") from exc
     if parsed < 0:
         raise ValueError(f"{field} must be >= 0")
-    return parsed
-
-
-def ensure_within(base: Path, target: Path) -> None:
-    try:
-        base_resolved = base.resolve(strict=False)
-        target_resolved = target.resolve(strict=False)
-    except FileNotFoundError:
-        base_resolved = base.resolve()
-        target_resolved = target
-    if base_resolved not in target_resolved.parents and base_resolved != target_resolved:
-        raise ValueError("Path is outside allowed base")
 
 
 def make_run_id() -> str:
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = secrets.token_hex(3)
     return f"{ts}_{suffix}"
 
 
-def build_status_payload(run_id: str, run_spec: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "run_id": run_id,
-        "requested_by": run_spec["requested_by"],
-        "strategy_entry": run_spec["strategy_entry"],
-        "strategy_artifact": run_spec["strategy_artifact"],
-        "symbols": run_spec["symbols"],
-        "start": run_spec["start"],
-        "end": run_spec["end"],
-        "tags": run_spec["tags"],
-    }
-
-
-def write_status(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2)
-
-
-def read_status(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
     unknown_fields = set(payload.keys()) - ALLOWED_FIELDS
     if unknown_fields:
         raise ValueError(f"Unknown fields: {sorted(unknown_fields)}")
@@ -180,6 +167,8 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(symbol, str) or not symbol.strip():
             raise ValueError("symbols must be list of strings")
 
+    if not isinstance(payload.get("strategy_file"), str) or not payload["strategy_file"].strip():
+        raise ValueError("strategy_file must be a non-empty string")
     if not isinstance(payload.get("strategy_config"), dict):
         raise ValueError("strategy_config must be an object")
     if not isinstance(payload.get("chunk_size"), int) or payload["chunk_size"] <= 0:
@@ -189,29 +178,28 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload.get("tags"), dict):
         raise ValueError("tags must be an object")
 
-    start = parse_iso8601(payload["start"])
-    end = parse_iso8601(payload["end"])
-    if start >= end:
-        raise ValueError("start must be before end")
-    if end - start > timedelta(days=MAX_RANGE_DAYS):
-        raise ValueError("time range exceeds limit")
-
-    strategy_artifact = Path(payload["strategy_artifact"])
-    if not strategy_artifact.is_absolute():
-        raise ValueError("strategy_artifact must be absolute path")
-
-    wheels_base = STRATEGY_ARTIFACTS_PATH / "wheels"
-    ensure_within(wheels_base, strategy_artifact)
-    if not strategy_artifact.exists():
-        raise ValueError("strategy_artifact not found")
+    start_value = payload["start"]
+    end_value = payload["end"]
+    if isinstance(start_value, (int, float)) and isinstance(end_value, (int, float)):
+        if start_value >= end_value:
+            raise ValueError("start must be before end")
+    elif isinstance(start_value, str) and isinstance(end_value, str):
+        start = parse_iso8601(start_value)
+        end = parse_iso8601(end_value)
+        if start >= end:
+            raise ValueError("start must be before end")
+        if end - start > timedelta(days=MAX_RANGE_DAYS):
+            raise ValueError("time range exceeds limit")
+    else:
+        raise ValueError("start/end must both be ISO8601 strings or numeric timestamps")
 
     strategy_entry = payload["strategy_entry"]
-    if not isinstance(strategy_entry, str) or ":" not in strategy_entry:
-        raise ValueError("strategy_entry must be module:ClassName")
+    if not isinstance(strategy_entry, str) or not strategy_entry.strip():
+        raise ValueError("strategy_entry must be a string")
 
     strategy_config_path = payload["strategy_config_path"]
-    if not isinstance(strategy_config_path, str) or ":" not in strategy_config_path:
-        raise ValueError("strategy_config_path must be module:ClassName")
+    if not isinstance(strategy_config_path, str) or not strategy_config_path.strip():
+        raise ValueError("strategy_config_path must be a string")
 
     parse_decimal_field("margin_init", payload["margin_init"])
     parse_decimal_field("margin_maint", payload["margin_maint"])
@@ -222,158 +210,8 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     sanitized: dict[str, Any] = {}
     for field in ALLOWED_FIELDS:
-        if field in payload:
-            sanitized[field] = payload[field]
+        sanitized[field] = payload[field]
     return sanitized
-
-
-def write_audit_log(run_id: str, requested_by: str, strategy_artifact: str, client_ip: str) -> None:
-    HOST_API_AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-    entry = {
-        "run_id": run_id,
-        "requested_by": requested_by,
-        "strategy_artifact": strategy_artifact,
-        "created_at": utc_now(),
-        "client_ip": client_ip,
-    }
-    with open(HOST_API_AUDIT_LOG, "a") as handle:
-        handle.write(json.dumps(entry) + "\n")
-
-
-def active_count() -> int:
-    with ACTIVE_LOCK:
-        return len(ACTIVE_RUNS)
-
-
-def reap_finished() -> None:
-    with ACTIVE_LOCK:
-        items = list(ACTIVE_RUNS.items())
-
-    finished: list[str] = []
-    for run_id, status_path in items:
-        status = read_status(status_path)
-        if status and status.get("status") in {"success", "failed"}:
-            finished.append(run_id)
-
-    if finished:
-        with ACTIVE_LOCK:
-            for run_id in finished:
-                ACTIVE_RUNS.pop(run_id, None)
-
-
-def trigger_backtest(run_id: str, run_spec_path: Path) -> tuple[str, str]:
-    trigger_log_path = f"/opt/backtest_logs/{run_id}/trigger.log"
-    trigger_cmd = " ".join(
-        [
-            "uv",
-            "run",
-            "--python",
-            BACKTEST_PYTHON,
-            "--no-sync",
-            BACKTEST_RUNNER_PATH,
-            "--run-spec",
-            str(run_spec_path),
-        ]
-    )
-    container_cmd = f"{trigger_cmd} >> {trigger_log_path} 2>&1"
-    cmd = [
-        "docker",
-        "exec",
-        "-d",
-        "-w",
-        "/opt",
-        BACKTEST_CONTAINER_NAME,
-        "sh",
-        "-lc",
-        container_cmd,
-    ]
-    logger.info(
-        "Triggering backtest run_id=%s container=%s python=%s cmd=%s",
-        run_id,
-        BACKTEST_CONTAINER_NAME,
-        BACKTEST_PYTHON,
-        container_cmd,
-    )
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr or result.stdout)
-    exec_id = result.stdout.strip()
-    return exec_id, trigger_cmd
-
-
-def enqueue_run(run_id: str, run_spec_path: Path, run_spec: dict[str, Any]) -> None:
-    status_path = BACKTEST_LOGS_PATH / run_id / "status.json"
-    status = build_status_payload(run_id, run_spec)
-    status.update({"status": "queued", "queued_at": utc_now()})
-    write_status(status_path, status)
-    RUN_QUEUE.put(
-        {
-            "run_id": run_id,
-            "run_spec_path": run_spec_path,
-            "status_path": status_path,
-            "run_spec": run_spec,
-        }
-    )
-    logger.info(
-        "Run queued run_id=%s run_spec_path=%s",
-        run_id,
-        run_spec_path,
-    )
-
-
-def start_run(task: dict[str, Any]) -> None:
-    exec_id, trigger_cmd = trigger_backtest(task["run_id"], task["run_spec_path"])
-    status = build_status_payload(task["run_id"], task["run_spec"])
-    status.update(
-        {
-            "status": "running",
-            "started_at": utc_now(),
-            "triggered_at": utc_now(),
-            "exec_id": exec_id,
-            "trigger_cmd": trigger_cmd,
-            "backtest_python": BACKTEST_PYTHON,
-        }
-    )
-    write_status(task["status_path"], status)
-    with ACTIVE_LOCK:
-        ACTIVE_RUNS[task["run_id"]] = task["status_path"]
-    logger.info(
-        "Run started run_id=%s exec_id=%s",
-        task["run_id"],
-        exec_id,
-    )
-
-
-def worker_loop() -> None:
-    while True:
-        reap_finished()
-        if active_count() >= BACKTEST_MAX_CONCURRENCY:
-            time.sleep(1)
-            continue
-        try:
-            task = RUN_QUEUE.get(timeout=1)
-        except queue.Empty:
-            time.sleep(0.5)
-            continue
-        try:
-            start_run(task)
-        except Exception as exc:
-            logger.exception(
-                "Run failed to start run_id=%s error=%s",
-                task.get("run_id"),
-                exc,
-            )
-            status = build_status_payload(task["run_id"], task["run_spec"])
-            status.update(
-                {
-                    "status": "failed",
-                    "finished_at": utc_now(),
-                    "error": str(exc),
-                }
-            )
-            write_status(task["status_path"], status)
-        finally:
-            RUN_QUEUE.task_done()
 
 
 def require_api_key(api_key: str | None) -> None:
@@ -383,10 +221,102 @@ def require_api_key(api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-@app.on_event("startup")
-def start_worker() -> None:
-    thread = threading.Thread(target=worker_loop, daemon=True)
-    thread.start()
+def read_mapping() -> dict[str, Any]:
+    if not RUN_MAPPING_PATH.exists():
+        return {}
+    with RUN_MAPPING_PATH.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_mapping(mapping: dict[str, Any]) -> None:
+    RUN_MAPPING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with RUN_MAPPING_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(mapping, handle, ensure_ascii=True, indent=2)
+
+
+def update_mapping(run_id: str, backtest_docker_run_id: str) -> None:
+    with MAPPING_LOCK:
+        mapping = read_mapping()
+        mapping[run_id] = {"backtest_docker_run_id": backtest_docker_run_id, "created_at": utc_now()}
+        write_mapping(mapping)
+
+
+def build_multipart_form(
+    fields: list[tuple[str, str]],
+    files: list[tuple[str, str, str, bytes]],
+) -> tuple[bytes, str]:
+    boundary = "----backtest-hub-" + secrets.token_hex(16)
+    body = bytearray()
+    for name, value in fields:
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.extend(value.encode("utf-8"))
+        body.extend(b"\r\n")
+    for field_name, filename, content_type, content in files:
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode(
+                "utf-8"
+            )
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+        body.extend(content)
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return bytes(body), content_type
+
+
+def backtest_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if BACKTEST_API_KEY:
+        headers["X-API-KEY"] = BACKTEST_API_KEY
+    return headers
+
+
+def submit_to_backtest(
+    run_id: str,
+    run_spec_bytes: bytes,
+    strategy_filename: str,
+    strategy_bytes: bytes,
+    runner_bytes: bytes,
+) -> str:
+    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_SUBMIT_PATH}"
+    logger.info("submit_to_backtest start run_id=%s url=%s", run_id, url)
+    # backtest docker 最新接口字段名：backtest_id / runer / strategies / configs
+    form_body, content_type = build_multipart_form(
+        fields=[("backtest_id", run_id)],
+        files=[
+            ("runer", "run_backtest.py", "text/x-python", runner_bytes),
+            ("strategies", strategy_filename, "text/x-python", strategy_bytes),
+            ("configs", "run_spec.json", "application/json", run_spec_bytes),
+        ],
+    )
+    headers = {"Content-Type": content_type, **backtest_headers()}
+    req = urllib.request.Request(url, data=form_body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read()
+            payload = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "backtest_http_error run_id=%s status=%s detail=%s",
+            run_id,
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("backtest_request_failed run_id=%s", run_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    backtest_docker_run_id = payload.get("run_id")
+    if not backtest_docker_run_id:
+        logger.warning("backtest_id_missing run_id=%s payload_keys=%s", run_id, sorted(payload.keys()))
+        raise HTTPException(status_code=502, detail="backtest_docker_run_id missing from response")
+    logger.info("submit_to_backtest success run_id=%s backtest_docker_run_id=%s", run_id, backtest_docker_run_id)
+    return str(backtest_docker_run_id)
 
 
 @app.get("/health")
@@ -395,43 +325,92 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/runs")
-async def create_run(request: Request, x_api_key: str | None = Header(default=None)) -> JSONResponse:
+async def create_run(
+    run_spec: UploadFile = File(...),
+    strategy_file: UploadFile = File(...),
+    x_api_key: str | None = Header(default=None),
+) -> JSONResponse:
+    # 入口：research docker 上传 run_spec.json 与策略文件（multipart/form-data）
     require_api_key(x_api_key)
+    logger.info(
+        "create_run_received run_spec=%s strategy_file=%s",
+        run_spec.filename or "-",
+        strategy_file.filename or "-",
+    )
+
     try:
-        payload = await request.json()
+        # 1) 读取并解析 run_spec.json
+        run_spec_raw = await run_spec.read()
+        payload = json.loads(run_spec_raw.decode("utf-8"))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+        logger.warning("create_run_invalid_spec_json error=%s", exc)
+        raise HTTPException(status_code=400, detail="Invalid run_spec.json") from exc
 
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Invalid payload")
+        logger.warning("create_run_spec_not_object type=%s", type(payload).__name__)
+        raise HTTPException(status_code=400, detail="run_spec.json must be an object")
 
     try:
-        run_spec = validate_payload(payload)
+        # 2) 校验 run_spec 内容（字段、时间范围、费用等）
+        run_spec_payload = validate_run_spec(payload)
     except ValueError as exc:
+        logger.warning("create_run_spec_validation_failed error=%s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # 3) 生成 run_id，并在本地保存上传内容，便于排查与追踪
     run_id = make_run_id()
+    logger.info("create_run_generated run_id=%s", run_id)
 
-    runs_dir = STRATEGY_ARTIFACTS_PATH / "runs" / run_id
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    run_spec_path = runs_dir / "run_spec.json"
+    run_dir = RUN_STORAGE_PATH / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(run_spec_path, "w") as handle:
-        json.dump(run_spec, handle, indent=2)
+    # 4) 保存策略文件（只保留文件名，避免路径穿越）
+    strategy_filename = Path(strategy_file.filename or "strategy.py").name
+    strategy_bytes = await strategy_file.read()
+    if not strategy_bytes:
+        logger.warning("create_run_empty_strategy run_id=%s", run_id)
+        raise HTTPException(status_code=400, detail="strategy_file is empty")
+    strategy_path = run_dir / strategy_filename
+    strategy_path.write_bytes(strategy_bytes)
 
-    client_ip = request.client.host if request.client else "unknown"
-    write_audit_log(run_id, run_spec["requested_by"], run_spec["strategy_artifact"], client_ip)
+    # 5) 将 run_spec 中的 strategy_file 更新为实际保存的文件名，并落盘
+    run_spec_payload["strategy_file"] = strategy_filename
+    run_spec_payload["run_id"] = run_id
+    run_spec_path = run_dir / "run_spec.json"
+    run_spec_bytes = json.dumps(run_spec_payload, ensure_ascii=True, indent=2).encode("utf-8")
+    run_spec_path.write_bytes(run_spec_bytes)
+    logger.info(
+        "create_run_saved run_id=%s strategy_filename=%s run_spec_bytes=%s strategy_bytes=%s",
+        run_id,
+        strategy_filename,
+        len(run_spec_bytes),
+        len(strategy_bytes),
+    )
 
-    try:
-        enqueue_run(run_id, run_spec_path, run_spec)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    # 6) 从本仓库读取 run_backtest.py，并一并转发给 backtest docker
+    if not RUNNER_PATH.is_file():
+        logger.error("create_run_missing_runner run_id=%s path=%s", run_id, RUNNER_PATH)
+        raise HTTPException(status_code=500, detail="run_backtest.py not found")
+    runner_bytes = RUNNER_PATH.read_bytes()
+
+    # 7) 调用 backtest docker 提交任务，获取 backtest_docker_run_id
+    backtest_docker_run_id = submit_to_backtest(
+        run_id=run_id,
+        run_spec_bytes=run_spec_bytes,
+        strategy_filename=strategy_filename,
+        strategy_bytes=strategy_bytes,
+        runner_bytes=runner_bytes,
+    )
+
+    # 8) 维护 run_id -> backtest_docker_run_id 映射，供日志下载与状态查询
+    update_mapping(run_id, backtest_docker_run_id)
+    logger.info("create_run_submitted run_id=%s backtest_docker_run_id=%s", run_id, backtest_docker_run_id)
 
     return JSONResponse(
         {
             "run_id": run_id,
-            "status": "queued",
-            "run_spec_path": str(run_spec_path),
+            "backtest_docker_run_id": backtest_docker_run_id,
+            "status": "submitted",
         }
     )
 
@@ -439,9 +418,58 @@ async def create_run(request: Request, x_api_key: str | None = Header(default=No
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str, x_api_key: str | None = Header(default=None)) -> JSONResponse:
     require_api_key(x_api_key)
-    status_file = BACKTEST_LOGS_PATH / run_id / "status.json"
-    if not status_file.exists():
+    logger.info("get_run_requested run_id=%s", run_id)
+    with MAPPING_LOCK:
+        mapping = read_mapping()
+    entry = mapping.get(run_id)
+    if not entry:
+        logger.warning("get_run_not_found run_id=%s", run_id)
         raise HTTPException(status_code=404, detail="run_id not found")
-    with open(status_file, "r") as handle:
-        payload = json.load(handle)
+    if isinstance(entry, dict):
+        payload = {"run_id": run_id, **entry}
+    else:
+        payload = {"run_id": run_id, "backtest_docker_run_id": entry}
     return JSONResponse(payload)
+
+
+@app.get("/runs/{run_id}/logs")
+async def get_logs(run_id: str, x_api_key: str | None = Header(default=None)) -> Response:
+    require_api_key(x_api_key)
+    logger.info("get_logs_requested run_id=%s", run_id)
+    with MAPPING_LOCK:
+        mapping = read_mapping()
+    entry = mapping.get(run_id)
+    if not entry:
+        logger.warning("get_logs_run_id_not_found run_id=%s", run_id)
+        raise HTTPException(status_code=404, detail="run_id not found")
+    backtest_docker_run_id = entry.get("backtest_docker_run_id") if isinstance(entry, dict) else entry
+    if not backtest_docker_run_id:
+        logger.warning("get_logs_backtest_id_missing run_id=%s", run_id)
+        raise HTTPException(status_code=404, detail="backtest_docker_run_id not found for run_id")
+
+    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_LOGS_PATH.format(backtest_docker_run_id=backtest_docker_run_id)}"
+    req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
+    try:
+        logger.info("get_logs_fetching run_id=%s backtest_docker_run_id=%s url=%s", run_id, backtest_docker_run_id, url)
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "application/octet-stream")
+            headers: dict[str, str] = {}
+            content_disposition = resp.headers.get("Content-Disposition")
+            if content_disposition:
+                headers["Content-Disposition"] = content_disposition
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "get_logs_http_error run_id=%s backtest_docker_run_id=%s status=%s detail=%s",
+            run_id,
+            backtest_docker_run_id,
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("get_logs_request_failed run_id=%s backtest_docker_run_id=%s", run_id, backtest_docker_run_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return Response(content=data, media_type=content_type, headers=headers)

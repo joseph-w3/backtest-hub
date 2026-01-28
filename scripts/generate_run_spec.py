@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
+import argparse
 import json
-import subprocess
-import sys
 from pathlib import Path
-
-OUTPUT_PATH = "/app/run_spec.json"
-WHEEL_OUTPUT_DIR = "/opt/backtest/strategy_artifacts/wheels"
 
 SCHEMA_VERSION = "1.0"
 REQUESTED_BY = "researcher_001"
+STRATEGY_FILE = "strategies/spot_futures_arb_diagnostics.py"
 STRATEGY_ENTRY = "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnostics"
-STRATEGY_CONFIG_PATH = (
-    "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnosticsConfig"
-)
+STRATEGY_CONFIG_PATH = "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnosticsConfig"
 STRATEGY_CONFIG = {
     "order_quantity": "1000",
     "log_interval_minutes": 10.0,
@@ -24,43 +19,29 @@ SPOT_TAKER_FEE = 0.001
 FUTURES_MAKER_FEE = 0.001
 FUTURES_TAKER_FEE = 0.001
 SYMBOLS = ["ACTUSDT", "ACTUSDT-PERP", "DOTUSDT", "DOTUSDT-PERP"]
-START_TIME = "2025-01-01T00:00:00Z"
-END_TIME = "2025-01-02T00:00:00Z"
+START_TIME = "2025-11-10T00:00:00.000Z"
+END_TIME = "2025-11-11T23:59:59.999Z"
 CHUNK_SIZE = 200000
 SEED = 12345
 TAGS = {"purpose": "example"}
 
 
-def build_strategy_wheel(repo_root: Path, output_dir: Path) -> Path:
-    build_script = repo_root / "scripts" / "build_strategy_wheel.sh"
-    if not build_script.is_file():
-        raise FileNotFoundError(f"build script not found at {build_script}")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run([str(build_script), "--output-dir", str(output_dir)], check=True)
-
-    wheels = sorted(
-        output_dir.glob("strategies-*.whl"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    if not wheels:
-        raise RuntimeError(f"No wheel found in {output_dir}")
-    return wheels[0]
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate run_spec.json for backtest hub.")
+    parser.add_argument("--output", default="run_spec.json", help="Output path for run_spec.json")
+    parser.add_argument("--requested-by", default=REQUESTED_BY)
+    parser.add_argument("--strategy-file", default=STRATEGY_FILE)
+    return parser.parse_args()
 
 
 def main() -> int:
-    if len(sys.argv) > 1:
-        print("This script uses global constants. Edit scripts/generate_run_spec.py.")
-        return 1
-
-    repo_root = Path(__file__).resolve().parent.parent
-    wheel_path = build_strategy_wheel(repo_root, Path(WHEEL_OUTPUT_DIR))
+    args = parse_args()
+    strategy_file = Path(args.strategy_file)
 
     run_spec = {
         "schema_version": SCHEMA_VERSION,
-        "requested_by": REQUESTED_BY,
-        "strategy_artifact": str(wheel_path),
+        "requested_by": args.requested_by,
+        "strategy_file": strategy_file.name,
         "strategy_entry": STRATEGY_ENTRY,
         "strategy_config_path": STRATEGY_CONFIG_PATH,
         "strategy_config": STRATEGY_CONFIG,
@@ -78,7 +59,7 @@ def main() -> int:
         "tags": TAGS,
     }
 
-    output_path = Path(OUTPUT_PATH)
+    output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as handle:
         json.dump(run_spec, handle, indent=2)

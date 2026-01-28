@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import random
-import shutil
-import subprocess
+import secrets
 import sys
 import traceback
 from datetime import datetime
@@ -52,9 +52,10 @@ DEFAULT_MARGIN_MAINT = Decimal("0.025")
 DEFAULT_BOOK_TYPE = "L2_MBP"
 
 REQUIRED_FIELDS = {
+    "run_id",
     "schema_version",
     "requested_by",
-    "strategy_artifact",
+    "strategy_file",
     "strategy_entry",
     "strategy_config_path",
     "strategy_config",
@@ -89,7 +90,7 @@ def _load_run_spec(path: Path) -> dict:
     return data
 
 
-def _validate_run_spec(run_spec: dict) -> None:
+def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> Path:
     missing = REQUIRED_FIELDS - set(run_spec.keys())
     extra = set(run_spec.keys()) - REQUIRED_FIELDS
     if missing:
@@ -110,14 +111,21 @@ def _validate_run_spec(run_spec: dict) -> None:
 
     for field in ("strategy_entry", "strategy_config_path"):
         value = run_spec[field]
-        if not isinstance(value, str) or ":" not in value:
-            raise ValueError(f"RunSpec {field} must be 'module:ClassName'.")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"RunSpec {field} must be a non-empty string.")
+        class_name = value.split(":", 1)[1] if ":" in value else value
+        if not class_name:
+            raise ValueError(f"RunSpec {field} missing class name.")
 
-    artifact = Path(run_spec["strategy_artifact"])
-    if not artifact.is_file():
-        raise FileNotFoundError(f"Strategy artifact not found: {artifact}")
+    if not isinstance(run_spec.get("strategy_file"), str) or not run_spec["strategy_file"].strip():
+        raise ValueError("RunSpec strategy_file must be a non-empty string.")
+    strategy_path = _resolve_strategy_file(run_spec_path, run_spec["strategy_file"])
+
+    if not isinstance(run_spec.get("run_id"), str) or not run_spec["run_id"].strip():
+        raise ValueError("RunSpec run_id must be a non-empty string.")
 
     _validate_time_order(run_spec["start"], run_spec["end"])
+    return strategy_path
 
 
 def _parse_decimal(field: str, value: object) -> Decimal:
@@ -155,12 +163,29 @@ def _parse_time(value: str | int) -> datetime | int:
     return datetime.fromisoformat(normalized)
 
 
-def _install_strategy_artifact(path: Path) -> None:
-    if shutil.which("uv"):
-        command = ["uv", "pip", "install", "--no-deps", str(path)]
-    else:
-        command = [sys.executable, "-m", "pip", "install", "--no-deps", str(path)]
-    subprocess.run(command, check=True)
+def _resolve_strategy_file(run_spec_path: Path, strategy_file: str) -> Path:
+    candidate = Path(strategy_file)
+    if not candidate.is_absolute():
+        candidate = run_spec_path.parent / candidate
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Strategy file not found: {candidate}")
+    return candidate
+
+
+def _load_strategy_module(strategy_path: Path) -> str:
+    module_name = f"strategy_{strategy_path.stem}_{secrets.token_hex(4)}"
+    spec = importlib.util.spec_from_file_location(module_name, strategy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load strategy module: {strategy_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module_name
+
+
+def _rewrite_import_path(value: str, module_name: str) -> str:
+    class_name = value.split(":", 1)[1] if ":" in value else value
+    return f"{module_name}:{class_name}"
 
 
 def _parse_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
@@ -386,8 +411,8 @@ def _migrate_instrument_data(
     target_id: InstrumentId,
     data_cls: type,
 ) -> int:
-    data = catalog.query(data_cls, instrument_ids=[source_id.value])
-    if data is None or data.is_empty():
+    data = catalog.query(data_cls, identifiers=[source_id.value])
+    if not data:
         return 0
     catalog.write(data, instrument_id=target_id)
     return len(data)
@@ -421,7 +446,7 @@ def _build_status_payload(run_id: str, run_spec: dict) -> dict:
         "run_id": run_id,
         "requested_by": run_spec["requested_by"],
         "strategy_entry": run_spec["strategy_entry"],
-        "strategy_artifact": run_spec["strategy_artifact"],
+        "strategy_file": run_spec["strategy_file"],
         "symbols": run_spec["symbols"],
         "start": run_spec["start"],
         "end": run_spec["end"],
@@ -439,9 +464,9 @@ def main() -> int:
     args = _parse_args()
     run_spec_path = Path(args.run_spec).expanduser()
     run_spec = _load_run_spec(run_spec_path)
-    _validate_run_spec(run_spec)
+    strategy_file_path = _validate_run_spec(run_spec, run_spec_path)
 
-    run_id = run_spec_path.parent.name or "unknown"
+    run_id = run_spec["run_id"]
     log_root = os.environ.get("BACKTEST_LOGS_PATH", "/opt/backtest_logs")
     log_dir = Path(log_root) / run_id
     status_path = log_dir / "status.json"
@@ -452,8 +477,10 @@ def main() -> int:
     _write_status(status_path, status)
 
     try:
-        _install_strategy_artifact(Path(run_spec["strategy_artifact"]))
         random.seed(run_spec["seed"])
+        module_name = _load_strategy_module(strategy_file_path)
+        strategy_entry = _rewrite_import_path(run_spec["strategy_entry"], module_name)
+        strategy_config_path = _rewrite_import_path(run_spec["strategy_config_path"], module_name)
 
         spot_symbols, futures_symbols = _parse_symbols(run_spec["symbols"])
         margin_init = _parse_decimal("margin_init", run_spec["margin_init"])
@@ -603,13 +630,13 @@ def main() -> int:
         engine_config = BacktestEngineConfig(
             strategies=[
                 ImportableStrategyConfig(
-                    strategy_path=run_spec["strategy_entry"],
-                    config_path=run_spec["strategy_config_path"],
+                    strategy_path=strategy_entry,
+                    config_path=strategy_config_path,
                     config=strategy_config,
                 )
             ],
             logging=LoggingConfig(
-                log_level="ERROR",
+                log_level="INFO",
                 log_directory=log_dir.as_posix(),
                 log_level_file="INFO",
                 log_file_name="engine",

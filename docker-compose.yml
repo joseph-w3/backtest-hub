@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  backtest-hub:
+    build: .
+    container_name: backtest-hub
+    ports:
+      - "10033:10033"
+    environment:
+      HOST_API_KEY: ${HOST_API_KEY:-abcc}
+      BACKTEST_API_BASE: ${BACKTEST_API_BASE:-http://100.99.101.120:10001}
+      BACKTEST_SUBMIT_PATH: ${BACKTEST_SUBMIT_PATH:-/v1/scripts/run_backtest}
+      BACKTEST_LOGS_PATH: ${BACKTEST_LOGS_PATH:-/backtests/{backtest_id}/logs}
+      BACKTEST_API_KEY: ${BACKTEST_API_KEY:-}
+      DATA_MOUNT_PATH: ${DATA_MOUNT_PATH:-/opt/backtest}
+      RUN_STORAGE_PATH: ${RUN_STORAGE_PATH:-/opt/backtest/runs}
+      RUN_MAPPING_PATH: ${RUN_MAPPING_PATH:-/opt/backtest/run_mapping.json}
+      BACKTEST_RUNNER_PATH: ${BACKTEST_RUNNER_PATH:-/app/scripts/run_backtest.py}
+      MAX_SYMBOLS: ${MAX_SYMBOLS:-50}
+      MAX_RANGE_DAYS: ${MAX_RANGE_DAYS:-90}
+    volumes:
+      - ./data:/opt/backtest
+    restart: unless-stopped
