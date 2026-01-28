@@ -90,6 +90,7 @@ BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.99.101.120:1
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
 BACKTEST_LOGS_PATH = env_or_default("BACKTEST_LOGS_PATH", "/backtests/{backtest_docker_run_id}/logs")
+BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/runs/backtest/{backtest_id}")
 
 RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
 
@@ -319,6 +320,38 @@ def submit_to_backtest(
     return str(backtest_docker_run_id)
 
 
+def fetch_backtest_status(run_id: str) -> dict[str, Any]:
+    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_STATUS_PATH.format(backtest_id=run_id)}"
+    req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
+    try:
+        logger.info("fetch_backtest_status start backtest_id=%s url=%s", run_id, url)
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read()
+            payload = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "fetch_backtest_status_http_error run_id=%s status=%s detail=%s",
+            run_id,
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("fetch_backtest_status_failed run_id=%s", run_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not isinstance(payload, dict):
+        logger.warning("fetch_backtest_status_invalid_payload backtest_id=%s", run_id)
+        raise HTTPException(status_code=502, detail="backtest status invalid response")
+
+    return {
+        "status": payload.get("status"),
+        "pid": payload.get("pid"),
+        "started_at": payload.get("started_at"),
+    }
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "timestamp": utc_now()}
@@ -429,6 +462,13 @@ async def get_run(run_id: str, x_api_key: str | None = Header(default=None)) -> 
         payload = {"run_id": run_id, **entry}
     else:
         payload = {"run_id": run_id, "backtest_docker_run_id": entry}
+    return JSONResponse(payload)
+
+
+@app.get("/runs/backtest/{run_id}")
+async def get_backtest_status(run_id: str) -> JSONResponse:
+    logger.info("get_backtest_status_requested backtest_id=%s", run_id)
+    payload = fetch_backtest_status(run_id)
     return JSONResponse(payload)
 
 

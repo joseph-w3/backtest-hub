@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 
@@ -66,6 +67,26 @@ def generate_run_spec(run_spec_path: Path, strategy_path: Path) -> None:
     subprocess.run(command, check=True)
 
 
+def extract_run_id(response_body: str) -> str | None:
+    try:
+        data = json.loads(response_body)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and data.get("run_id"):
+        return str(data["run_id"])
+    return None
+
+
+def write_run_id_history(run_id: str, history_path: Path) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_line = f"{timestamp} {run_id}\n"
+    if history_path.exists():
+        existing = history_path.read_text(encoding="utf-8")
+    else:
+        existing = ""
+    history_path.write_text(new_line + existing, encoding="utf-8")
+
+
 def main() -> int:
     args = parse_args()
     if not args.api_key:
@@ -111,6 +132,12 @@ def main() -> int:
         with urllib.request.urlopen(req) as resp:
             body = resp.read().decode("utf-8")
             print(body)
+            run_id = extract_run_id(body)
+            if run_id:
+                history_path = Path(__file__).resolve().parent / "backtest_run_id_history"
+                write_run_id_history(run_id, history_path)
+            else:
+                print("run_id not found in response; skip writing history", file=sys.stderr)
             return 0
     except urllib.error.HTTPError as exc:
         print(exc.read().decode("utf-8"))
