@@ -15,7 +15,7 @@ from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
-HUB_BASE_URL = os.getenv("BACKTEST_HUB_BASE_URL", "http://100.87.155.67:10033")
+HUB_BASE_URL = os.getenv("BACKTEST_HUB_BASE_URL", "http://100.99.101.120:10033")
 
 
 def build_multipart_form(files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
@@ -36,8 +36,7 @@ def build_multipart_form(files: list[tuple[str, str, str, bytes]]) -> tuple[byte
     return bytes(body), content_type
 
 
-def generate_run_spec(run_spec_path: Path, strategy_path: Path) -> None:
-    script_path = Path(__file__).resolve().parent / "generate_run_spec.py"
+def generate_run_spec(run_spec_path: Path, strategy_path: Path, script_path: Path) -> None:
     command = [
         sys.executable,
         str(script_path),
@@ -47,6 +46,27 @@ def generate_run_spec(run_spec_path: Path, strategy_path: Path) -> None:
         str(strategy_path),
     ]
     subprocess.run(command, check=True)
+
+
+def resolve_local_run_spec_script() -> Path | None:
+    candidate = Path.cwd() / "scripts" / "generate_run_spec.py"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def get_template_script_path() -> Path:
+    return Path(__file__).resolve().parent / "scripts" / "generate_run_spec.py"
+
+
+def init_run_spec_script() -> Path:
+    target = Path.cwd() / "scripts" / "generate_run_spec.py"
+    if target.exists():
+        raise FileExistsError(f"{target} already exists")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    template = get_template_script_path()
+    target.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+    return target
 
 
 def extract_run_id(response_body: str) -> str | None:
@@ -176,6 +196,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="After submit, stream WebSocket logs into ./live_logs/{backtest_id}.log",
     )
 
+    subparsers.add_parser("init", help="Create scripts/generate_run_spec.py in current directory")
+
     status_parser = subparsers.add_parser("status", help="Get backtest status (status/pid/started_at)")
     status_parser.add_argument("backtest_id", help="Backtest ID")
 
@@ -202,13 +224,17 @@ def command_submit(args: argparse.Namespace) -> int:
         return 1
 
     if not args.no_generate or not run_spec_path.exists():
+        script_path = resolve_local_run_spec_script()
+        if script_path is None:
+            print("Missing scripts/generate_run_spec.py. Run: backtest-hub-cli init", file=sys.stderr)
+            return 1
         try:
-            generate_run_spec(run_spec_path, strategy_path)
+            generate_run_spec(run_spec_path, strategy_path, script_path)
         except subprocess.CalledProcessError as exc:
             print(f"generate_run_spec failed: {exc}")
             return 1
 
-    with run_spec_path.open("r") as handle:
+    with run_spec_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
     run_spec_bytes = json.dumps(payload).encode("utf-8")
@@ -233,7 +259,7 @@ def command_submit(args: argparse.Namespace) -> int:
             print(body_text)
             backtest_id = extract_run_id(body_text)
             if backtest_id:
-                history_path = Path(__file__).resolve().parent / "backtest_run_id_history"
+                history_path = Path.cwd() / "backtest_run_id_history"
                 write_run_id_history(backtest_id, args.name, history_path)
                 if args.follow_logs:
                     ws_url = build_ws_url(
@@ -295,6 +321,8 @@ def command_help() -> int:
                 "  --no-generate    Skip run_spec generation",
                 "  --follow-logs    Stream WebSocket logs into ./live_logs/{backtest_id}.log",
                 "",
+                "init    Create scripts/generate_run_spec.py in current directory",
+                "",
                 "status  Get backtest status (status/pid/started_at)",
                 "  backtest_id      Backtest ID",
                 "",
@@ -303,7 +331,7 @@ def command_help() -> int:
                 "  --out            Output file path (default: {backtest_id}.log)",
                 "",
                 "Global:",
-                "  BACKTEST_HUB_BASE_URL  Hub base URL (default: http://100.87.155.67:10033)",
+                "  BACKTEST_HUB_BASE_URL  Hub base URL (default: http://100.99.101.120:10033)",
             ]
         )
     )
@@ -314,6 +342,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "help":
         return command_help()
+    if args.command == "init":
+        try:
+            target = init_run_spec_script()
+        except FileExistsError as exc:
+            print(str(exc))
+            return 1
+        print(f"Created {target}")
+        return 0
     if args.command == "submit":
         return command_submit(args)
     if args.command == "status":
