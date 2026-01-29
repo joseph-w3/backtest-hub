@@ -15,7 +15,7 @@ from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
-HUB_BASE_URL = os.getenv("BACKTEST_HUB_BASE_URL", "http://100.99.101.120:10033")
+HUB_BASE_URL = os.getenv("BACKTEST_HUB_BASE_URL", "http://100.87.155.67:10033")
 
 
 def build_multipart_form(files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
@@ -59,9 +59,10 @@ def extract_run_id(response_body: str) -> str | None:
     return None
 
 
-def write_run_id_history(backtest_id: str, history_path: Path) -> None:
+def write_run_id_history(backtest_id: str, name: str, history_path: Path) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    new_line = f"{timestamp} {backtest_id}\n"
+    safe_name = " ".join(str(name).split())
+    new_line = f"{timestamp} {backtest_id} {safe_name}\n"
     if history_path.exists():
         existing = history_path.read_text(encoding="utf-8")
     else:
@@ -160,6 +161,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Path to run_spec.json (will be generated if missing or --no-generate is not set)",
     )
     submit_parser.add_argument(
+        "--name",
+        required=True,
+        help="Strategy name for this submission (required, used in run id history)",
+    )
+    submit_parser.add_argument(
         "--no-generate",
         action="store_true",
         help="Skip generating run_spec.json",
@@ -228,7 +234,7 @@ def command_submit(args: argparse.Namespace) -> int:
             backtest_id = extract_run_id(body_text)
             if backtest_id:
                 history_path = Path(__file__).resolve().parent / "backtest_run_id_history"
-                write_run_id_history(backtest_id, history_path)
+                write_run_id_history(backtest_id, args.name, history_path)
                 if args.follow_logs:
                     ws_url = build_ws_url(
                         HUB_BASE_URL,
@@ -285,6 +291,7 @@ def command_help() -> int:
                 "  --api-key        API key (default: $HOST_API_KEY)",
                 "  --strategy-file  Strategy file path",
                 "  --run-spec       Run spec path (auto-generate unless --no-generate)",
+                "  --name           Strategy name (required, recorded in history)",
                 "  --no-generate    Skip run_spec generation",
                 "  --follow-logs    Stream WebSocket logs into ./live_logs/{backtest_id}.log",
                 "",
@@ -296,7 +303,7 @@ def command_help() -> int:
                 "  --out            Output file path (default: {backtest_id}.log)",
                 "",
                 "Global:",
-                "  BACKTEST_HUB_BASE_URL  Hub base URL (default: http://100.99.101.120:10033)",
+                "  BACKTEST_HUB_BASE_URL  Hub base URL (default: http://100.87.155.67:10033)",
             ]
         )
     )
