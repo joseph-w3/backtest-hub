@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-01-29 20:06:02
+- 当前梳理时间: 2026-01-29 20:19:57
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流。
@@ -57,7 +57,7 @@
   5) 保存 `backtest_id -> backtest_docker_run_id` 映射（含 `created_at`）。
   6) 返回 `backtest_id` 与 `backtest_docker_run_id`。
 - 查询链路:
-  - `GET /runs/{backtest_id}`（需 API Key）读取映射并返回。
+  - `GET /runs/{backtest_id}` 读取映射并返回。
   - `GET /runs/backtest/{backtest_id}` 透传 backtest docker 状态（status/pid/started_at）。
   - `GET /runs/{backtest_id}/logs` 代理下载 backtest docker 日志。
 - 日志流链路:
@@ -68,7 +68,7 @@
 ### 关键配置
 - 配置文件: `docker-compose.yml`, `run_spec.json`, `pyproject.toml`。
 - 关键参数:
-  - Hub 服务: `HOST_API_KEY`, `BACKTEST_API_BASE`, `BACKTEST_SUBMIT_PATH`, `BACKTEST_STATUS_PATH`, `BACKTEST_LOGS_PATH`, `BACKTEST_API_KEY`,
+  - Hub 服务: `BACKTEST_API_BASE`, `BACKTEST_SUBMIT_PATH`, `BACKTEST_STATUS_PATH`, `BACKTEST_LOGS_PATH`, `BACKTEST_API_KEY`,
     `BACKTEST_WS_LOGS_PATH`, `DATA_MOUNT_PATH`, `RUN_STORAGE_PATH`, `RUN_MAPPING_PATH`, `BACKTEST_RUNNER_PATH`, `MAX_SYMBOLS`, `MAX_RANGE_DAYS`。
   - CLI: `BACKTEST_HUB_BASE_URL`（默认 `http://100.99.101.120:10033`）。
   - Runner 脚本: `CATALOG_PATH`，`BACKTEST_LOGS_PATH`（日志目录，默认 `/opt/backtest_logs`，与 Hub 的 `BACKTEST_LOGS_PATH` 为 URL 路径含义不同）。
@@ -78,16 +78,21 @@
 - 运行步骤:
   1) 启动服务（Docker/uvicorn）。
   2) 执行 `backtest-hub-cli init` 生成 `./scripts/generate_run_spec.py`，按需修改参数。
-  3) 调用 `POST /runs` 上传 run_spec 与策略文件（需 `X-API-KEY`，或使用 `backtest-hub-cli submit`/`scripts/submit_run.py`）。
+  3) 调用 `POST /runs` 上传 run_spec 与策略文件（或使用 `backtest-hub-cli submit`/`scripts/submit_run.py`）。
   4) 服务落盘并转发至 backtest docker，返回 `backtest_id`。
-  5) 使用 `GET /runs/{backtest_id}` 查询映射信息（需 `X-API-KEY`）。
+  5) 使用 `GET /runs/{backtest_id}` 查询映射信息。
   6) 使用 `GET /runs/backtest/{backtest_id}` 查询 backtest docker 状态。
   7) 使用 `GET /runs/{backtest_id}/logs` 拉取 backtest 日志。
   8) 可选：连接 `/runs/backtest/{backtest_id}/logs/stream` 实时查看日志（或 `backtest-hub-cli submit --follow-logs`/`scripts/submit_run.py --follow-logs` 自动落盘）。
-- 异常/边界处理: 参数校验失败返回 400；缺少 runner 返回 500；backtest docker 返回错误码时透传；backtest_id 不存在返回 404；`/runs` 与 `/runs/{backtest_id}` 需 `X-API-KEY`，其余查询/日志接口不做 API key 校验。
+- 异常/边界处理: 参数校验失败返回 400；缺少 runner 返回 500；backtest docker 返回错误码时透传；backtest_id 不存在返回 404。
 - 观测与日志: `app.py` 统一记录请求日志；`scripts/run_backtest.py` 写入 `status.json`（包含状态/错误/traceback）。
 
 ## 改动概要/变更记录
+
+### 2026-01-29 20:19:57
+- 本次新增/更新要点: 移除 `/runs` 与 `/runs/{backtest_id}` 的 API key 鉴权要求；同步更新 CLI 与文档说明。
+- 变更动机/需求来源: 用户要求取消鉴权。
+- 当前更新时间: 2026-01-29 20:19:57
 
 ### 2026-01-29 20:06:02
 - 本次新增/更新要点: CLI 迁移至 `backtest_hub_cli` 包；新增 `init` 命令以生成 `scripts/generate_run_spec.py` 模板；submit 改为调用本地脚本；更新历史记录落盘路径为当前目录。
