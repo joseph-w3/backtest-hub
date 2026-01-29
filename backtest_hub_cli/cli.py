@@ -169,7 +169,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     help_parser.set_defaults(_command_description=True)
 
     submit_parser = subparsers.add_parser("submit", help="Submit run_spec.json and strategy file")
-    submit_parser.add_argument("--api-key", default=os.getenv("HOST_API_KEY", ""))
     submit_parser.add_argument(
         "--strategy-file",
         default="strategies/spot_futures_arb_diagnostics.py",
@@ -213,10 +212,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def command_submit(args: argparse.Namespace) -> int:
-    if not args.api_key:
-        print("HOST_API_KEY is required")
-        return 1
-
     run_spec_path = Path(args.run_spec)
     strategy_path = Path(args.strategy_file)
     if not strategy_path.is_file():
@@ -249,7 +244,7 @@ def command_submit(args: argparse.Namespace) -> int:
     req = urllib.request.Request(
         f"{HUB_BASE_URL.rstrip('/')}/runs",
         data=body,
-        headers={"Content-Type": content_type, "X-API-KEY": args.api_key},
+        headers={"Content-Type": content_type},
         method="POST",
     )
 
@@ -314,7 +309,6 @@ def command_help() -> int:
                 "Backtest Hub CLI commands:",
                 "",
                 "submit  Submit run_spec.json and strategy file to /runs",
-                "  --api-key        API key (default: $HOST_API_KEY)",
                 "  --strategy-file  Strategy file path",
                 "  --run-spec       Run spec path (auto-generate unless --no-generate)",
                 "  --name           Strategy name (required, recorded in history)",
