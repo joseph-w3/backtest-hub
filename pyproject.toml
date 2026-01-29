@@ -3,7 +3,7 @@ name = "backtest-hub"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.9.0",
     "fastapi>=0.128.0",
