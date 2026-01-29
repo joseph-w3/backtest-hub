@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-01-29 16:20:55
+- 当前梳理时间: 2026-01-29 20:06:02
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流。
@@ -18,17 +18,18 @@
 - 模块划分:
   - `app.py`: API 层、参数校验、文件落盘、转发 backtest API、backtest_id 映射管理。
   - `scripts/run_backtest.py`: 回测 runner 脚本（由 backtest docker 执行），加载策略、构建配置并运行回测。
-  - `scripts/generate_run_spec.py`: 生成示例 `run_spec.json`。
-  - `scripts/cli.py`: Hub CLI，负责提交/查询/下载日志/日志流。
-  - `scripts/submit_run.py`: 提交 CLI 的薄封装（转发至 `scripts/cli.py submit`）。
-  - `scripts/backtest_hub_sdk.py`: 兼容旧命令的 CLI 封装（转发至 `scripts/cli.py`）。
+  - `backtest_hub_cli/cli.py`: Hub CLI 包入口，负责提交/查询/下载日志/日志流，并提供 `init` 生成模板脚本。
+  - `backtest_hub_cli/scripts/generate_run_spec.py`: CLI 模板脚本，`init` 命令会复制到项目 `./scripts/generate_run_spec.py`。
+  - `scripts/generate_run_spec.py`: 用户自定义的 run_spec 生成脚本（由 `init` 创建，用于本地生成 `run_spec.json`）。
+  - `scripts/submit_run.py`: 提交 CLI 的薄封装（转发至 `backtest_hub_cli.cli`）。
+  - `scripts/backtest_hub_sdk.py`: 兼容旧命令的 CLI 封装（转发至 `backtest_hub_cli.cli`）。
   - `strategies/`: 示例策略实现（如 `spot_futures_arb_diagnostics.py`）。
   - `docker-compose.yml`: 服务运行环境与环境变量配置。
   - `run_spec.json`: 回测配置样例。
 - 关键职责:
   - `app.py`: 提供 `/health`、`POST /runs`、`GET /runs/{backtest_id}`、`GET /runs/backtest/{backtest_id}`、`GET /runs/{backtest_id}/logs`、`/runs/backtest/{backtest_id}/logs/stream`；校验字段/时间范围；生成 backtest_id；落盘保存；转发并记录 backtest_docker_run_id；维护映射；通过 WebSocket 代理日志流。
   - `scripts/run_backtest.py`: 校验 run_spec；动态加载策略模块；构建 spot/futures instruments 与 backtest configs；执行 `BacktestNode`；写入 `status.json`（运行/成功/失败）。
-  - `scripts/cli.py`: `submit` 提交 run_spec 与策略（可自动生成 run_spec），可选 `--follow-logs` WebSocket 写入 `./live_logs/{backtest_id}.log`；`status` 查询 backtest 状态；`logs` 下载日志；并写入 `scripts/backtest_run_id_history` 记录历史。
+  - `backtest_hub_cli/cli.py`: `init` 复制模板脚本到 `./scripts/generate_run_spec.py`；`submit` 调用本地 `scripts/generate_run_spec.py` 生成 run_spec（若未 init 则提示）；可选 `--follow-logs` WebSocket 写入 `./live_logs/{backtest_id}.log`；`status` 查询 backtest 状态；`logs` 下载日志；并写入 `./backtest_run_id_history` 记录历史。
   - `scripts/submit_run.py`: 仅负责转发 CLI 的 submit 命令。
   - `scripts/backtest_hub_sdk.py`: 兼容命令 `get-backtest-status`/`download-backtest-logs`，内部转发至 CLI 的 `status`/`logs`。
 - 主要依赖:
@@ -61,7 +62,7 @@
   - `GET /runs/{backtest_id}/logs` 代理下载 backtest docker 日志。
 - 日志流链路:
   - 客户端连接 `/runs/backtest/{backtest_id}/logs/stream`，服务端建立到 backtest docker 的 WebSocket 连接并双向转发消息。
-  - `scripts/cli.py submit --follow-logs`（或 `scripts/submit_run.py --follow-logs`）通过 WebSocket 拉取日志并落盘到 `./live_logs/{backtest_id}.log`。
+  - `backtest-hub-cli submit --follow-logs`（或 `scripts/submit_run.py --follow-logs`）通过 WebSocket 拉取日志并落盘到 `./live_logs/{backtest_id}.log`。
 - 控制/调度流程: 映射文件通过 `threading.Lock` 保护读写；异常以 HTTP 4xx/5xx 返回并记录日志；backtest docker 请求失败统一返回 502。
 
 ### 关键配置
@@ -76,16 +77,22 @@
 ### 运行流程
 - 运行步骤:
   1) 启动服务（Docker/uvicorn）。
-  2) 调用 `POST /runs` 上传 run_spec 与策略文件（需 `X-API-KEY`，或使用 `backtest-hub-cli submit`/`scripts/submit_run.py`）。
-  3) 服务落盘并转发至 backtest docker，返回 `backtest_id`。
-  4) 使用 `GET /runs/{backtest_id}` 查询映射信息（需 `X-API-KEY`）。
-  5) 使用 `GET /runs/backtest/{backtest_id}` 查询 backtest docker 状态。
-  6) 使用 `GET /runs/{backtest_id}/logs` 拉取 backtest 日志。
-  7) 可选：连接 `/runs/backtest/{backtest_id}/logs/stream` 实时查看日志（或 `backtest-hub-cli submit --follow-logs`/`scripts/submit_run.py --follow-logs` 自动落盘）。
+  2) 执行 `backtest-hub-cli init` 生成 `./scripts/generate_run_spec.py`，按需修改参数。
+  3) 调用 `POST /runs` 上传 run_spec 与策略文件（需 `X-API-KEY`，或使用 `backtest-hub-cli submit`/`scripts/submit_run.py`）。
+  4) 服务落盘并转发至 backtest docker，返回 `backtest_id`。
+  5) 使用 `GET /runs/{backtest_id}` 查询映射信息（需 `X-API-KEY`）。
+  6) 使用 `GET /runs/backtest/{backtest_id}` 查询 backtest docker 状态。
+  7) 使用 `GET /runs/{backtest_id}/logs` 拉取 backtest 日志。
+  8) 可选：连接 `/runs/backtest/{backtest_id}/logs/stream` 实时查看日志（或 `backtest-hub-cli submit --follow-logs`/`scripts/submit_run.py --follow-logs` 自动落盘）。
 - 异常/边界处理: 参数校验失败返回 400；缺少 runner 返回 500；backtest docker 返回错误码时透传；backtest_id 不存在返回 404；`/runs` 与 `/runs/{backtest_id}` 需 `X-API-KEY`，其余查询/日志接口不做 API key 校验。
 - 观测与日志: `app.py` 统一记录请求日志；`scripts/run_backtest.py` 写入 `status.json`（包含状态/错误/traceback）。
 
 ## 改动概要/变更记录
+
+### 2026-01-29 20:06:02
+- 本次新增/更新要点: CLI 迁移至 `backtest_hub_cli` 包；新增 `init` 命令以生成 `scripts/generate_run_spec.py` 模板；submit 改为调用本地脚本；更新历史记录落盘路径为当前目录。
+- 变更动机/需求来源: 用户要求根据最新代码更新架构文档。
+- 当前更新时间: 2026-01-29 20:06:02
 
 ### 2026-01-29 16:20:55
 - 本次新增/更新要点: 补充 CLI 体系（scripts/cli.py 与 submit/backtest_hub_sdk 封装）；更新运行环境约束为 Python>=3.12；补全日志流/提交链路字段与配置项说明。
