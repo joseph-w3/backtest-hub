@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import json
 import os
 import subprocess
@@ -7,6 +8,9 @@ import sys
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
+
+import aiohttp
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +31,11 @@ def parse_args() -> argparse.Namespace:
         "--no-generate",
         action="store_true",
         help="Skip generating run_spec.json",
+    )
+    parser.add_argument(
+        "--follow-logs",
+        action="store_true",
+        help="After submit, stream WebSocket logs into ./live_logs/{backtest_id}.log",
     )
     return parser.parse_args()
 
@@ -87,6 +96,44 @@ def write_run_id_history(backtest_id: str, history_path: Path) -> None:
     history_path.write_text(new_line + existing, encoding="utf-8")
 
 
+def build_ws_url(base_url: str, path: str) -> str:
+    parsed = urlparse(base_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    base_path = parsed.path.rstrip("/")
+    normalized_path = "/" + path.lstrip("/")
+    full_path = f"{base_path}{normalized_path}"
+    return urlunparse((scheme, parsed.netloc, full_path, "", "", ""))
+
+
+async def stream_logs(ws_url: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Streaming logs to {output_path}")
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ws_url) as ws:
+            with output_path.open("a", encoding="utf-8") as handle:
+                async for message in ws:
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        text = message.data
+                    elif message.type == aiohttp.WSMsgType.BINARY:
+                        text = message.data.decode("utf-8", errors="replace")
+                    elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                        break
+                    elif message.type == aiohttp.WSMsgType.ERROR:
+                        break
+                    else:
+                        continue
+                    data = None
+                    try:
+                        payload = json.loads(text)
+                        if isinstance(payload, dict):
+                            data = payload.get("data")
+                    except json.JSONDecodeError:
+                        data = text
+                    if data:
+                        handle.write(str(data))
+                        handle.flush()
+
+
 def main() -> int:
     args = parse_args()
     if not args.api_key:
@@ -136,6 +183,16 @@ def main() -> int:
             if backtest_id:
                 history_path = Path(__file__).resolve().parent / "backtest_run_id_history"
                 write_run_id_history(backtest_id, history_path)
+                if args.follow_logs:
+                    ws_url = build_ws_url(
+                        args.host,
+                        f"/runs/backtest/{backtest_id}/logs/stream",
+                    )
+                    output_path = Path.cwd() / "live_logs" / f"{backtest_id}.log"
+                    try:
+                        asyncio.run(stream_logs(ws_url, output_path))
+                    except KeyboardInterrupt:
+                        print("\nLog streaming interrupted.")
             else:
                 print("backtest_id not found in response; skip writing history", file=sys.stderr)
             return 0

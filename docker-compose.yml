@@ -10,7 +10,7 @@ services:
       HOST_API_KEY: ${HOST_API_KEY:-abcc}
       BACKTEST_API_BASE: ${BACKTEST_API_BASE:-http://100.99.101.120:10001}
       BACKTEST_SUBMIT_PATH: ${BACKTEST_SUBMIT_PATH:-/v1/scripts/run_backtest}
-      BACKTEST_LOGS_PATH: ${BACKTEST_LOGS_PATH:-/backtests/{backtest_id}/logs}
+      BACKTEST_LOGS_PATH: ${BACKTEST_LOGS_PATH:-/v1/runs/backtest/{backtest_id}/logs/download}
       BACKTEST_API_KEY: ${BACKTEST_API_KEY:-}
       DATA_MOUNT_PATH: ${DATA_MOUNT_PATH:-/opt/backtest}
       RUN_STORAGE_PATH: ${RUN_STORAGE_PATH:-/opt/backtest/runs}

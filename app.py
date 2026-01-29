@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -11,8 +12,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+import aiohttp
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
 app = FastAPI()
@@ -89,8 +92,12 @@ HOST_API_KEY = os.getenv("HOST_API_KEY", "")
 BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.99.101.120:10001")
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
-BACKTEST_LOGS_PATH = env_or_default("BACKTEST_LOGS_PATH", "/backtests/{backtest_docker_run_id}/logs")
-BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
+BACKTEST_LOGS_PATH = env_or_default("BACKTEST_LOGS_PATH", "/v1/runs/backtest/{backtest_id}/logs/download")
+BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/runs/backtest/{backtest_id}")
+BACKTEST_WS_LOGS_PATH = env_or_default(
+    "BACKTEST_WS_LOGS_PATH",
+    "/v1/runs/backtest/{backtest_id}/logs/stream",
+)
 
 RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
 
@@ -273,6 +280,15 @@ def backtest_headers() -> dict[str, str]:
     if BACKTEST_API_KEY:
         headers["X-API-KEY"] = BACKTEST_API_KEY
     return headers
+
+
+def build_ws_url(base_url: str, path: str) -> str:
+    parsed = urlparse(base_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    base_path = parsed.path.rstrip("/")
+    normalized_path = "/" + path.lstrip("/")
+    full_path = f"{base_path}{normalized_path}"
+    return urlunparse((scheme, parsed.netloc, full_path, "", "", ""))
 
 
 def submit_to_backtest(
@@ -472,25 +488,73 @@ async def get_backtest_status(backtest_id: str) -> JSONResponse:
     return JSONResponse(payload)
 
 
-@app.get("/runs/{backtest_id}/logs")
-async def get_logs(backtest_id: str, x_api_key: str | None = Header(default=None)) -> Response:
-    require_api_key(x_api_key)
-    logger.info("get_logs_requested backtest_id=%s", backtest_id)
-    with MAPPING_LOCK:
-        mapping = read_mapping()
-    entry = mapping.get(backtest_id)
-    if not entry:
-        logger.warning("get_logs_run_id_not_found backtest_id=%s", backtest_id)
-        raise HTTPException(status_code=404, detail="backtest_id not found")
-    backtest_docker_run_id = entry.get("backtest_docker_run_id") if isinstance(entry, dict) else entry
-    if not backtest_docker_run_id:
-        logger.warning("get_logs_backtest_id_missing backtest_id=%s", backtest_id)
-        raise HTTPException(status_code=404, detail="backtest_docker_run_id not found for backtest_id")
+@app.websocket("/runs/backtest/{backtest_id}/logs/stream")
+async def stream_backtest_logs(websocket: WebSocket, backtest_id: str) -> None:
+    await websocket.accept()
+    upstream_url = build_ws_url(
+        BACKTEST_API_BASE,
+        BACKTEST_WS_LOGS_PATH.format(backtest_id=backtest_id),
+    )
+    logger.info("ws_logs_connect backtest_id=%s url=%s", backtest_id, upstream_url)
 
-    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_LOGS_PATH.format(backtest_docker_run_id=backtest_docker_run_id)}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(upstream_url, headers=backtest_headers()) as upstream:
+
+                async def client_to_upstream() -> None:
+                    try:
+                        while True:
+                            message = await websocket.receive()
+                            if message.get("type") == "websocket.disconnect":
+                                break
+                            if "text" in message and message["text"] is not None:
+                                await upstream.send_str(message["text"])
+                            elif "bytes" in message and message["bytes"] is not None:
+                                await upstream.send_bytes(message["bytes"])
+                    except WebSocketDisconnect:
+                        pass
+                    except Exception as exc:
+                        logger.warning("ws_client_to_upstream_error backtest_id=%s error=%s", backtest_id, exc)
+
+                async def upstream_to_client() -> None:
+                    try:
+                        async for message in upstream:
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                await websocket.send_text(message.data)
+                            elif message.type == aiohttp.WSMsgType.BINARY:
+                                await websocket.send_bytes(message.data)
+                            elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                                break
+                            elif message.type == aiohttp.WSMsgType.ERROR:
+                                break
+                    except Exception as exc:
+                        logger.warning("ws_upstream_to_client_error backtest_id=%s error=%s", backtest_id, exc)
+
+                tasks = [
+                    asyncio.create_task(client_to_upstream()),
+                    asyncio.create_task(upstream_to_client()),
+                ]
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc:
+                        logger.warning("ws_proxy_task_failed backtest_id=%s error=%s", backtest_id, exc)
+    except Exception as exc:
+        logger.warning("ws_upstream_connect_failed backtest_id=%s error=%s", backtest_id, exc)
+        await websocket.close(code=1011)
+
+
+@app.get("/runs/{backtest_id}/logs")
+async def get_logs(backtest_id: str) -> Response:
+    logger.info("get_logs_requested backtest_id=%s", backtest_id)
+    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_LOGS_PATH.format(backtest_id=backtest_id)}"
     req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
     try:
-        logger.info("get_logs_fetching backtest_id=%s backtest_docker_run_id=%s url=%s", backtest_id, backtest_docker_run_id, url)
+        logger.info("get_logs_fetching backtest_id=%s url=%s", backtest_id, url)
         with urllib.request.urlopen(req) as resp:
             data = resp.read()
             content_type = resp.headers.get("Content-Type", "application/octet-stream")
@@ -501,15 +565,14 @@ async def get_logs(backtest_id: str, x_api_key: str | None = Header(default=None
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8")
         logger.warning(
-            "get_logs_http_error backtest_id=%s backtest_docker_run_id=%s status=%s detail=%s",
+            "get_logs_http_error backtest_id=%s status=%s detail=%s",
             backtest_id,
-            backtest_docker_run_id,
             exc.code,
             detail[:200] if detail else "",
         )
         raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
     except Exception as exc:
-        logger.exception("get_logs_request_failed backtest_id=%s backtest_docker_run_id=%s", backtest_id, backtest_docker_run_id)
+        logger.exception("get_logs_request_failed backtest_id=%s", backtest_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return Response(content=data, media_type=content_type, headers=headers)
