@@ -1,0 +1,26 @@
+name: CICD
+
+on:
+  push:
+    branches: ['main']
+
+jobs:
+  deploy-backend:
+    uses: TBDTBD-git/terraform_config/.github/workflows/reusable-deploy.yml@main
+    with:
+      server_host: "neo-test1"
+      server_user: "root"
+      source_path: "."
+      target_path: "/home/trade/backtest-hub/"
+      commands: |
+        set -e
+        cd /home/trade/backtest-hub/
+        docker compose down
+        docker compose build --no-cache
+        docker compose up -d
+        docker builder prune -f && docker image prune -f
+    secrets:
+      SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY_NEO_TEST1_SERVER }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
