@@ -377,10 +377,8 @@ async def health() -> dict[str, str]:
 async def create_run(
     run_spec: UploadFile = File(...),
     strategy_file: UploadFile = File(...),
-    x_api_key: str | None = Header(default=None),
 ) -> JSONResponse:
     # 入口：research docker 上传 run_spec.json 与策略文件（multipart/form-data）
-    require_api_key(x_api_key)
     logger.info(
         "create_run_received run_spec=%s strategy_file=%s",
         run_spec.filename or "-",
@@ -465,8 +463,7 @@ async def create_run(
 
 
 @app.get("/runs/{backtest_id}")
-async def get_run(backtest_id: str, x_api_key: str | None = Header(default=None)) -> JSONResponse:
-    require_api_key(x_api_key)
+async def get_run(backtest_id: str) -> JSONResponse:
     logger.info("get_run_requested backtest_id=%s", backtest_id)
     with MAPPING_LOCK:
         mapping = read_mapping()
