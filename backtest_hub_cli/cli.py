@@ -15,7 +15,7 @@ from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
-HUB_BASE_URL = os.getenv("BACKTEST_HUB_BASE_URL", "http://100.99.101.120:10033")
+HUB_BASE_URL = os.getenv("BACKTEST_HUB_BASE_URL", "http://100.87.155.67:10033")
 
 
 def build_multipart_form(files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
