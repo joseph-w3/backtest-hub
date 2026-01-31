@@ -324,8 +324,6 @@ def command_help() -> int:
                 "  backtest_id      Backtest ID",
                 "  --out            Output file path (default: {backtest_id}.log)",
                 "",
-                "Global:",
-                "  BACKTEST_HUB_BASE_URL  Hub base URL (default: http://100.99.101.120:10033)",
             ]
         )
     )
