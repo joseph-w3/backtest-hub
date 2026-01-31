@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import secrets
+import uuid
 import threading
 import urllib.error
 import urllib.request
@@ -163,7 +164,7 @@ def parse_decimal_field(field: str, value: object) -> None:
 
 def make_run_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    suffix = secrets.token_hex(3)
+    suffix = uuid.uuid4().hex
     return f"{ts}_{suffix}"
 
 
