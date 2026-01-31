@@ -587,7 +587,7 @@ def main() -> int:
             latency_model_path="quant_trade_v1.backtest.models:LatencyModel",
             config_path="quant_trade_v1.backtest.config:LatencyModelConfig",
             config={
-                "base_latency_nanos": 5_000_000,
+                "base_latency_nanos": 20_000_000,
                 "insert_latency_nanos": 2_000_000,
                 "update_latency_nanos": 3_000_000,
                 "cancel_latency_nanos": 1_000_000,

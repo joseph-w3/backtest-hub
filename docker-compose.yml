@@ -10,14 +10,18 @@ services:
       HOST_API_KEY: ${HOST_API_KEY:-abcc}
       BACKTEST_API_BASE: ${BACKTEST_API_BASE:-http://100.97.194.7:10001}
       BACKTEST_SUBMIT_PATH: ${BACKTEST_SUBMIT_PATH:-/v1/scripts/run_backtest}
+      BACKTEST_RUNS_PATH: ${BACKTEST_RUNS_PATH:-/v1/runs}
       BACKTEST_LOGS_PATH: ${BACKTEST_LOGS_PATH:-/v1/runs/backtest/{backtest_id}/logs/download}
       BACKTEST_API_KEY: ${BACKTEST_API_KEY:-}
       DATA_MOUNT_PATH: ${DATA_MOUNT_PATH:-/opt/backtest}
       RUN_STORAGE_PATH: ${RUN_STORAGE_PATH:-/opt/backtest/runs}
       RUN_MAPPING_PATH: ${RUN_MAPPING_PATH:-/opt/backtest/run_mapping.json}
+      QUEUE_PATH: ${QUEUE_PATH:-/opt/backtest/submit_queue.json}
       BACKTEST_RUNNER_PATH: ${BACKTEST_RUNNER_PATH:-/app/scripts/run_backtest.py}
       MAX_SYMBOLS: ${MAX_SYMBOLS:-50}
       MAX_RANGE_DAYS: ${MAX_RANGE_DAYS:-90}
+      MAX_RUNNING_BACKTESTS: ${MAX_RUNNING_BACKTESTS:-10}
+      QUEUE_POLL_INTERVAL_SECONDS: ${QUEUE_POLL_INTERVAL_SECONDS:-3}
     volumes:
       - ./data:/opt/backtest
     restart: unless-stopped
