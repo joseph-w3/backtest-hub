@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
 app = FastAPI()
@@ -42,6 +42,8 @@ logger = setup_logging()
 @app.on_event("startup")
 async def on_startup() -> None:
     logger.info("app_started")
+    # Start background scheduler for queued submissions.
+    asyncio.create_task(queue_scheduler())
 
 
 @app.middleware("http")
@@ -92,6 +94,7 @@ HOST_API_KEY = os.getenv("HOST_API_KEY", "")
 BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.97.194.7:10001")
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
+BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
 BACKTEST_LOGS_PATH = env_or_default("BACKTEST_LOGS_PATH", "/v1/runs/backtest/{backtest_id}/logs/download")
 BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 BACKTEST_WS_LOGS_PATH = env_or_default(
@@ -103,6 +106,9 @@ RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "script
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
 MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
+MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
+QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
+QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_queue.json")))
 
 ALLOWED_FIELDS = {
     "schema_version",
@@ -128,6 +134,10 @@ ALLOWED_FIELDS = {
 REQUIRED_FIELDS = set(ALLOWED_FIELDS)
 
 MAPPING_LOCK = threading.Lock()
+
+# Protect queue + inflight submissions to avoid oversubmitting to backtest docker.
+QUEUE_STATE_LOCK = asyncio.Lock()
+INFLIGHT_SUBMISSIONS = 0
 
 
 def utc_now() -> str:
@@ -229,24 +239,140 @@ def require_api_key(api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def read_mapping() -> dict[str, Any]:
-    if not RUN_MAPPING_PATH.exists():
+def read_mapping(path: Path = RUN_MAPPING_PATH) -> dict[str, Any]:
+    if not path.exists():
         return {}
-    with RUN_MAPPING_PATH.open("r", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
-def write_mapping(mapping: dict[str, Any]) -> None:
-    RUN_MAPPING_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with RUN_MAPPING_PATH.open("w", encoding="utf-8") as handle:
+def write_mapping(mapping: dict[str, Any], path: Path = RUN_MAPPING_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
         json.dump(mapping, handle, ensure_ascii=True, indent=2)
 
 
-def update_mapping(backtest_id: str, backtest_docker_run_id: str) -> None:
+def update_mapping(backtest_id: str, updates: dict[str, Any]) -> None:
     with MAPPING_LOCK:
         mapping = read_mapping()
-        mapping[backtest_id] = {"backtest_docker_run_id": backtest_docker_run_id, "created_at": utc_now()}
+        entry = mapping.get(backtest_id)
+        if isinstance(entry, dict):
+            entry_dict: dict[str, Any] = dict(entry)
+        elif entry is None:
+            entry_dict = {}
+        else:
+            entry_dict = {"backtest_docker_run_id": entry}
+
+        entry_dict.update(updates)
+        entry_dict.setdefault("created_at", utc_now())
+        mapping[backtest_id] = entry_dict
         write_mapping(mapping)
+
+
+def normalize_join_url(base_url: str, path: str) -> str:
+    return f"{base_url.rstrip('/')}/" + path.lstrip("/")
+
+
+def read_queue(path: Path = QUEUE_PATH) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    items: list[dict[str, str]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        backtest_id = item.get("backtest_id")
+        queued_at = item.get("queued_at")
+        if isinstance(backtest_id, str) and backtest_id and isinstance(queued_at, str) and queued_at:
+            items.append({"backtest_id": backtest_id, "queued_at": queued_at})
+    return items
+
+
+def write_queue(items: list[dict[str, str]], path: Path = QUEUE_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(items, handle, ensure_ascii=True, indent=2)
+
+
+def queue_position(backtest_id: str, path: Path = QUEUE_PATH) -> int | None:
+    items = read_queue(path=path)
+    for idx, item in enumerate(items):
+        if item.get("backtest_id") == backtest_id:
+            return idx
+    return None
+
+
+def enqueue_backtest(backtest_id: str, queued_at: str | None = None, path: Path = QUEUE_PATH) -> None:
+    items = read_queue(path=path)
+    items.append({"backtest_id": backtest_id, "queued_at": queued_at or utc_now()})
+    write_queue(items, path=path)
+
+
+def dequeue_backtest(path: Path = QUEUE_PATH) -> dict[str, str] | None:
+    items = read_queue(path=path)
+    if not items:
+        return None
+    item = items.pop(0)
+    write_queue(items, path=path)
+    return item
+
+
+def remove_from_queue_batch(backtest_ids: list[str], path: Path = QUEUE_PATH) -> set[str]:
+    wanted = {bid for bid in backtest_ids if isinstance(bid, str) and bid}
+    if not wanted:
+        return set()
+    items = read_queue(path=path)
+    kept: list[dict[str, str]] = []
+    removed: set[str] = set()
+    for item in items:
+        bid = item.get("backtest_id")
+        if bid in wanted:
+            removed.add(bid)
+        else:
+            kept.append(item)
+    write_queue(kept, path=path)
+    return removed
+
+
+def count_running_from_runs_payload(payload: dict[str, Any]) -> int:
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        raise ValueError("invalid runs payload")
+    running = 0
+    for run in runs:
+        if isinstance(run, dict) and run.get("status") == "running":
+            running += 1
+    return running
+
+
+def fetch_backtest_runs() -> dict[str, Any]:
+    url = normalize_join_url(BACKTEST_API_BASE, BACKTEST_RUNS_PATH)
+    req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
+    try:
+        logger.info("fetch_backtest_runs start url=%s", url)
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read()
+            payload = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "fetch_backtest_runs_http_error status=%s detail=%s",
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("fetch_backtest_runs_failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="backtest runs invalid response")
+    return payload
 
 
 def build_multipart_form(
@@ -298,7 +424,7 @@ def submit_to_backtest(
     strategy_bytes: bytes,
     runner_bytes: bytes,
 ) -> str:
-    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_SUBMIT_PATH}"
+    url = normalize_join_url(BACKTEST_API_BASE, BACKTEST_SUBMIT_PATH)
     logger.info("submit_to_backtest start backtest_id=%s url=%s", backtest_id, url)
     # backtest docker 最新接口字段名：backtest_id / runer / strategies / configs
     form_body, content_type = build_multipart_form(
@@ -337,7 +463,7 @@ def submit_to_backtest(
 
 
 def fetch_backtest_status(backtest_id: str) -> dict[str, Any]:
-    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_STATUS_PATH.format(backtest_id=backtest_id)}"
+    url = normalize_join_url(BACKTEST_API_BASE, BACKTEST_STATUS_PATH.format(backtest_id=backtest_id))
     req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
     try:
         logger.info("fetch_backtest_status start backtest_id=%s url=%s", backtest_id, url)
@@ -366,6 +492,182 @@ def fetch_backtest_status(backtest_id: str) -> dict[str, Any]:
         "pid": payload.get("pid"),
         "started_at": payload.get("started_at"),
     }
+
+
+def load_run_assets(backtest_id: str) -> tuple[bytes, str, bytes, bytes]:
+    run_dir = RUN_STORAGE_PATH / backtest_id
+    run_spec_path = run_dir / "run_spec.json"
+    run_spec_bytes = run_spec_path.read_bytes()
+    try:
+        run_spec_payload = json.loads(run_spec_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"invalid stored run_spec.json: {exc}") from exc
+    if not isinstance(run_spec_payload, dict):
+        raise ValueError("stored run_spec.json must be an object")
+    strategy_filename = Path(str(run_spec_payload.get("strategy_file") or "strategy.py")).name
+    strategy_path = run_dir / strategy_filename
+    strategy_bytes = strategy_path.read_bytes()
+    if not RUNNER_PATH.is_file():
+        raise FileNotFoundError(f"run_backtest.py not found: {RUNNER_PATH}")
+    runner_bytes = RUNNER_PATH.read_bytes()
+    return run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes
+
+
+async def safe_count_running() -> int | None:
+    try:
+        payload = await asyncio.to_thread(fetch_backtest_runs)
+        return count_running_from_runs_payload(payload)
+    except Exception as exc:
+        logger.warning("count_running_failed error=%s", exc)
+        return None
+
+
+async def submit_with_queue_control(
+    backtest_id: str,
+    run_spec_bytes: bytes,
+    strategy_filename: str,
+    strategy_bytes: bytes,
+    runner_bytes: bytes,
+) -> tuple[str, str | None]:
+    """
+    Returns: (hub_status, backtest_docker_run_id)
+      - hub_status: "submitted" | "queued"
+    """
+    global INFLIGHT_SUBMISSIONS
+
+    # If the queue is not empty, enforce FIFO fairness (no bypass).
+    async with QUEUE_STATE_LOCK:
+        if read_queue():
+            enqueue_backtest(backtest_id)
+            update_mapping(backtest_id, {"status": "queued", "queued_at": utc_now()})
+            return "queued", None
+
+    running = await safe_count_running()
+    if running is None:
+        async with QUEUE_STATE_LOCK:
+            enqueue_backtest(backtest_id)
+            update_mapping(backtest_id, {"status": "queued", "queued_at": utc_now(), "last_error": "count_running_failed"})
+            return "queued", None
+
+    async with QUEUE_STATE_LOCK:
+        if read_queue():
+            enqueue_backtest(backtest_id)
+            update_mapping(backtest_id, {"status": "queued", "queued_at": utc_now()})
+            return "queued", None
+
+        if running + INFLIGHT_SUBMISSIONS < MAX_RUNNING_BACKTESTS:
+            INFLIGHT_SUBMISSIONS += 1
+            should_submit = True
+        else:
+            should_submit = False
+
+        if not should_submit:
+            enqueue_backtest(backtest_id)
+            update_mapping(backtest_id, {"status": "queued", "queued_at": utc_now()})
+            return "queued", None
+
+    try:
+        backtest_docker_run_id = await asyncio.to_thread(
+            submit_to_backtest,
+            backtest_id,
+            run_spec_bytes,
+            strategy_filename,
+            strategy_bytes,
+            runner_bytes,
+        )
+        update_mapping(
+            backtest_id,
+            {
+                "status": "submitted",
+                "submitted_at": utc_now(),
+                "backtest_docker_run_id": backtest_docker_run_id,
+            },
+        )
+        return "submitted", backtest_docker_run_id
+    finally:
+        async with QUEUE_STATE_LOCK:
+            INFLIGHT_SUBMISSIONS = max(0, INFLIGHT_SUBMISSIONS - 1)
+
+
+async def queue_scheduler() -> None:
+    global INFLIGHT_SUBMISSIONS
+
+    while True:
+        try:
+            async with QUEUE_STATE_LOCK:
+                queued = read_queue()
+            if not queued:
+                await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
+                continue
+
+            running = await safe_count_running()
+            if running is None:
+                await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
+                continue
+
+            async with QUEUE_STATE_LOCK:
+                queued = read_queue()
+                available = MAX_RUNNING_BACKTESTS - (running + INFLIGHT_SUBMISSIONS)
+                if available <= 0 or not queued:
+                    should_dequeue = 0
+                else:
+                    should_dequeue = min(available, len(queued))
+                    for _ in range(should_dequeue):
+                        # Reserve inflight slots up-front.
+                        INFLIGHT_SUBMISSIONS += 1
+
+            for _ in range(should_dequeue):
+                item = None
+                async with QUEUE_STATE_LOCK:
+                    item = dequeue_backtest()
+                if not item:
+                    async with QUEUE_STATE_LOCK:
+                        INFLIGHT_SUBMISSIONS = max(0, INFLIGHT_SUBMISSIONS - 1)
+                    continue
+
+                backtest_id = item["backtest_id"]
+                try:
+                    run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes = await asyncio.to_thread(
+                        load_run_assets, backtest_id
+                    )
+                    backtest_docker_run_id = await asyncio.to_thread(
+                        submit_to_backtest,
+                        backtest_id,
+                        run_spec_bytes,
+                        strategy_filename,
+                        strategy_bytes,
+                        runner_bytes,
+                    )
+                    update_mapping(
+                        backtest_id,
+                        {
+                            "status": "submitted",
+                            "submitted_at": utc_now(),
+                            "backtest_docker_run_id": backtest_docker_run_id,
+                        },
+                    )
+                    logger.info(
+                        "queue_scheduler_submitted backtest_id=%s backtest_docker_run_id=%s",
+                        backtest_id,
+                        backtest_docker_run_id,
+                    )
+                except Exception as exc:
+                    # Put back to queue head to retry later.
+                    async with QUEUE_STATE_LOCK:
+                        items = read_queue()
+                        items.insert(0, item)
+                        write_queue(items)
+                    update_mapping(
+                        backtest_id,
+                        {"status": "queued", "last_error": str(exc), "last_error_at": utc_now()},
+                    )
+                    logger.warning("queue_scheduler_submit_failed backtest_id=%s error=%s", backtest_id, exc)
+                finally:
+                    async with QUEUE_STATE_LOCK:
+                        INFLIGHT_SUBMISSIONS = max(0, INFLIGHT_SUBMISSIONS - 1)
+        except Exception as exc:
+            logger.exception("queue_scheduler_crashed error=%s", exc)
+            await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
 
 
 @app.get("/health")
@@ -441,23 +743,85 @@ async def create_run(
     runner_bytes = RUNNER_PATH.read_bytes()
 
     # 7) 调用 backtest docker 提交任务，获取 backtest_docker_run_id
-    backtest_docker_run_id = submit_to_backtest(
+    hub_status, backtest_docker_run_id = await submit_with_queue_control(
         backtest_id=backtest_id,
         run_spec_bytes=run_spec_bytes,
         strategy_filename=strategy_filename,
         strategy_bytes=strategy_bytes,
         runner_bytes=runner_bytes,
     )
-
-    # 8) 维护 backtest_id -> backtest_docker_run_id 映射，供日志下载与状态查询
-    update_mapping(backtest_id, backtest_docker_run_id)
-    logger.info("create_run_submitted backtest_id=%s backtest_docker_run_id=%s", backtest_id, backtest_docker_run_id)
+    logger.info(
+        "create_run_done backtest_id=%s status=%s backtest_docker_run_id=%s",
+        backtest_id,
+        hub_status,
+        backtest_docker_run_id or "-",
+    )
 
     return JSONResponse(
         {
             "backtest_id": backtest_id,
             "backtest_docker_run_id": backtest_docker_run_id,
-            "status": "submitted",
+            "status": hub_status,
+        }
+    )
+
+
+@app.get("/queue")
+async def get_queue(
+    limit: int = 100,
+    offset: int = 0,
+    backtest_id: str | None = None,
+) -> JSONResponse:
+    if limit < 0 or offset < 0:
+        raise HTTPException(status_code=400, detail="limit/offset must be >= 0")
+    async with QUEUE_STATE_LOCK:
+        items = read_queue()
+        total = len(items)
+        sliced = items[offset : offset + limit] if limit else items[offset:]
+        pos = None
+        if backtest_id:
+            for idx, item in enumerate(items):
+                if item.get("backtest_id") == backtest_id:
+                    pos = idx
+                    break
+        position_1_based = (pos + 1) if pos is not None else None
+    return JSONResponse(
+        {
+            "count": total,
+            "items": sliced,
+            "position": position_1_based,
+        }
+    )
+
+
+@app.delete("/queue")
+async def delete_queue(payload: dict[str, Any] = Body(...)) -> JSONResponse:
+    backtest_ids = payload.get("backtest_ids")
+    if not isinstance(backtest_ids, list) or not all(isinstance(x, str) and x for x in backtest_ids):
+        raise HTTPException(status_code=400, detail="backtest_ids must be a non-empty list of strings")
+
+    async with QUEUE_STATE_LOCK:
+        removed = remove_from_queue_batch(backtest_ids)
+
+    with MAPPING_LOCK:
+        mapping = read_mapping()
+
+    not_queued: list[str] = []
+    not_found: list[str] = []
+    for bid in backtest_ids:
+        if bid in removed:
+            update_mapping(bid, {"status": "cancelled", "cancelled_at": utc_now()})
+            continue
+        if bid in mapping:
+            not_queued.append(bid)
+        else:
+            not_found.append(bid)
+
+    return JSONResponse(
+        {
+            "removed": sorted(removed),
+            "not_queued": not_queued,
+            "not_found": not_found,
         }
     )
 
