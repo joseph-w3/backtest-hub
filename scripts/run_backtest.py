@@ -638,7 +638,7 @@ def main() -> int:
             logging=LoggingConfig(
                 log_level="INFO",
                 log_directory=log_dir.as_posix(),
-                log_level_file="INFO",
+                log_level_file="WARN",
                 log_file_name="engine",
                 clear_log_file=True,
             ),
