@@ -93,7 +93,7 @@ BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.97.194.7:100
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
 BACKTEST_LOGS_PATH = env_or_default("BACKTEST_LOGS_PATH", "/v1/runs/backtest/{backtest_id}/logs/download")
-BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/runs/backtest/{backtest_id}")
+BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 BACKTEST_WS_LOGS_PATH = env_or_default(
     "BACKTEST_WS_LOGS_PATH",
     "/v1/runs/backtest/{backtest_id}/logs/stream",
