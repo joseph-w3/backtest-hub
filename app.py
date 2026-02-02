@@ -111,7 +111,15 @@ MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
 QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
 QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_queue.json")))
 
-ALLOWED_FIELDS = {
+DEFAULT_LATENCY_CONFIG: dict[str, int] = {
+    "base_latency_nanos": 20_000_000,
+    "insert_latency_nanos": 2_000_000,
+    "update_latency_nanos": 3_000_000,
+    "cancel_latency_nanos": 1_000_000,
+}
+LATENCY_CONFIG_KEYS = set(DEFAULT_LATENCY_CONFIG.keys())
+
+REQUIRED_FIELDS = {
     "schema_version",
     "requested_by",
     "strategy_file",
@@ -131,8 +139,9 @@ ALLOWED_FIELDS = {
     "seed",
     "tags",
 }
+OPTIONAL_FIELDS = {"latency_config"}
 
-REQUIRED_FIELDS = set(ALLOWED_FIELDS)
+ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 
 MAPPING_LOCK = threading.Lock()
 
@@ -197,6 +206,9 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload.get("tags"), dict):
         raise ValueError("tags must be an object")
 
+    if "latency_config" in payload:
+        payload["latency_config"] = parse_latency_config(payload["latency_config"])
+
     start_value = payload["start"]
     end_value = payload["end"]
     if isinstance(start_value, (int, float)) and isinstance(end_value, (int, float)):
@@ -228,9 +240,27 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
     parse_decimal_field("futures_taker_fee", payload["futures_taker_fee"])
 
     sanitized: dict[str, Any] = {}
-    for field in ALLOWED_FIELDS:
+    for field in REQUIRED_FIELDS:
         sanitized[field] = payload[field]
+    if "latency_config" in payload:
+        sanitized["latency_config"] = payload["latency_config"]
     return sanitized
+
+
+def parse_latency_config(value: object) -> dict[str, int]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("latency_config must be an object")
+    unknown = set(value.keys()) - LATENCY_CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"latency_config has unknown keys: {sorted(unknown)}")
+    parsed: dict[str, int] = {}
+    for key, raw in value.items():
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            raise ValueError(f"latency_config.{key} must be a non-negative integer")
+        parsed[str(key)] = raw
+    return parsed
 
 
 def require_api_key(api_key: str | None) -> None:

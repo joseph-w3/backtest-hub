@@ -14,6 +14,12 @@
   "spot_taker_fee": 0.001,
   "futures_maker_fee": 0.001,
   "futures_taker_fee": 0.001,
+  "latency_config": {
+    "base_latency_nanos": 20000000,
+    "insert_latency_nanos": 2000000,
+    "update_latency_nanos": 3000000,
+    "cancel_latency_nanos": 1000000
+  },
   "symbols": [
     "ACTUSDT",
     "ACTUSDT-PERP",
