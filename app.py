@@ -96,7 +96,7 @@ BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.65.27.118:10
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
 BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
-BACKTEST_LOGS_PATH = env_or_default("BACKTEST_LOGS_PATH", "/v1/runs/backtest/{backtest_id}/logs/download")
+BACKTEST_LOGS_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/logs/download"
 BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 BACKTEST_WS_LOGS_PATH = env_or_default(
     "BACKTEST_WS_LOGS_PATH",
@@ -913,7 +913,7 @@ async def stream_backtest_logs(websocket: WebSocket, backtest_id: str) -> None:
 @app.get("/runs/{backtest_id}/logs")
 async def get_logs(backtest_id: str) -> Response:
     logger.info("get_logs_requested backtest_id=%s", backtest_id)
-    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_LOGS_PATH.format(backtest_id=backtest_id)}"
+    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_LOGS_DOWNLOAD_PATH.format(backtest_id=backtest_id)}"
     req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
     try:
         logger.info("get_logs_fetching backtest_id=%s url=%s", backtest_id, url)
