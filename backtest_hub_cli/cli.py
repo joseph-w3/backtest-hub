@@ -171,8 +171,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     submit_parser = subparsers.add_parser("submit", help="Submit run_spec.json and strategy file")
     submit_parser.add_argument(
         "--strategy-file",
-        default="strategies/spot_futures_arb_diagnostics.py",
-        help="Path to strategy file",
+        default=None,
+        help="Path to strategy file (optional; fallback to run_spec.json: strategy_file; and ./strategies/<same-name>)",
     )
     submit_parser.add_argument(
         "--run-spec",
@@ -211,12 +211,61 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_strategy_path(raw: str) -> Path | None:
+    """
+    Resolve a strategy file path.
+
+    Resolution order:
+    1) Use the given path (absolute or relative to cwd) if it exists.
+    2) If not found and the path is not absolute, fallback to ./strategies/<basename>.
+    """
+    candidate = Path(str(raw))
+    if candidate.is_file():
+        return candidate
+    if not candidate.is_absolute():
+        fallback = Path.cwd() / "strategies" / candidate.name
+        if fallback.is_file():
+            return fallback
+    return None
+
+
 def command_submit(args: argparse.Namespace) -> int:
     run_spec_path = Path(args.run_spec)
-    strategy_path = Path(args.strategy_file)
-    if not strategy_path.is_file():
-        print(f"strategy file not found: {strategy_path}")
+
+    # Read run_spec.json first to get strategy_file if not specified.
+    run_spec_data: dict[str, Any] = {}
+    if not args.strategy_file and run_spec_path.exists():
+        try:
+            with run_spec_path.open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    run_spec_data = loaded
+        except json.JSONDecodeError as exc:
+            print(f"Invalid run_spec.json: {exc}", file=sys.stderr)
+            return 1
+
+    # Get strategy file from args or run_spec.json.
+    if args.strategy_file:
+        raw_strategy = args.strategy_file
+    elif run_spec_data.get("strategy_file"):
+        raw_strategy = str(run_spec_data["strategy_file"])
+    else:
+        print("strategy file not specified and not found in run_spec.json", file=sys.stderr)
         return 1
+
+    strategy_path = resolve_strategy_path(raw_strategy)
+    if strategy_path is None:
+        candidate = Path(str(raw_strategy))
+        tried_fallback = Path.cwd() / "strategies" / candidate.name
+        if candidate.is_absolute():
+            print(f"strategy file not found: {candidate}", file=sys.stderr)
+        else:
+            print(
+                f"strategy file not found: {candidate} (also tried: {tried_fallback})",
+                file=sys.stderr,
+            )
+        return 1
+    print(f"Using strategy file: {strategy_path.resolve()}")
 
     if not args.no_generate or not run_spec_path.exists():
         script_path = resolve_local_run_spec_script()
@@ -309,7 +358,7 @@ def command_help() -> int:
                 "Backtest Hub CLI commands:",
                 "",
                 "submit  Submit run_spec.json and strategy file to /runs",
-                "  --strategy-file  Strategy file path",
+                "  --strategy-file  Strategy file path (optional; fallback to run_spec.json: strategy_file; and ./strategies/<same-name>)",
                 "  --run-spec       Run spec path (auto-generate unless --no-generate)",
                 "  --name           Strategy name (required, recorded in history)",
                 "  --no-generate    Skip run_spec generation",
