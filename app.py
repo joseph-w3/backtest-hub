@@ -92,7 +92,7 @@ RUN_STORAGE_PATH = Path(env_or_default("RUN_STORAGE_PATH", str(DATA_MOUNT_PATH /
 RUN_MAPPING_PATH = Path(env_or_default("RUN_MAPPING_PATH", str(DATA_MOUNT_PATH / "run_mapping.json")))
 HOST_API_KEY = os.getenv("HOST_API_KEY", "")
 
-BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.97.194.7:10001")
+BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.65.27.118:10001")
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
 BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
