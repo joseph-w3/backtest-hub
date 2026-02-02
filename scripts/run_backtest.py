@@ -51,6 +51,14 @@ DEFAULT_MARGIN_INIT = Decimal("0.05")
 DEFAULT_MARGIN_MAINT = Decimal("0.025")
 DEFAULT_BOOK_TYPE = "L2_MBP"
 
+DEFAULT_LATENCY_CONFIG: dict[str, int] = {
+    "base_latency_nanos": 20_000_000,
+    "insert_latency_nanos": 2_000_000,
+    "update_latency_nanos": 3_000_000,
+    "cancel_latency_nanos": 1_000_000,
+}
+LATENCY_CONFIG_KEYS = set(DEFAULT_LATENCY_CONFIG.keys())
+
 # CSV report outputs live alongside status.json under BACKTEST_LOGS_PATH/{backtest_id}/.
 REPORTS_OUTPUT_ROOT = os.environ.get("BACKTEST_LOGS_PATH", "/opt/backtest_logs")
 
@@ -76,6 +84,12 @@ REQUIRED_FIELDS = {
     "tags",
 }
 
+OPTIONAL_FIELDS = {
+    "latency_config",
+}
+
+ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run backtest from RunSpec JSON.")
@@ -95,7 +109,7 @@ def _load_run_spec(path: Path) -> dict:
 
 def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> Path:
     missing = REQUIRED_FIELDS - set(run_spec.keys())
-    extra = set(run_spec.keys()) - REQUIRED_FIELDS
+    extra = set(run_spec.keys()) - ALLOWED_FIELDS
     if missing:
         raise ValueError(f"RunSpec missing required fields: {sorted(missing)}")
     if extra:
@@ -111,6 +125,9 @@ def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> Path:
         raise ValueError("RunSpec seed must be an integer.")
     if not isinstance(run_spec["tags"], dict):
         raise ValueError("RunSpec tags must be an object.")
+
+    if "latency_config" in run_spec:
+        _parse_latency_config(run_spec["latency_config"])
 
     for field in ("strategy_entry", "strategy_config_path"):
         value = run_spec[field]
@@ -144,6 +161,25 @@ def _parse_decimal(field: str, value: object) -> Decimal:
     if parsed < 0:
         raise ValueError(f"RunSpec {field} must be >= 0.")
     return parsed
+
+
+def _parse_latency_config(value: object) -> dict[str, int]:
+    if value is None:
+        return dict(DEFAULT_LATENCY_CONFIG)
+    if not isinstance(value, dict):
+        raise ValueError("RunSpec latency_config must be an object.")
+    unknown = set(value.keys()) - LATENCY_CONFIG_KEYS
+    if unknown:
+        raise ValueError(f"RunSpec latency_config has unknown keys: {sorted(unknown)}")
+    parsed = dict(DEFAULT_LATENCY_CONFIG)
+    for key, raw in value.items():
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(f"RunSpec latency_config.{key} must be a non-negative integer.")
+        if raw < 0:
+            raise ValueError(f"RunSpec latency_config.{key} must be >= 0.")
+        parsed[str(key)] = raw
+    return parsed
+
 
 def _validate_time_order(start: str | int, end: str | int) -> None:
     start_dt = _parse_time(start)
@@ -764,12 +800,7 @@ def main() -> int:
         latency_model_config = ImportableLatencyModelConfig(
             latency_model_path="quant_trade_v1.backtest.models:LatencyModel",
             config_path="quant_trade_v1.backtest.config:LatencyModelConfig",
-            config={
-                "base_latency_nanos": 20_000_000,
-                "insert_latency_nanos": 2_000_000,
-                "update_latency_nanos": 3_000_000,
-                "cancel_latency_nanos": 1_000_000,
-            },
+            config=_parse_latency_config(run_spec.get("latency_config")),
         )
 
         strategy_config = dict(run_spec["strategy_config"])

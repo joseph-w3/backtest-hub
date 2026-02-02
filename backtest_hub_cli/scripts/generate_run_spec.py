@@ -18,6 +18,12 @@ SPOT_MAKER_FEE = 0.001
 SPOT_TAKER_FEE = 0.001
 FUTURES_MAKER_FEE = 0.001
 FUTURES_TAKER_FEE = 0.001
+LATENCY_CONFIG = {
+    "base_latency_nanos": 20_000_000,
+    "insert_latency_nanos": 2_000_000,
+    "update_latency_nanos": 3_000_000,
+    "cancel_latency_nanos": 1_000_000,
+}
 SYMBOLS = ["ACTUSDT", "ACTUSDT-PERP", "DOTUSDT", "DOTUSDT-PERP"]
 START_TIME = "2025-11-10T00:00:00.000Z"
 END_TIME = "2025-11-11T23:59:59.999Z"
@@ -51,6 +57,7 @@ def main() -> int:
         "spot_taker_fee": SPOT_TAKER_FEE,
         "futures_maker_fee": FUTURES_MAKER_FEE,
         "futures_taker_fee": FUTURES_TAKER_FEE,
+        "latency_config": LATENCY_CONFIG,
         "symbols": SYMBOLS,
         "start": START_TIME,
         "end": END_TIME,
