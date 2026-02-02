@@ -51,6 +51,9 @@ DEFAULT_MARGIN_INIT = Decimal("0.05")
 DEFAULT_MARGIN_MAINT = Decimal("0.025")
 DEFAULT_BOOK_TYPE = "L2_MBP"
 
+# CSV report outputs live alongside status.json under BACKTEST_LOGS_PATH/{backtest_id}/.
+REPORTS_OUTPUT_ROOT = os.environ.get("BACKTEST_LOGS_PATH", "/opt/backtest_logs")
+
 REQUIRED_FIELDS = {
     "backtest_id",
     "schema_version",
@@ -460,6 +463,180 @@ def _write_status(path: Path, payload: dict) -> None:
         json.dump(payload, handle, ensure_ascii=True, indent=2)
 
 
+def _export_csv_reports(
+    engine: object,
+    output_dir: Path,
+    *,
+    include_spot_account: bool,
+    include_futures_account: bool,
+) -> tuple[dict[str, str], list[str]]:
+    """
+    Export commonly-used reports to CSV, mirroring example.py behavior.
+
+    Returns:
+      - reports mapping: logical_name -> filename (within output_dir)
+      - errors: list of string messages (best-effort; export failures do not abort the run)
+    """
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    reports: dict[str, str] = {}
+    errors: list[str] = []
+
+    trader = getattr(engine, "trader", None)
+    if trader is None:
+        return reports, ["engine.trader not available; cannot export CSV reports"]
+
+    def _write_df(name: str, df: object, filename: str) -> None:
+        empty = getattr(df, "empty", None)
+        if empty is True:
+            return
+        path = output_dir / filename
+        df.to_csv(path)  # type: ignore[attr-defined]
+        reports[name] = filename
+
+    fills_report = None
+    try:
+        fills_report = trader.generate_fills_report()
+        _write_df("fills", fills_report, "fills.csv")
+    except Exception as exc:
+        errors.append(f"fills export failed: {exc}")
+
+    if include_spot_account:
+        try:
+            account_report_spot = trader.generate_account_report(BINANCE_SPOT_VENUE)
+            _write_df("account_spot", account_report_spot, "account_spot.csv")
+        except Exception as exc:
+            errors.append(f"account_spot export failed: {exc}")
+
+    if include_futures_account:
+        try:
+            account_report_futures = trader.generate_account_report(BINANCE_FUTURES_VENUE)
+            _write_df("account_futures", account_report_futures, "account_futures.csv")
+        except Exception as exc:
+            errors.append(f"account_futures export failed: {exc}")
+
+    try:
+        order_fills_report = trader.generate_order_fills_report()
+        _write_df("order_fills", order_fills_report, "order_fills.csv")
+    except Exception as exc:
+        errors.append(f"order_fills export failed: {exc}")
+
+    try:
+        positions_report = trader.generate_positions_report()
+        _write_df("positions", positions_report, "positions.csv")
+    except Exception as exc:
+        errors.append(f"positions export failed: {exc}")
+
+    # Best-effort concurrent max notional stats (stdout only), derived from fills report.
+    _print_concurrent_max_position_from_fills(fills_report)
+
+    return reports, errors
+
+
+def _print_concurrent_max_position_from_fills(fills_report: object) -> None:
+    if fills_report is None:
+        print("\n" + "=" * 70)
+        print("🌍 全局并发仓位统计 (Concurrent Max Position)")
+        print("=" * 70)
+        print("  No fills data available")
+        print("=" * 70 + "\n")
+        return
+
+    empty = getattr(fills_report, "empty", None)
+    if empty is True:
+        print("\n" + "=" * 70)
+        print("🌍 全局并发仓位统计 (Concurrent Max Position)")
+        print("=" * 70)
+        print("  No fills data available")
+        print("=" * 70 + "\n")
+        return
+
+    # We avoid importing pandas here; use DataFrame-like APIs dynamically.
+    required_cols = ("ts_event", "instrument_id", "order_side", "last_qty", "last_px")
+    cols = getattr(fills_report, "columns", None)
+    if cols is None or any(c not in cols for c in required_cols):
+        print("\n" + "=" * 70)
+        print("🌍 全局并发仓位统计 (Concurrent Max Position)")
+        print("=" * 70)
+        print("  Cannot compute: fills_report missing required columns")
+        if cols is not None:
+            print(f"  columns={list(cols)}")
+        print("=" * 70 + "\n")
+        return
+
+    try:
+        sorted_fills = fills_report.sort_values("ts_event")
+    except Exception:
+        sorted_fills = fills_report
+
+    positions: dict[str, Decimal] = {}
+    max_concurrent_spot_notional = Decimal("0")
+    max_concurrent_perp_notional = Decimal("0")
+
+    for _, fill in sorted_fills.iterrows():  # type: ignore[attr-defined]
+        instrument_id = str(fill["instrument_id"])
+        side = str(fill["order_side"]).upper()
+        qty = Decimal(str(fill["last_qty"]))
+        price = Decimal(str(fill["last_px"]))
+
+        if instrument_id not in positions:
+            positions[instrument_id] = Decimal("0")
+        if side == "BUY":
+            positions[instrument_id] += qty
+        else:
+            positions[instrument_id] -= qty
+
+        current_spot_notional = Decimal("0")
+        current_perp_notional = Decimal("0")
+
+        for inst_id, pos in positions.items():
+            notional = abs(pos) * price  # Approximation, mirrors example.py behavior
+            inst_upper = inst_id.upper()
+            is_perp = (
+                "-PERP" in inst_upper
+                or "PERP" in inst_upper
+                or "FUTURES" in inst_upper
+            )
+            if is_perp:
+                current_perp_notional += notional
+            else:
+                current_spot_notional += notional
+
+        if current_spot_notional > max_concurrent_spot_notional:
+            max_concurrent_spot_notional = current_spot_notional
+        if current_perp_notional > max_concurrent_perp_notional:
+            max_concurrent_perp_notional = current_perp_notional
+
+    print("\n" + "=" * 70)
+    print("🌍 全局并发仓位统计 (Concurrent Max Position)")
+    print("=" * 70)
+    print(f"  最大并发Spot名义价值: {max_concurrent_spot_notional:,.2f} USDT")
+    print(f"  最大并发Perp名义价值: {max_concurrent_perp_notional:,.2f} USDT")
+    print(
+        f"  最大并发总名义价值: {max_concurrent_spot_notional + max_concurrent_perp_notional:,.2f} USDT"
+    )
+    print("=" * 70 + "\n")
+
+
+def _print_reports_summary(output_dir: Path, reports: dict[str, str], errors: list[str]) -> None:
+    print("\n" + "=" * 70)
+    print(f"[REPORTS] CSV outputs saved to: {output_dir}")
+    print("=" * 70)
+    if reports:
+        print("Files:")
+        for name in sorted(reports):
+            print(f"  - {name}: {reports[name]}")
+    else:
+        print("Files: (none)")
+    if errors:
+        print("-" * 70)
+        print("Export errors:")
+        for msg in errors:
+            print(f"  - {msg}")
+    print("=" * 70 + "\n")
+
+
 def main() -> int:
     args = _parse_args()
     run_spec_path = Path(args.run_spec).expanduser()
@@ -467,9 +644,10 @@ def main() -> int:
     strategy_file_path = _validate_run_spec(run_spec, run_spec_path)
 
     backtest_id = run_spec["backtest_id"]
-    log_root = os.environ.get("BACKTEST_LOGS_PATH", "/opt/backtest_logs")
+    log_root = REPORTS_OUTPUT_ROOT
     log_dir = Path(log_root) / backtest_id
     status_path = log_dir / "status.json"
+    reports_dir = log_dir
 
     started_at = datetime.now(timezone.utc).isoformat()
     status = _build_status_payload(backtest_id, run_spec)
@@ -650,13 +828,35 @@ def main() -> int:
             data=data_configs,
             venues=venues_configs,
             chunk_size=run_spec["chunk_size"],
-            dispose_on_completion=True,
+            # Keep engine alive for report export, then dispose explicitly.
+            dispose_on_completion=False,
             start=run_spec["start"],
             end=run_spec["end"],
         )
 
         node = BacktestNode(configs=[run_config])
         node.run()
+
+        engine = node.get_engine(run_config.id)
+        if engine is None:
+            raise RuntimeError("Backtest engine not found for run config.")
+
+        reports, report_errors = _export_csv_reports(
+            engine,
+            reports_dir,
+            include_spot_account=bool(spot_instruments),
+            include_futures_account=bool(futures_instruments),
+        )
+        _print_reports_summary(reports_dir, reports, report_errors)
+        status["reports_output_dir"] = reports_dir.as_posix()
+        status["reports"] = reports
+        if report_errors:
+            status["report_export_errors"] = report_errors
+
+        try:
+            engine.dispose()
+        except Exception:
+            pass
 
         status.update(
             {
