@@ -522,6 +522,7 @@ def fetch_backtest_status(backtest_id: str) -> dict[str, Any]:
         "status": payload.get("status"),
         "pid": payload.get("pid"),
         "started_at": payload.get("started_at"),
+        "finished_at": payload.get("finished_at"),
     }
 
 
