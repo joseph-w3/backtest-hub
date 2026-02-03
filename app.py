@@ -19,6 +19,12 @@ import aiohttp
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
+from scheduler import (
+    parse_backtest_api_bases,
+    required_memory_gb_from_run_spec,
+    select_backtest_docker,
+)
+
 app = FastAPI()
 
 
@@ -92,16 +98,22 @@ RUN_STORAGE_PATH = Path(env_or_default("RUN_STORAGE_PATH", str(DATA_MOUNT_PATH /
 RUN_MAPPING_PATH = Path(env_or_default("RUN_MAPPING_PATH", str(DATA_MOUNT_PATH / "run_mapping.json")))
 HOST_API_KEY = os.getenv("HOST_API_KEY", "")
 
-BACKTEST_API_BASE = env_or_default("BACKTEST_API_BASE", "http://100.65.27.118:10001")
+BACKTEST_API_BASES = parse_backtest_api_bases(os.getenv("BACKTEST_API_BASES"), "")
+if not BACKTEST_API_BASES:
+    raise RuntimeError("BACKTEST_API_BASES is required")
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
 BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
 BACKTEST_LOGS_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/logs/download"
+BACKTEST_CSV_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/download_csv"
+BACKTEST_KILL_PATH = "/v1/runs/backtest/{backtest_id}/kill"
 BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 BACKTEST_WS_LOGS_PATH = env_or_default(
     "BACKTEST_WS_LOGS_PATH",
     "/v1/runs/backtest/{backtest_id}/logs/stream",
 )
+BACKTEST_METRICS_PATH = env_or_default("BACKTEST_METRICS_PATH", "v1/docker/metrics")
+BACKTEST_METRICS_TIMEOUT_SECONDS = float(os.getenv("BACKTEST_METRICS_TIMEOUT_SECONDS", "3"))
 
 RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
 
@@ -147,11 +159,28 @@ MAPPING_LOCK = threading.Lock()
 
 # Protect queue + inflight submissions to avoid oversubmitting to backtest docker.
 QUEUE_STATE_LOCK = asyncio.Lock()
-INFLIGHT_SUBMISSIONS = 0
+INFLIGHT_MEMORY_GB: dict[str, float] = {}
+INFLIGHT_COUNTS: dict[str, int] = {}
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def reserve_inflight(base_url: str, required_memory_gb: float) -> None:
+    INFLIGHT_MEMORY_GB[base_url] = INFLIGHT_MEMORY_GB.get(base_url, 0.0) + required_memory_gb
+    INFLIGHT_COUNTS[base_url] = INFLIGHT_COUNTS.get(base_url, 0) + 1
+
+
+def release_inflight(base_url: str, required_memory_gb: float) -> None:
+    if base_url in INFLIGHT_MEMORY_GB:
+        INFLIGHT_MEMORY_GB[base_url] = max(0.0, INFLIGHT_MEMORY_GB[base_url] - required_memory_gb)
+        if INFLIGHT_MEMORY_GB[base_url] == 0.0:
+            INFLIGHT_MEMORY_GB.pop(base_url, None)
+    if base_url in INFLIGHT_COUNTS:
+        INFLIGHT_COUNTS[base_url] = max(0, INFLIGHT_COUNTS[base_url] - 1)
+        if INFLIGHT_COUNTS[base_url] == 0:
+            INFLIGHT_COUNTS.pop(base_url, None)
 
 
 def parse_iso8601(value: str) -> datetime:
@@ -371,39 +400,6 @@ def remove_from_queue_batch(backtest_ids: list[str], path: Path = QUEUE_PATH) ->
     return removed
 
 
-def count_running_from_runs_payload(payload: dict[str, Any]) -> int:
-    runs = payload.get("runs")
-    if not isinstance(runs, list):
-        raise ValueError("invalid runs payload")
-    running = 0
-    for run in runs:
-        if isinstance(run, dict) and run.get("status") == "running":
-            running += 1
-    return running
-
-
-def fetch_backtest_runs() -> dict[str, Any]:
-    url = normalize_join_url(BACKTEST_API_BASE, BACKTEST_RUNS_PATH)
-    req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
-    try:
-        logger.info("fetch_backtest_runs start url=%s", url)
-        with urllib.request.urlopen(req) as resp:
-            body = resp.read()
-            payload = json.loads(body.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8")
-        logger.warning(
-            "fetch_backtest_runs_http_error status=%s detail=%s",
-            exc.code,
-            detail[:200] if detail else "",
-        )
-        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
-    except Exception as exc:
-        logger.exception("fetch_backtest_runs_failed")
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=502, detail="backtest runs invalid response")
-    return payload
 
 
 def build_multipart_form(
@@ -439,6 +435,40 @@ def backtest_headers() -> dict[str, str]:
     return headers
 
 
+def resolve_backtest_api_base(backtest_id: str | None) -> str:
+    if backtest_id:
+        with MAPPING_LOCK:
+            mapping = read_mapping()
+        entry = mapping.get(backtest_id)
+        if isinstance(entry, dict):
+            base_url = entry.get("backtest_api_base")
+            if isinstance(base_url, str) and base_url:
+                return base_url
+    return BACKTEST_API_BASES[0]
+
+
+def get_mapping_entry(backtest_id: str) -> dict[str, Any] | None:
+    with MAPPING_LOCK:
+        mapping = read_mapping()
+    entry = mapping.get(backtest_id)
+    if not isinstance(entry, dict):
+        return None
+    return entry
+
+
+def ensure_backtest_routable(backtest_id: str, *, allow_running_only: bool = True) -> dict[str, Any]:
+    entry = get_mapping_entry(backtest_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="backtest_id not found")
+    base_url = entry.get("backtest_api_base")
+    status = entry.get("status")
+    if not isinstance(base_url, str) or not base_url:
+        raise HTTPException(status_code=409, detail="Backtest is still queued")
+    if allow_running_only and status not in {"submitted", "running"}:
+        raise HTTPException(status_code=409, detail="Backtest is still queued")
+    return entry
+
+
 def build_ws_url(base_url: str, path: str) -> str:
     parsed = urlparse(base_url)
     scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -449,13 +479,14 @@ def build_ws_url(base_url: str, path: str) -> str:
 
 
 def submit_to_backtest(
+    base_url: str,
     backtest_id: str,
     run_spec_bytes: bytes,
     strategy_filename: str,
     strategy_bytes: bytes,
     runner_bytes: bytes,
 ) -> str:
-    url = normalize_join_url(BACKTEST_API_BASE, BACKTEST_SUBMIT_PATH)
+    url = normalize_join_url(base_url, BACKTEST_SUBMIT_PATH)
     logger.info("submit_to_backtest start backtest_id=%s url=%s", backtest_id, url)
     # backtest docker 最新接口字段名：backtest_id / runer / strategies / configs
     form_body, content_type = build_multipart_form(
@@ -493,8 +524,8 @@ def submit_to_backtest(
     return str(backtest_docker_run_id)
 
 
-def fetch_backtest_status(backtest_id: str) -> dict[str, Any]:
-    url = normalize_join_url(BACKTEST_API_BASE, BACKTEST_STATUS_PATH.format(backtest_id=backtest_id))
+def fetch_backtest_status(base_url: str, backtest_id: str) -> dict[str, Any]:
+    url = normalize_join_url(base_url, BACKTEST_STATUS_PATH.format(backtest_id=backtest_id))
     req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
     try:
         logger.info("fetch_backtest_status start backtest_id=%s url=%s", backtest_id, url)
@@ -526,16 +557,28 @@ def fetch_backtest_status(backtest_id: str) -> dict[str, Any]:
     }
 
 
-def load_run_assets(backtest_id: str) -> tuple[bytes, str, bytes, bytes]:
-    run_dir = RUN_STORAGE_PATH / backtest_id
-    run_spec_path = run_dir / "run_spec.json"
-    run_spec_bytes = run_spec_path.read_bytes()
+def parse_run_spec_bytes(run_spec_bytes: bytes) -> dict[str, Any]:
     try:
         run_spec_payload = json.loads(run_spec_bytes.decode("utf-8"))
     except Exception as exc:
         raise ValueError(f"invalid stored run_spec.json: {exc}") from exc
     if not isinstance(run_spec_payload, dict):
         raise ValueError("stored run_spec.json must be an object")
+    return run_spec_payload
+
+
+def load_run_spec_payload(backtest_id: str) -> dict[str, Any]:
+    run_dir = RUN_STORAGE_PATH / backtest_id
+    run_spec_path = run_dir / "run_spec.json"
+    run_spec_bytes = run_spec_path.read_bytes()
+    return parse_run_spec_bytes(run_spec_bytes)
+
+
+def load_run_assets(backtest_id: str) -> tuple[bytes, str, bytes, bytes]:
+    run_dir = RUN_STORAGE_PATH / backtest_id
+    run_spec_path = run_dir / "run_spec.json"
+    run_spec_bytes = run_spec_path.read_bytes()
+    run_spec_payload = parse_run_spec_bytes(run_spec_bytes)
     strategy_filename = Path(str(run_spec_payload.get("strategy_file") or "strategy.py")).name
     strategy_path = run_dir / strategy_filename
     strategy_bytes = strategy_path.read_bytes()
@@ -545,13 +588,26 @@ def load_run_assets(backtest_id: str) -> tuple[bytes, str, bytes, bytes]:
     return run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes
 
 
-async def safe_count_running() -> int | None:
-    try:
-        payload = await asyncio.to_thread(fetch_backtest_runs)
-        return count_running_from_runs_payload(payload)
-    except Exception as exc:
-        logger.warning("count_running_failed error=%s", exc)
-        return None
+async def pick_backtest_target(required_memory_gb: float):
+    async with QUEUE_STATE_LOCK:
+        reserved_snapshot = dict(INFLIGHT_MEMORY_GB)
+        inflight_counts_snapshot = dict(INFLIGHT_COUNTS)
+
+    max_running = MAX_RUNNING_BACKTESTS if MAX_RUNNING_BACKTESTS > 0 else None
+    runs_path = BACKTEST_RUNS_PATH if max_running is not None else None
+
+    return await asyncio.to_thread(
+        select_backtest_docker,
+        base_urls=BACKTEST_API_BASES,
+        metrics_path=BACKTEST_METRICS_PATH,
+        runs_path=runs_path,
+        headers=backtest_headers(),
+        required_memory_gb=required_memory_gb,
+        reserved_memory_gb=reserved_snapshot,
+        inflight_counts=inflight_counts_snapshot,
+        max_running=max_running,
+        timeout_seconds=BACKTEST_METRICS_TIMEOUT_SECONDS,
+    )
 
 
 async def submit_with_queue_control(
@@ -560,47 +616,75 @@ async def submit_with_queue_control(
     strategy_filename: str,
     strategy_bytes: bytes,
     runner_bytes: bytes,
+    required_memory_gb: float,
 ) -> tuple[str, str | None]:
     """
     Returns: (hub_status, backtest_docker_run_id)
       - hub_status: "submitted" | "queued"
     """
-    global INFLIGHT_SUBMISSIONS
-
     # If the queue is not empty, enforce FIFO fairness (no bypass).
     async with QUEUE_STATE_LOCK:
         if read_queue():
             enqueue_backtest(backtest_id)
-            update_mapping(backtest_id, {"status": "queued", "queued_at": utc_now()})
+            update_mapping(
+                backtest_id,
+                {
+                    "status": "queued",
+                    "queued_at": utc_now(),
+                    "required_memory_gb": required_memory_gb,
+                },
+            )
             return "queued", None
 
-    running = await safe_count_running()
-    if running is None:
+    selection = await pick_backtest_target(required_memory_gb)
+    if selection is None:
         async with QUEUE_STATE_LOCK:
             enqueue_backtest(backtest_id)
-            update_mapping(backtest_id, {"status": "queued", "queued_at": utc_now(), "last_error": "count_running_failed"})
+            update_mapping(
+                backtest_id,
+                {
+                    "status": "queued",
+                    "queued_at": utc_now(),
+                    "required_memory_gb": required_memory_gb,
+                    "last_error": "no_capacity",
+                },
+            )
             return "queued", None
 
     async with QUEUE_STATE_LOCK:
         if read_queue():
             enqueue_backtest(backtest_id)
-            update_mapping(backtest_id, {"status": "queued", "queued_at": utc_now()})
+            update_mapping(
+                backtest_id,
+                {
+                    "status": "queued",
+                    "queued_at": utc_now(),
+                    "required_memory_gb": required_memory_gb,
+                },
+            )
             return "queued", None
 
-        if running + INFLIGHT_SUBMISSIONS < MAX_RUNNING_BACKTESTS:
-            INFLIGHT_SUBMISSIONS += 1
-            should_submit = True
-        else:
-            should_submit = False
-
-        if not should_submit:
+        current_reserved = INFLIGHT_MEMORY_GB.get(selection.base_url, 0.0)
+        available = selection.metrics.memory_free_gb - current_reserved
+        if available < required_memory_gb:
             enqueue_backtest(backtest_id)
-            update_mapping(backtest_id, {"status": "queued", "queued_at": utc_now()})
+            update_mapping(
+                backtest_id,
+                {
+                    "status": "queued",
+                    "queued_at": utc_now(),
+                    "required_memory_gb": required_memory_gb,
+                    "last_error": "insufficient_memory",
+                },
+            )
             return "queued", None
+
+        reserve_inflight(selection.base_url, required_memory_gb)
 
     try:
         backtest_docker_run_id = await asyncio.to_thread(
             submit_to_backtest,
+            selection.base_url,
             backtest_id,
             run_spec_bytes,
             strategy_filename,
@@ -613,17 +697,17 @@ async def submit_with_queue_control(
                 "status": "submitted",
                 "submitted_at": utc_now(),
                 "backtest_docker_run_id": backtest_docker_run_id,
+                "backtest_api_base": selection.base_url,
+                "required_memory_gb": required_memory_gb,
             },
         )
         return "submitted", backtest_docker_run_id
     finally:
         async with QUEUE_STATE_LOCK:
-            INFLIGHT_SUBMISSIONS = max(0, INFLIGHT_SUBMISSIONS - 1)
+            release_inflight(selection.base_url, required_memory_gb)
 
 
 async def queue_scheduler() -> None:
-    global INFLIGHT_SUBMISSIONS
-
     while True:
         try:
             async with QUEUE_STATE_LOCK:
@@ -631,39 +715,54 @@ async def queue_scheduler() -> None:
             if not queued:
                 await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
                 continue
+            made_progress = False
+            while True:
+                async with QUEUE_STATE_LOCK:
+                    queued = read_queue()
+                    if not queued:
+                        break
+                    head = queued[0]
 
-            running = await safe_count_running()
-            if running is None:
-                await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
-                continue
+                backtest_id = head["backtest_id"]
+                try:
+                    run_spec_payload = await asyncio.to_thread(load_run_spec_payload, backtest_id)
+                    required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload)
+                except Exception as exc:
+                    update_mapping(
+                        backtest_id,
+                        {"status": "queued", "last_error": str(exc), "last_error_at": utc_now()},
+                    )
+                    logger.warning("queue_scheduler_load_failed backtest_id=%s error=%s", backtest_id, exc)
+                    break
 
-            async with QUEUE_STATE_LOCK:
-                queued = read_queue()
-                available = MAX_RUNNING_BACKTESTS - (running + INFLIGHT_SUBMISSIONS)
-                if available <= 0 or not queued:
-                    should_dequeue = 0
-                else:
-                    should_dequeue = min(available, len(queued))
-                    for _ in range(should_dequeue):
-                        # Reserve inflight slots up-front.
-                        INFLIGHT_SUBMISSIONS += 1
+                selection = await pick_backtest_target(required_memory_gb)
+                if selection is None:
+                    break
 
-            for _ in range(should_dequeue):
                 item = None
                 async with QUEUE_STATE_LOCK:
-                    item = dequeue_backtest()
-                if not item:
-                    async with QUEUE_STATE_LOCK:
-                        INFLIGHT_SUBMISSIONS = max(0, INFLIGHT_SUBMISSIONS - 1)
-                    continue
+                    queued = read_queue()
+                    if not queued or queued[0].get("backtest_id") != backtest_id:
+                        continue
 
-                backtest_id = item["backtest_id"]
+                    current_reserved = INFLIGHT_MEMORY_GB.get(selection.base_url, 0.0)
+                    available = selection.metrics.memory_free_gb - current_reserved
+                    if available < required_memory_gb:
+                        break
+
+                    item = dequeue_backtest()
+                    if not item:
+                        continue
+
+                    reserve_inflight(selection.base_url, required_memory_gb)
+
                 try:
                     run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes = await asyncio.to_thread(
                         load_run_assets, backtest_id
                     )
                     backtest_docker_run_id = await asyncio.to_thread(
                         submit_to_backtest,
+                        selection.base_url,
                         backtest_id,
                         run_spec_bytes,
                         strategy_filename,
@@ -676,27 +775,36 @@ async def queue_scheduler() -> None:
                             "status": "submitted",
                             "submitted_at": utc_now(),
                             "backtest_docker_run_id": backtest_docker_run_id,
+                            "backtest_api_base": selection.base_url,
+                            "required_memory_gb": required_memory_gb,
                         },
                     )
                     logger.info(
-                        "queue_scheduler_submitted backtest_id=%s backtest_docker_run_id=%s",
+                        "queue_scheduler_submitted backtest_id=%s backtest_docker_run_id=%s base=%s",
                         backtest_id,
                         backtest_docker_run_id,
+                        selection.base_url,
                     )
+                    made_progress = True
                 except Exception as exc:
                     # Put back to queue head to retry later.
-                    async with QUEUE_STATE_LOCK:
-                        items = read_queue()
-                        items.insert(0, item)
-                        write_queue(items)
+                    if item:
+                        async with QUEUE_STATE_LOCK:
+                            items = read_queue()
+                            items.insert(0, item)
+                            write_queue(items)
                     update_mapping(
                         backtest_id,
                         {"status": "queued", "last_error": str(exc), "last_error_at": utc_now()},
                     )
                     logger.warning("queue_scheduler_submit_failed backtest_id=%s error=%s", backtest_id, exc)
+                    break
                 finally:
                     async with QUEUE_STATE_LOCK:
-                        INFLIGHT_SUBMISSIONS = max(0, INFLIGHT_SUBMISSIONS - 1)
+                        release_inflight(selection.base_url, required_memory_gb)
+
+            if not made_progress:
+                await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
         except Exception as exc:
             logger.exception("queue_scheduler_crashed error=%s", exc)
             await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
@@ -737,6 +845,8 @@ async def create_run(
     except ValueError as exc:
         logger.warning("create_run_spec_validation_failed error=%s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload)
 
     # 3) 生成 run_id，并在本地保存上传内容，便于排查与追踪
     backtest_id = make_run_id()
@@ -781,6 +891,7 @@ async def create_run(
         strategy_filename=strategy_filename,
         strategy_bytes=strategy_bytes,
         runner_bytes=runner_bytes,
+        required_memory_gb=required_memory_gb,
     )
     logger.info(
         "create_run_done backtest_id=%s status=%s backtest_docker_run_id=%s",
@@ -877,15 +988,24 @@ async def get_run(backtest_id: str) -> JSONResponse:
 @app.get("/runs/backtest/{backtest_id}")
 async def get_backtest_status(backtest_id: str) -> JSONResponse:
     logger.info("get_backtest_status_requested backtest_id=%s", backtest_id)
-    payload = fetch_backtest_status(backtest_id)
+    entry = ensure_backtest_routable(backtest_id)
+    base_url = entry["backtest_api_base"]
+    payload = fetch_backtest_status(base_url, backtest_id)
     return JSONResponse(payload)
 
 
 @app.websocket("/runs/backtest/{backtest_id}/logs/stream")
 async def stream_backtest_logs(websocket: WebSocket, backtest_id: str) -> None:
+    try:
+        entry = ensure_backtest_routable(backtest_id)
+        base_url = entry["backtest_api_base"]
+    except HTTPException as exc:
+        await websocket.close(code=1008, reason=str(exc.detail))
+        return
+
     await websocket.accept()
     upstream_url = build_ws_url(
-        BACKTEST_API_BASE,
+        base_url,
         BACKTEST_WS_LOGS_PATH.format(backtest_id=backtest_id),
     )
     logger.info("ws_logs_connect backtest_id=%s url=%s", backtest_id, upstream_url)
@@ -944,7 +1064,9 @@ async def stream_backtest_logs(websocket: WebSocket, backtest_id: str) -> None:
 @app.get("/runs/{backtest_id}/logs")
 async def get_logs(backtest_id: str) -> Response:
     logger.info("get_logs_requested backtest_id=%s", backtest_id)
-    url = f"{BACKTEST_API_BASE.rstrip('/')}{BACKTEST_LOGS_DOWNLOAD_PATH.format(backtest_id=backtest_id)}"
+    entry = ensure_backtest_routable(backtest_id)
+    base_url = entry["backtest_api_base"]
+    url = f"{base_url.rstrip('/')}{BACKTEST_LOGS_DOWNLOAD_PATH.format(backtest_id=backtest_id)}"
     req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
     try:
         logger.info("get_logs_fetching backtest_id=%s url=%s", backtest_id, url)
@@ -969,3 +1091,65 @@ async def get_logs(backtest_id: str) -> Response:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return Response(content=data, media_type=content_type, headers=headers)
+
+
+@app.get("/runs/backtest/{backtest_id}/download_csv")
+async def download_backtest_csv(backtest_id: str) -> Response:
+    logger.info("download_csv_requested backtest_id=%s", backtest_id)
+    entry = ensure_backtest_routable(backtest_id)
+    base_url = entry["backtest_api_base"]
+    url = f"{base_url.rstrip('/')}{BACKTEST_CSV_DOWNLOAD_PATH.format(backtest_id=backtest_id)}"
+    req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
+    try:
+        logger.info("download_csv_fetching backtest_id=%s url=%s", backtest_id, url)
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "application/zip")
+            headers: dict[str, str] = {}
+            content_disposition = resp.headers.get("Content-Disposition")
+            if content_disposition:
+                headers["Content-Disposition"] = content_disposition
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "download_csv_http_error backtest_id=%s status=%s detail=%s",
+            backtest_id,
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("download_csv_request_failed backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return Response(content=data, media_type=content_type, headers=headers)
+
+
+@app.post("/runs/backtest/{backtest_id}/kill")
+async def kill_backtest_run(backtest_id: str) -> JSONResponse:
+    logger.info("kill_backtest_requested backtest_id=%s", backtest_id)
+    entry = ensure_backtest_routable(backtest_id, allow_running_only=False)
+    base_url = entry["backtest_api_base"]
+    url = f"{base_url.rstrip('/')}{BACKTEST_KILL_PATH.format(backtest_id=backtest_id)}"
+    req = urllib.request.Request(url, headers=backtest_headers(), method="POST")
+    try:
+        logger.info("kill_backtest_fetching backtest_id=%s url=%s", backtest_id, url)
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read()
+        payload = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "kill_backtest_http_error backtest_id=%s status=%s detail=%s",
+            backtest_id,
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("kill_backtest_request_failed backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="backtest kill invalid response")
+    return JSONResponse(payload)
