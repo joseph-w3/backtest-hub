@@ -105,12 +105,14 @@ BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
 BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
 BACKTEST_LOGS_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/logs/download"
+BACKTEST_CSV_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/download_csv"
+BACKTEST_KILL_PATH = "/v1/runs/backtest/{backtest_id}/kill"
 BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 BACKTEST_WS_LOGS_PATH = env_or_default(
     "BACKTEST_WS_LOGS_PATH",
     "/v1/runs/backtest/{backtest_id}/logs/stream",
 )
-BACKTEST_METRICS_PATH = env_or_default("BACKTEST_METRICS_PATH", "/system/metrics")
+BACKTEST_METRICS_PATH = env_or_default("BACKTEST_METRICS_PATH", "v1/docker/metrics")
 BACKTEST_METRICS_TIMEOUT_SECONDS = float(os.getenv("BACKTEST_METRICS_TIMEOUT_SECONDS", "3"))
 
 RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
@@ -1089,3 +1091,65 @@ async def get_logs(backtest_id: str) -> Response:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return Response(content=data, media_type=content_type, headers=headers)
+
+
+@app.get("/runs/backtest/{backtest_id}/download_csv")
+async def download_backtest_csv(backtest_id: str) -> Response:
+    logger.info("download_csv_requested backtest_id=%s", backtest_id)
+    entry = ensure_backtest_routable(backtest_id)
+    base_url = entry["backtest_api_base"]
+    url = f"{base_url.rstrip('/')}{BACKTEST_CSV_DOWNLOAD_PATH.format(backtest_id=backtest_id)}"
+    req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
+    try:
+        logger.info("download_csv_fetching backtest_id=%s url=%s", backtest_id, url)
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "application/zip")
+            headers: dict[str, str] = {}
+            content_disposition = resp.headers.get("Content-Disposition")
+            if content_disposition:
+                headers["Content-Disposition"] = content_disposition
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "download_csv_http_error backtest_id=%s status=%s detail=%s",
+            backtest_id,
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("download_csv_request_failed backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return Response(content=data, media_type=content_type, headers=headers)
+
+
+@app.post("/runs/backtest/{backtest_id}/kill")
+async def kill_backtest_run(backtest_id: str) -> JSONResponse:
+    logger.info("kill_backtest_requested backtest_id=%s", backtest_id)
+    entry = ensure_backtest_routable(backtest_id, allow_running_only=False)
+    base_url = entry["backtest_api_base"]
+    url = f"{base_url.rstrip('/')}{BACKTEST_KILL_PATH.format(backtest_id=backtest_id)}"
+    req = urllib.request.Request(url, headers=backtest_headers(), method="POST")
+    try:
+        logger.info("kill_backtest_fetching backtest_id=%s url=%s", backtest_id, url)
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read()
+        payload = json.loads(body.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "kill_backtest_http_error backtest_id=%s status=%s detail=%s",
+            backtest_id,
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("kill_backtest_request_failed backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="backtest kill invalid response")
+    return JSONResponse(payload)

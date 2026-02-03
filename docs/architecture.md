@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-02-03 16:34:37
+- 当前梳理时间: 2026-02-03 19:24:19
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流；并在 hub 侧提供并发队列限制（避免 backtest docker 被无限提交打爆）。
@@ -28,9 +28,9 @@
   - `docker-compose.yml`: 服务运行环境与环境变量配置。
   - `run_spec.json`: 回测配置样例。
 - 关键职责:
-  - `app.py`: 提供 `/health`、`POST /runs`、`GET /runs/{backtest_id}`、`GET /runs/backtest/{backtest_id}`、`GET /runs/{backtest_id}/logs`、`/runs/backtest/{backtest_id}/logs/stream`、`GET /queue`、`DELETE /queue`；校验字段/时间范围；生成 backtest_id；落盘保存；调用调度器按 system metrics + symbols 估算内存选择目标 backtest docker；内存不足则入队；后台调度器按 FIFO 出队并提交；维护 mapping（包含 queued/submitted/cancelled 状态、时间戳与 `backtest_api_base`）；通过 WebSocket 代理日志流。
+  - `app.py`: 提供 `/health`、`POST /runs`、`GET /runs/{backtest_id}`、`GET /runs/backtest/{backtest_id}`、`GET /runs/{backtest_id}/logs`、`GET /runs/backtest/{backtest_id}/download_csv`、`POST /runs/backtest/{backtest_id}/kill`、`/runs/backtest/{backtest_id}/logs/stream`、`GET /queue`、`DELETE /queue`；校验字段/时间范围；生成 backtest_id；落盘保存；调用调度器按 system metrics + symbols 估算内存选择目标 backtest docker；内存不足则入队；后台调度器按 FIFO 出队并提交；维护 mapping（包含 queued/submitted/cancelled 状态、时间戳与 `backtest_api_base`）；通过 WebSocket 代理日志流。
   - `scripts/run_backtest.py`: 校验 run_spec；动态加载策略模块；构建 spot/futures instruments 与 backtest configs；执行 `BacktestNode`；写入 `status.json`（运行/成功/失败）。
-  - `backtest_hub_cli/cli.py`: `init` 复制模板脚本到 `./scripts/generate_run_spec.py`；`submit` 调用本地 `scripts/generate_run_spec.py` 生成 run_spec（若未 init 则提示）；可选 `--follow-logs` WebSocket 写入 `./live_logs/{backtest_id}.log`；`status` 查询 backtest 状态；`logs` 下载日志；并写入 `./backtest_run_id_history` 记录历史。
+  - `backtest_hub_cli/cli.py`: `init` 复制模板脚本到 `./scripts/generate_run_spec.py`；`submit` 调用本地 `scripts/generate_run_spec.py` 生成 run_spec（若未 init 则提示）；可选 `--follow-logs` WebSocket 写入 `./live_logs/{backtest_id}.log`；`status` 查询 backtest 状态；`logs` 下载日志；`download-csv` 下载回测 CSV ZIP；`kill` 停止回测；并写入 `./backtest_run_id_history` 记录历史。
   - `scripts/submit_run.py`: 仅负责转发 CLI 的 submit 命令。
   - `scripts/backtest_hub_sdk.py`: 兼容命令 `get-backtest-status`/`download-backtest-logs`，内部转发至 CLI 的 `status`/`logs`。
 - 主要依赖:
@@ -64,6 +64,8 @@
   - `GET /runs/{backtest_id}` 读取映射并返回。
   - `GET /runs/backtest/{backtest_id}` 根据映射中的 `backtest_api_base` 透传目标 backtest docker 状态（status/pid/started_at）。
   - `GET /runs/{backtest_id}/logs` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 日志。
+  - `GET /runs/backtest/{backtest_id}/download_csv` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 回测 CSV ZIP。
+  - `POST /runs/backtest/{backtest_id}/kill` 根据映射中的 `backtest_api_base` 代理停止回测任务并返回更新后的任务记录。
 - 队列管理链路:
   - `GET /queue` 查询当前 hub 队列（支持分页与查询 position）。
   - `DELETE /queue` 批量删除队列中的任务（仅影响 queued 任务，删除后标记为 cancelled）。
@@ -96,12 +98,24 @@
   5) 使用 `GET /runs/{backtest_id}` 查询映射信息。
   6) 使用 `GET /runs/backtest/{backtest_id}` 查询 backtest docker 状态。
   7) 使用 `GET /runs/{backtest_id}/logs` 拉取 backtest 日志。
-  8) 可选：连接 `/runs/backtest/{backtest_id}/logs/stream` 实时查看日志（或 `backtest-hub-cli submit --follow-logs`/`scripts/submit_run.py --follow-logs` 自动落盘）。
-  9) 可选：使用 `GET /queue` 查询排队情况；使用 `DELETE /queue` 批量删除排队任务（标记 cancelled）。
+  8) 使用 `GET /runs/backtest/{backtest_id}/download_csv` 下载回测 CSV ZIP。
+  9) 使用 `POST /runs/backtest/{backtest_id}/kill` 停止回测任务。
+  10) 可选：连接 `/runs/backtest/{backtest_id}/logs/stream` 实时查看日志（或 `backtest-hub-cli submit --follow-logs`/`scripts/submit_run.py --follow-logs` 自动落盘）。
+  11) 可选：使用 `GET /queue` 查询排队情况；使用 `DELETE /queue` 批量删除排队任务（标记 cancelled）。
 - 异常/边界处理: 参数校验失败返回 400；缺少 runner 返回 500；backtest docker 返回错误码时透传；backtest_id 不存在返回 404。
 - 观测与日志: `app.py` 统一记录请求日志；`scripts/run_backtest.py` 写入 `status.json`（包含状态/错误/traceback）。
 
 ## 改动概要/变更记录
+
+### 2026-02-03 19:24:19
+- 本次新增/更新要点: Hub 新增 `/runs/backtest/{backtest_id}/kill` 代理停止回测；CLI 新增 `kill` 命令。
+- 变更动机/需求来源: 用户要求 Hub 代理 backtest docker kill 接口并提供 CLI 能力。
+- 当前更新时间: 2026-02-03 19:24:19
+
+### 2026-02-03 18:12:18
+- 本次新增/更新要点: Hub 新增 `/runs/backtest/{backtest_id}/download_csv` 代理 backtest docker CSV ZIP 下载；CLI 新增 `download-csv` 命令。
+- 变更动机/需求来源: 用户要求 Hub 提供 CSV 下载代理与 CLI 能力。
+- 当前更新时间: 2026-02-03 18:12:18
 
 ### 2026-02-03 16:34:37
 - 本次新增/更新要点: 新增 `scheduler.py`，按 system metrics + symbols 估算内存选择目标 backtest docker；提交/队列调度按目标 docker 路由；日志/状态/日志流代理依据 `backtest_api_base`；新增多 docker 配置项与 metrics 参数。

@@ -132,8 +132,8 @@ def build_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}{path}"
 
 
-def request_json(url: str) -> dict[str, Any]:
-    req = urllib.request.Request(url, method="GET")
+def request_json(url: str, method: str = "GET") -> dict[str, Any]:
+    req = urllib.request.Request(url, method=method)
     try:
         with urllib.request.urlopen(req) as resp:
             body = resp.read()
@@ -207,6 +207,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Output file path (default: {backtest_id}.log)",
     )
+
+    csv_parser = subparsers.add_parser("download-csv", help="Download backtest CSV logs (zip)")
+    csv_parser.add_argument("backtest_id", help="Backtest ID")
+    csv_parser.add_argument(
+        "--out",
+        default=None,
+        help="Output file path (default: {backtest_id}.zip)",
+    )
+
+    kill_parser = subparsers.add_parser("kill", help="Stop a running backtest by backtest_id")
+    kill_parser.add_argument("backtest_id", help="Backtest ID")
 
     return parser.parse_args(argv)
 
@@ -351,6 +362,31 @@ def command_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_download_csv(args: argparse.Namespace) -> int:
+    url = build_url(HUB_BASE_URL, f"/runs/backtest/{args.backtest_id}/download_csv")
+    try:
+        content = request_bytes(url)
+    except RuntimeError as exc:
+        print(str(exc))
+        return 1
+    target_path = args.out or f"{args.backtest_id}.zip"
+    with open(target_path, "wb") as handle:
+        handle.write(content)
+    print(target_path)
+    return 0
+
+
+def command_kill(args: argparse.Namespace) -> int:
+    url = build_url(HUB_BASE_URL, f"/runs/backtest/{args.backtest_id}/kill")
+    try:
+        payload = request_json(url, method="POST")
+    except RuntimeError as exc:
+        print(str(exc))
+        return 1
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_help() -> int:
     print(
         "\n".join(
@@ -372,6 +408,13 @@ def command_help() -> int:
                 "logs    Download backtest logs",
                 "  backtest_id      Backtest ID",
                 "  --out            Output file path (default: {backtest_id}.log)",
+                "",
+                "download-csv  Download backtest CSV logs (zip)",
+                "  backtest_id      Backtest ID",
+                "  --out            Output file path (default: {backtest_id}.zip)",
+                "",
+                "kill    Stop a running backtest",
+                "  backtest_id      Backtest ID",
                 "",
             ]
         )
@@ -397,6 +440,10 @@ def main(argv: list[str] | None = None) -> int:
         return command_status(args)
     if args.command == "logs":
         return command_logs(args)
+    if args.command == "download-csv":
+        return command_download_csv(args)
+    if args.command == "kill":
+        return command_kill(args)
     raise RuntimeError(f"Unknown command: {args.command}")
 
 

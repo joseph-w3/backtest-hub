@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import urllib.request
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 BYTES_PER_GB = 1024 * 1024 * 1024
+LOGGER = logging.getLogger("backtest_hub.scheduler")
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,7 @@ def fetch_metrics(
     timeout_seconds: float,
 ) -> DockerMetrics:
     url = normalize_join_url(base_url, metrics_path)
+    LOGGER.info("scheduler_fetch_metrics_start base=%s url=%s", base_url, url)
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
         body = resp.read()
@@ -137,6 +140,14 @@ def fetch_metrics(
     metrics = parse_metrics_payload(payload, base_url)
     if metrics is None:
         raise ValueError("metrics payload missing memory fields")
+    LOGGER.info(
+        "scheduler_fetch_metrics_ok base=%s cpu_pct=%s mem_total_gb=%.3f mem_used_gb=%.3f mem_free_gb=%.3f",
+        base_url,
+        metrics.cpu_percent,
+        metrics.memory_total_gb,
+        metrics.memory_used_gb,
+        metrics.memory_free_gb,
+    )
     return metrics
 
 
@@ -188,17 +199,35 @@ def select_backtest_docker(
     reserved_memory_gb = reserved_memory_gb or {}
     inflight_counts = inflight_counts or {}
 
+    LOGGER.info(
+        "scheduler_select_start required_memory_gb=%.3f base_urls=%s",
+        required_memory_gb,
+        base_urls,
+    )
     candidates: list[DockerSelection] = []
 
     for base_url in base_urls:
         try:
             metrics = fetch_metrics(base_url, metrics_path, headers, timeout_seconds)
-        except Exception:
+        except Exception as exc:
+            LOGGER.info("scheduler_metrics_failed base=%s error=%s", base_url, exc)
             continue
 
         reserved = reserved_memory_gb.get(base_url, 0.0)
         available = metrics.memory_free_gb - reserved
+        LOGGER.info(
+            "scheduler_metrics_snapshot base=%s reserved_gb=%.3f available_gb=%.3f",
+            base_url,
+            reserved,
+            available,
+        )
         if available < required_memory_gb:
+            LOGGER.info(
+                "scheduler_skip_insufficient_memory base=%s required_gb=%.3f available_gb=%.3f",
+                base_url,
+                required_memory_gb,
+                available,
+            )
             continue
 
         running_count = None
@@ -206,10 +235,18 @@ def select_backtest_docker(
             try:
                 runs_payload = fetch_backtest_runs(base_url, runs_path, headers, timeout_seconds)
                 running_count = count_running_from_runs_payload(runs_payload)
-            except Exception:
+            except Exception as exc:
+                LOGGER.info("scheduler_runs_failed base=%s error=%s", base_url, exc)
                 continue
             inflight = inflight_counts.get(base_url, 0)
             if running_count + inflight >= max_running:
+                LOGGER.info(
+                    "scheduler_skip_running_limit base=%s running=%s inflight=%s max_running=%s",
+                    base_url,
+                    running_count,
+                    inflight,
+                    max_running,
+                )
                 continue
 
         candidates.append(
@@ -222,6 +259,7 @@ def select_backtest_docker(
         )
 
     if not candidates:
+        LOGGER.info("scheduler_no_candidates required_memory_gb=%.3f", required_memory_gb)
         return None
 
     def sort_key(selection: DockerSelection) -> tuple[float, float]:
@@ -229,4 +267,12 @@ def select_backtest_docker(
         return (selection.available_memory_gb, -cpu_rank)
 
     candidates.sort(key=sort_key, reverse=True)
-    return candidates[0]
+    selected = candidates[0]
+    LOGGER.info(
+        "scheduler_selected base=%s available_gb=%.3f cpu_pct=%s running=%s",
+        selected.base_url,
+        selected.available_memory_gb,
+        selected.metrics.cpu_percent,
+        selected.running_count,
+    )
+    return selected

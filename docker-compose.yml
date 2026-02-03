@@ -15,7 +15,7 @@ services:
       # Leave it empty unless explicitly provided; app.py will apply its own default.
       BACKTEST_LOGS_PATH: ${BACKTEST_LOGS_PATH-}
       BACKTEST_API_KEY: ${BACKTEST_API_KEY:-}
-      BACKTEST_METRICS_PATH: ${BACKTEST_METRICS_PATH:-/system/metrics}
+      BACKTEST_METRICS_PATH: ${BACKTEST_METRICS_PATH:-v1/docker/metrics}
       BACKTEST_METRICS_TIMEOUT_SECONDS: ${BACKTEST_METRICS_TIMEOUT_SECONDS:-3}
       DATA_MOUNT_PATH: ${DATA_MOUNT_PATH:-/opt/backtest}
       RUN_STORAGE_PATH: ${RUN_STORAGE_PATH:-/opt/backtest/runs}
