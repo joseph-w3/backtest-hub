@@ -195,6 +195,8 @@ def select_backtest_docker(
     inflight_counts: dict[str, int] | None,
     max_running: int | None,
     timeout_seconds: float,
+    cpu_percent_lt: float | None = None,
+    require_memory_gt: bool = False,
 ) -> DockerSelection | None:
     reserved_memory_gb = reserved_memory_gb or {}
     inflight_counts = inflight_counts or {}
@@ -213,6 +215,16 @@ def select_backtest_docker(
             LOGGER.info("scheduler_metrics_failed base=%s error=%s", base_url, exc)
             continue
 
+        if cpu_percent_lt is not None:
+            if metrics.cpu_percent is None or metrics.cpu_percent >= cpu_percent_lt:
+                LOGGER.info(
+                    "scheduler_skip_cpu_threshold base=%s cpu_pct=%s threshold=%s",
+                    base_url,
+                    metrics.cpu_percent,
+                    cpu_percent_lt,
+                )
+                continue
+
         reserved = reserved_memory_gb.get(base_url, 0.0)
         available = metrics.memory_free_gb - reserved
         LOGGER.info(
@@ -221,7 +233,16 @@ def select_backtest_docker(
             reserved,
             available,
         )
-        if available < required_memory_gb:
+        if require_memory_gt:
+            if available <= required_memory_gb:
+                LOGGER.info(
+                    "scheduler_skip_insufficient_memory_gt base=%s required_gb=%.3f available_gb=%.3f",
+                    base_url,
+                    required_memory_gb,
+                    available,
+                )
+                continue
+        elif available < required_memory_gb:
             LOGGER.info(
                 "scheduler_skip_insufficient_memory base=%s required_gb=%.3f available_gb=%.3f",
                 base_url,

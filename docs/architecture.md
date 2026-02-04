@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-02-03 19:24:19
+- 当前梳理时间: 2026-02-04 12:25:04
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流；并在 hub 侧提供并发队列限制（避免 backtest docker 被无限提交打爆）。
@@ -75,16 +75,18 @@
   - 客户端连接 `/runs/backtest/{backtest_id}/logs/stream`，服务端按映射中的 `backtest_api_base` 建立到目标 backtest docker 的 WebSocket 连接并双向转发消息。
   - `backtest-hub-cli submit --follow-logs`（或 `scripts/submit_run.py --follow-logs`）通过 WebSocket 拉取日志并落盘到 `./live_logs/{backtest_id}.log`。
 - 控制/调度流程:
-  - 调度按内存优先：每个 symbol 估算 1GB，依据 metrics 计算可用内存（`total - used - inflight`）决定是否可提交；满足内存后再检查 running 上限（按 docker 维度）。
+  - 调度要求 CPU < 80%；按内存优先：每个 symbol 估算 1GB，依据 metrics 计算可用内存（`total - used - inflight`）决定是否可提交；满足内存后再检查 running 上限（按 docker 维度）。
+  - 若 symbols 数量 < 6 且青铜分组 docker 的 CPU < 80% 且可用内存大于估算内存（1 symbol ≈ 1GB），则优先调度到青铜分组。
   - 队列与 inflight 通过 `asyncio.Lock` 保护；mapping 文件通过 `threading.Lock` 保护读写。
   - 异常以 HTTP 4xx/5xx 返回并记录日志；backtest docker 请求失败统一返回 502；调度提交失败会回队并记录 `last_error`。
 
 ### 关键配置
 - 配置文件: `docker-compose.yml`, `run_spec.json`, `pyproject.toml`。
 - 关键参数:
-  - Hub 服务: `BACKTEST_API_BASES`, `BACKTEST_SUBMIT_PATH`, `BACKTEST_STATUS_PATH`, `BACKTEST_LOGS_PATH`, `BACKTEST_API_KEY`,
-    `BACKTEST_WS_LOGS_PATH`, `BACKTEST_RUNS_PATH`, `BACKTEST_METRICS_PATH`, `BACKTEST_METRICS_TIMEOUT_SECONDS`, `DATA_MOUNT_PATH`, `RUN_STORAGE_PATH`,
-    `RUN_MAPPING_PATH`, `QUEUE_PATH`, `BACKTEST_RUNNER_PATH`, `MAX_SYMBOLS`, `MAX_RANGE_DAYS`, `MAX_RUNNING_BACKTESTS`, `QUEUE_POLL_INTERVAL_SECONDS`。
+  - Hub 服务: `BACKTEST_API_BASES`, `BACKTEST_BRONZE_API_BASES`, `BACKTEST_SUBMIT_PATH`, `BACKTEST_STATUS_PATH`, `BACKTEST_LOGS_PATH`,
+    `BACKTEST_API_KEY`, `BACKTEST_WS_LOGS_PATH`, `BACKTEST_RUNS_PATH`, `BACKTEST_METRICS_PATH`, `BACKTEST_METRICS_TIMEOUT_SECONDS`,
+    `DATA_MOUNT_PATH`, `RUN_STORAGE_PATH`, `RUN_MAPPING_PATH`, `QUEUE_PATH`, `BACKTEST_RUNNER_PATH`, `MAX_SYMBOLS`, `MAX_RANGE_DAYS`,
+    `MAX_RUNNING_BACKTESTS`, `QUEUE_POLL_INTERVAL_SECONDS`。
   - CLI: `BACKTEST_HUB_BASE_URL`（默认 `http://100.99.101.120:10033`）。
   - Runner 脚本: `CATALOG_PATH`，`BACKTEST_LOGS_PATH`（日志目录，默认 `/opt/backtest_logs`，与 Hub 的 `BACKTEST_LOGS_PATH` 为 URL 路径含义不同）。
 - 运行环境约束: Python >= 3.12；可访问 backtest docker；挂载 `/opt/backtest` 数据目录；回测执行环境需要 `quant_trade_v1`。
@@ -106,6 +108,16 @@
 - 观测与日志: `app.py` 统一记录请求日志；`scripts/run_backtest.py` 写入 `status.json`（包含状态/错误/traceback）。
 
 ## 改动概要/变更记录
+
+### 2026-02-04 12:25:04
+- 本次新增/更新要点: 普通调度新增 CPU < 80% 过滤门槛；统一 CPU 阈值配置。
+- 变更动机/需求来源: 用户要求普通分组也受 CPU 阈值限制。
+- 当前更新时间: 2026-02-04 12:25:04
+
+### 2026-02-04 12:14:57
+- 本次新增/更新要点: 新增青铜分组配置 `BACKTEST_BRONZE_API_BASES`；调度规则新增“小币对优先青铜”（symbols < 6 且 CPU < 80% 且可用内存大于估算内存）。
+- 变更动机/需求来源: 用户要求优化调度逻辑并新增青铜分组配置。
+- 当前更新时间: 2026-02-04 12:14:57
 
 ### 2026-02-03 19:24:19
 - 本次新增/更新要点: Hub 新增 `/runs/backtest/{backtest_id}/kill` 代理停止回测；CLI 新增 `kill` 命令。
