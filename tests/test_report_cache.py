@@ -29,6 +29,8 @@ class TestReportCache(unittest.TestCase):
                 ReportServiceConfig(
                     cache_path=db_path,
                     report_path="/v1/runs/backtest/{backtest_id}/report",
+                    data_download_path="/v1/runs/backtest/{backtest_id}/download_data",
+                    runs_path="/v1/runs",
                     max_page_size=50,
                 ),
                 backtest_headers=lambda: {},

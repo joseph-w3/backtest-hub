@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-02-04 19:24:35
+- 当前梳理时间: 2026-02-04 20:49:35
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流；并在 hub 侧提供并发队列限制（避免 backtest docker 被无限提交打爆）。
@@ -18,7 +18,7 @@
 - 模块划分:
   - `app.py`: API 层、参数校验、文件落盘、转发 backtest API、backtest_id 映射管理。
   - `services/scheduler.py`: 多 backtest docker 调度逻辑（拉取 system metrics、按 symbols 估算内存、选择目标 docker）。
-  - `services/report_service.py`: 回测报告透传与 SQLite 缓存、聚合分页与 requested_by 过滤。
+  - `services/report_service.py`: 回测报告透传与 SQLite 缓存、聚合分页与 requested_by 过滤；提供 `/runs/backtest/reports`、`/runs/backtest/{backtest_id}/report`、`/runs/backtest/{backtest_id}/download_data`、`/runs/backtest/active` 的路由实现与独立 Swagger 文档。
   - `scripts/run_backtest.py`: 回测 runner 脚本（由 backtest docker 执行），加载策略、构建配置并运行回测。
   - `backtest_hub_cli/cli.py`: Hub CLI 包入口，负责提交/查询/下载日志/日志流；`submit` 支持 `--strategy-file`，未提供则回退 run_spec 或 `./strategies/<basename>`；提供 `init` 生成模板脚本与 `help` 命令。
   - `backtest_hub_cli/scripts/generate_run_spec.py`: CLI 模板脚本，`init` 命令会复制到项目 `./scripts/generate_run_spec.py`（包含 `latency_config` 示例字段）。
@@ -29,7 +29,7 @@
   - `docker-compose.yml`: 服务运行环境与环境变量配置。
   - `run_spec.json`: 回测配置样例。
 - 关键职责:
-  - `app.py`: 提供 `/health`、`POST /runs`、`GET /runs/{backtest_id}`、`GET /runs/backtest/reports`、`GET /runs/backtest/{backtest_id}`、`GET /runs/backtest/{backtest_id}/report`、`GET /runs/{backtest_id}/logs`、`GET /runs/backtest/{backtest_id}/download_csv`、`GET /runs/backtest/{backtest_id}/download_data`、`POST /runs/backtest/{backtest_id}/kill`、`/runs/backtest/{backtest_id}/logs/stream`、`GET /queue`、`DELETE /queue`；校验字段/时间范围/`latency_config`；生成 backtest_id；落盘保存；调用调度器按 system metrics + symbols 估算内存选择目标 backtest docker；队列非空或内存不足则入队；后台调度器按 FIFO 出队并提交；维护 mapping（包含 queued/submitted/cancelled 状态、时间戳与 `backtest_api_base`）；通过 WebSocket 代理日志流；回测报告透传与 SQLite 缓存（支持分页聚合与 requested_by 过滤）。
+  - `app.py`: 提供 `/health`、`POST /runs`、`GET /runs/{backtest_id}`、`GET /runs/backtest/reports`、`GET /runs/backtest/active`、`GET /runs/backtest/{backtest_id}`、`GET /runs/backtest/{backtest_id}/report`、`GET /runs/{backtest_id}/logs`、`GET /runs/backtest/{backtest_id}/download_csv`、`GET /runs/backtest/{backtest_id}/download_data`、`POST /runs/backtest/{backtest_id}/kill`、`/runs/backtest/{backtest_id}/logs/stream`、`GET /queue`、`DELETE /queue`；校验字段/时间范围/`latency_config`；生成 backtest_id；落盘保存；调用调度器按 system metrics + symbols 估算内存选择目标 backtest docker；队列非空或内存不足则入队；后台调度器按 FIFO 出队并提交；维护 mapping（包含 queued/submitted/cancelled 状态、时间戳与 `backtest_api_base`）；通过 WebSocket 代理日志流；回测报告透传与 SQLite 缓存（支持分页聚合与 requested_by 过滤）。
   - `scripts/run_backtest.py`: 校验 run_spec；动态加载策略模块；构建 spot/futures instruments 与 backtest configs；执行 `BacktestNode`；写入 `status.json`（运行/成功/失败）。
   - `backtest_hub_cli/cli.py`: `init` 复制模板脚本到 `./scripts/generate_run_spec.py`；`submit` 调用本地 `scripts/generate_run_spec.py` 生成 run_spec（若未 init 则提示），`--strategy-file` 可指定策略文件（否则回退 run_spec 或 `./strategies/<basename>`）；可选 `--follow-logs` WebSocket 写入 `./live_logs/{backtest_id}.log`；`status` 查询 backtest 状态；`logs` 下载日志；`download-csv` 下载回测 CSV ZIP；`kill` 停止回测；`help` 展示命令总览；并写入 `./backtest_run_id_history` 记录历史。
   - `scripts/submit_run.py`: 仅负责转发 CLI 的 submit 命令。
@@ -66,6 +66,7 @@
   - `GET /runs/backtest/{backtest_id}` 根据映射中的 `backtest_api_base` 透传目标 backtest docker 状态（status/pid/started_at）。
   - `GET /runs/backtest/{backtest_id}/report` 根据映射中的 `backtest_api_base` 透传回测报告，并在 hub 侧落入 SQLite 缓存（仅成功报告）。
   - `GET /runs/backtest/reports` 按映射中的时间倒序聚合回测报告（分页 + requested_by 过滤）；优先命中 SQLite 缓存，未命中则透传 backtest docker，失败或不可用报告跳过。
+  - `GET /runs/backtest/active` 透传并汇总所有 backtest docker 的活跃任务（starting/running/stopping），按 created_at 倒序返回。
   - `GET /runs/{backtest_id}/logs` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 日志。
   - `GET /runs/backtest/{backtest_id}/download_csv` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 回测 CSV ZIP。
   - `GET /runs/backtest/{backtest_id}/download_data` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 回测完整数据包 ZIP。
@@ -94,6 +95,7 @@
     `BACKTEST_RUNNER_PATH`, `MAX_SYMBOLS`, `MAX_RANGE_DAYS`, `MAX_RUNNING_BACKTESTS`, `MAX_REPORT_PAGE_SIZE`,
     `QUEUE_POLL_INTERVAL_SECONDS`。
   - 固定路径: 日志下载 `/v1/runs/backtest/{backtest_id}/logs/download`，CSV `/v1/runs/backtest/{backtest_id}/download_csv`，数据包 `/v1/runs/backtest/{backtest_id}/download_data`，kill `/v1/runs/backtest/{backtest_id}/kill`。
+  - 文档: report_service 独立 Swagger `/report-service/docs`（OpenAPI `/report-service/openapi.json`）；主 Swagger `/docs` 不包含 report_service 路由。
   - CLI: `BACKTEST_HUB_BASE_URL`（默认 `http://100.87.155.67:10033`）。
   - Runner 脚本: `CATALOG_PATH`，`BACKTEST_LOGS_PATH`（日志目录，默认 `/opt/backtest_logs`，与 Hub 的日志下载固定路径含义不同）。
 - 运行环境约束: Python >= 3.12；可访问 backtest docker；挂载 `/opt/backtest` 数据目录；回测执行环境需要 `quant_trade_v1`。
@@ -109,13 +111,29 @@
   7) 使用 `GET /runs/{backtest_id}/logs` 拉取 backtest 日志。
   8) 使用 `GET /runs/backtest/{backtest_id}/download_csv` 下载回测 CSV ZIP。
   9) 使用 `GET /runs/backtest/{backtest_id}/download_data` 下载回测完整数据包 ZIP。
-  10) 使用 `POST /runs/backtest/{backtest_id}/kill` 停止回测任务。
-  11) 可选：连接 `/runs/backtest/{backtest_id}/logs/stream` 实时查看日志（或 `backtest-hub-cli submit --follow-logs`/`scripts/submit_run.py --follow-logs` 自动落盘）。
-  12) 可选：使用 `GET /queue` 查询排队情况；使用 `DELETE /queue` 批量删除排队任务（标记 cancelled）。
+  10) 使用 `GET /runs/backtest/active` 查看活跃回测任务列表。
+  11) 使用 `POST /runs/backtest/{backtest_id}/kill` 停止回测任务。
+  12) 可选：连接 `/runs/backtest/{backtest_id}/logs/stream` 实时查看日志（或 `backtest-hub-cli submit --follow-logs`/`scripts/submit_run.py --follow-logs` 自动落盘）。
+  13) 可选：使用 `GET /queue` 查询排队情况；使用 `DELETE /queue` 批量删除排队任务（标记 cancelled）。
 - 异常/边界处理: 参数校验失败返回 400；缺少 runner 返回 500；backtest docker 返回错误码时透传；backtest_id 不存在返回 404。
 - 观测与日志: `app.py` 统一记录请求日志；`scripts/run_backtest.py` 写入 `status.json`（包含状态/错误/traceback）。
 
 ## 改动概要/变更记录
+
+### 2026-02-04 20:49:35
+- 本次新增/更新要点: 主 Swagger `/docs` 过滤 report_service 路由；report_service 仅在 `/report-service/docs` 展示。
+- 变更动机/需求来源: 用户要求 report_service 仅在独立 Swagger 文档路径展示。
+- 当前更新时间: 2026-02-04 20:49:35
+
+### 2026-02-04 20:20:57
+- 本次新增/更新要点: 新增 `/runs/backtest/active` 汇总 backtest docker 活跃任务接口；report_service 聚合活跃任务列表并按 created_at 倒序返回。
+- 变更动机/需求来源: 用户要求 hub 新增活跃回测任务列表聚合接口。
+- 当前更新时间: 2026-02-04 20:20:57
+
+### 2026-02-04 20:09:56
+- 本次新增/更新要点: `/runs/backtest/{backtest_id}/download_data` 与 report_service 相关接口路由迁移到 `services/report_service.py`；新增 report_service 独立 Swagger 文档路径。
+- 变更动机/需求来源: 用户要求 report_service 接口具备独立文档并将 download_data 迁移至 report_service。
+- 当前更新时间: 2026-02-04 20:09:56
 
 ### 2026-02-04 19:24:35
 - 本次新增/更新要点: 新增 `/runs/backtest/{backtest_id}/download_data` 代理 backtest docker 回测完整数据包下载；新增 `BACKTEST_DATA_DOWNLOAD_PATH` 配置；新增 download_data 的 backtest_id 非法字符校验。

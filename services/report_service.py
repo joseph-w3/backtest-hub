@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse, Response
+
 LOGGER = logging.getLogger("backtest_hub.report_service")
 
 def utc_now() -> str:
@@ -38,6 +41,11 @@ class ReportFetchError(ReportServiceError):
     def __init__(self, detail: str) -> None:
         super().__init__(detail)
         self.detail = detail
+
+
+def validate_backtest_id(backtest_id: str) -> None:
+    if not backtest_id or any(ch in backtest_id for ch in ("\\", "/", ".")):
+        raise HTTPException(status_code=400, detail="backtest_id has invalid characters")
 
 
 def parse_backtest_id_timestamp(backtest_id: str) -> str | None:
@@ -186,6 +194,8 @@ class ReportCache:
 class ReportServiceConfig:
     cache_path: Path
     report_path: str
+    data_download_path: str
+    runs_path: str
     max_page_size: int
 
 
@@ -257,6 +267,97 @@ class ReportService:
             raise ReportInvalidPayload("backtest report invalid response")
         LOGGER.info("report_fetch_ok backtest_id=%s", backtest_id)
         return payload
+
+    def fetch_data_package(self, backtest_id: str) -> tuple[bytes, str, dict[str, str]]:
+        validate_backtest_id(backtest_id)
+        entry = self._ensure_backtest_routable(backtest_id, allow_running_only=False)  # type: ignore[call-arg]
+        base_url = entry["backtest_api_base"]
+        url = normalize_join_url(base_url, self._config.data_download_path.format(backtest_id=backtest_id))
+        req = urllib.request.Request(url, headers=self._backtest_headers(), method="GET")
+        LOGGER.info("data_package_fetch_start backtest_id=%s base=%s url=%s", backtest_id, base_url, url)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                data = resp.read()
+                content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                headers: dict[str, str] = {}
+                content_disposition = resp.headers.get("Content-Disposition")
+                if content_disposition:
+                    headers["Content-Disposition"] = content_disposition
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8")
+            LOGGER.info(
+                "data_package_fetch_http_error backtest_id=%s status=%s detail=%s",
+                backtest_id,
+                exc.code,
+                detail,
+            )
+            raise ReportHttpError(exc.code, detail or "backtest error") from exc
+        except Exception as exc:
+            LOGGER.info("data_package_fetch_error backtest_id=%s error=%s", backtest_id, exc)
+            raise ReportFetchError(str(exc)) from exc
+        LOGGER.info("data_package_fetch_ok backtest_id=%s", backtest_id)
+        return data, content_type, headers
+
+    def fetch_runs(self, base_url: str) -> list[dict[str, Any]]:
+        url = normalize_join_url(base_url, self._config.runs_path)
+        req = urllib.request.Request(url, headers=self._backtest_headers(), method="GET")
+        LOGGER.info("runs_fetch_start base=%s url=%s", base_url, url)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8")
+            LOGGER.info(
+                "runs_fetch_http_error base=%s status=%s detail=%s",
+                base_url,
+                exc.code,
+                detail,
+            )
+            raise ReportHttpError(exc.code, detail or "backtest error") from exc
+        except Exception as exc:
+            LOGGER.info("runs_fetch_error base=%s error=%s", base_url, exc)
+            raise ReportFetchError(str(exc)) from exc
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception as exc:
+            LOGGER.info("runs_fetch_invalid_json base=%s", base_url)
+            raise ReportInvalidPayload("backtest runs invalid response") from exc
+        if not isinstance(payload, dict):
+            LOGGER.info("runs_fetch_invalid_payload base=%s", base_url)
+            raise ReportInvalidPayload("backtest runs invalid response")
+
+        runs = payload.get("runs")
+        if not isinstance(runs, list):
+            LOGGER.info("runs_fetch_missing_runs base=%s", base_url)
+            raise ReportInvalidPayload("backtest runs invalid response")
+
+        items: list[dict[str, Any]] = []
+        for run in runs:
+            if isinstance(run, dict):
+                items.append(run)
+        LOGGER.info("runs_fetch_ok base=%s count=%s", base_url, len(items))
+        return items
+
+    def list_active_runs(self, base_urls: list[str]) -> list[dict[str, Any]]:
+        active_statuses = {"starting", "running", "stopping"}
+        active: list[dict[str, Any]] = []
+        success = 0
+        for base_url in base_urls:
+            try:
+                runs = self.fetch_runs(base_url)
+            except ReportServiceError as exc:
+                LOGGER.info("active_runs_fetch_failed base=%s error=%s", base_url, exc)
+                continue
+            success += 1
+            for run in runs:
+                status = run.get("status")
+                if status in active_statuses:
+                    active.append(run)
+        if success == 0:
+            raise ReportFetchError("backtest active runs unavailable")
+        active.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return active
 
     def get_report(self, backtest_id: str, *, allow_running_only: bool = False) -> dict[str, Any]:
         LOGGER.info("report_get_start backtest_id=%s allow_running_only=%s", backtest_id, allow_running_only)
@@ -376,3 +477,127 @@ class ReportService:
 
 def normalize_join_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/" + path.lstrip("/")
+
+
+def build_report_router(
+    *,
+    get_report_service: Callable[[], ReportService],
+    read_mapping: Callable[[], dict[str, Any]],
+    mapping_lock: threading.Lock,
+    max_report_page_size: int,
+    active_base_urls: Callable[[], list[str]],
+) -> APIRouter:
+    router = APIRouter(tags=["report_service"])
+
+    @router.get("/runs/backtest/reports")
+    async def get_backtest_reports(
+        page: int = 1,
+        limit: int = 10,
+        requested_by: str | None = None,
+    ) -> JSONResponse:
+        if page < 1 or limit < 1:
+            raise HTTPException(status_code=400, detail="page/limit must be >= 1")
+        if limit > max_report_page_size:
+            raise HTTPException(status_code=400, detail=f"limit exceeds max size {max_report_page_size}")
+
+        with mapping_lock:
+            mapping = read_mapping()
+        service = get_report_service()
+        try:
+            items = service.get_report_page(
+                page=page,
+                limit=limit,
+                requested_by=requested_by,
+                mapping=mapping,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "page": page,
+                "limit": limit,
+                "count": len(items),
+                "items": items,
+            }
+        )
+
+    @router.get("/runs/backtest/{backtest_id}/report")
+    async def get_backtest_report(backtest_id: str) -> JSONResponse:
+        LOGGER.info("get_backtest_report_requested backtest_id=%s", backtest_id)
+        service = get_report_service()
+        try:
+            payload = service.get_report(backtest_id, allow_running_only=False)
+        except ReportHttpError as exc:
+            LOGGER.info(
+                "fetch_backtest_report_http_error backtest_id=%s status=%s detail=%s",
+                backtest_id,
+                exc.status_code,
+                exc.detail[:200] if exc.detail else "",
+            )
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail or "backtest error") from exc
+        except ReportInvalidPayload as exc:
+            LOGGER.info("fetch_backtest_report_invalid_payload backtest_id=%s error=%s", backtest_id, exc)
+            raise HTTPException(status_code=502, detail="backtest report invalid response") from exc
+        except ReportFetchError as exc:
+            LOGGER.info("fetch_backtest_report_failed backtest_id=%s error=%s", backtest_id, exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            LOGGER.info("fetch_backtest_report_failed backtest_id=%s error=%s", backtest_id, exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        return JSONResponse(payload)
+
+    @router.get("/runs/backtest/{backtest_id}/download_data")
+    async def download_backtest_data(backtest_id: str) -> Response:
+        LOGGER.info("download_data_requested backtest_id=%s", backtest_id)
+        service = get_report_service()
+        try:
+            data, content_type, headers = service.fetch_data_package(backtest_id)
+        except ReportHttpError as exc:
+            LOGGER.info(
+                "download_data_http_error backtest_id=%s status=%s detail=%s",
+                backtest_id,
+                exc.status_code,
+                exc.detail[:200] if exc.detail else "",
+            )
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail or "backtest error") from exc
+        except ReportFetchError as exc:
+            LOGGER.info("download_data_request_failed backtest_id=%s error=%s", backtest_id, exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            LOGGER.info("download_data_request_failed backtest_id=%s error=%s", backtest_id, exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        return Response(content=data, media_type=content_type, headers=headers)
+
+    @router.get("/runs/backtest/active")
+    async def get_active_backtest_runs() -> JSONResponse:
+        service = get_report_service()
+        try:
+            runs = service.list_active_runs(active_base_urls())
+        except ReportHttpError as exc:
+            LOGGER.info(
+                "active_runs_http_error status=%s detail=%s",
+                exc.status_code,
+                exc.detail[:200] if exc.detail else "",
+            )
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail or "backtest error") from exc
+        except ReportInvalidPayload as exc:
+            LOGGER.info("active_runs_invalid_payload error=%s", exc)
+            raise HTTPException(status_code=502, detail="backtest runs invalid response") from exc
+        except ReportFetchError as exc:
+            LOGGER.info("active_runs_fetch_failed error=%s", exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            LOGGER.info("active_runs_fetch_failed error=%s", exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        return JSONResponse({"count": len(runs), "runs": runs})
+
+    return router
