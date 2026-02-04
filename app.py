@@ -101,6 +101,7 @@ HOST_API_KEY = os.getenv("HOST_API_KEY", "")
 BACKTEST_API_BASES = parse_backtest_api_bases(os.getenv("BACKTEST_API_BASES"), "")
 if not BACKTEST_API_BASES:
     raise RuntimeError("BACKTEST_API_BASES is required")
+BACKTEST_BRONZE_API_BASES = parse_backtest_api_bases(os.getenv("BACKTEST_BRONZE_API_BASES"), "")
 BACKTEST_API_KEY = os.getenv("BACKTEST_API_KEY", "")
 BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_backtest")
 BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
@@ -122,6 +123,9 @@ MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
 MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
 QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
 QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_queue.json")))
+
+BRONZE_SYMBOLS_THRESHOLD = 6
+CPU_PERCENT_LT = 80.0
 
 DEFAULT_LATENCY_CONFIG: dict[str, int] = {
     "base_latency_nanos": 20_000_000,
@@ -588,13 +592,31 @@ def load_run_assets(backtest_id: str) -> tuple[bytes, str, bytes, bytes]:
     return run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes
 
 
-async def pick_backtest_target(required_memory_gb: float):
+async def pick_backtest_target(required_memory_gb: float, symbol_count: int):
     async with QUEUE_STATE_LOCK:
         reserved_snapshot = dict(INFLIGHT_MEMORY_GB)
         inflight_counts_snapshot = dict(INFLIGHT_COUNTS)
 
     max_running = MAX_RUNNING_BACKTESTS if MAX_RUNNING_BACKTESTS > 0 else None
     runs_path = BACKTEST_RUNS_PATH if max_running is not None else None
+
+    if symbol_count < BRONZE_SYMBOLS_THRESHOLD and BACKTEST_BRONZE_API_BASES:
+        bronze = await asyncio.to_thread(
+            select_backtest_docker,
+            base_urls=BACKTEST_BRONZE_API_BASES,
+            metrics_path=BACKTEST_METRICS_PATH,
+            runs_path=runs_path,
+            headers=backtest_headers(),
+            required_memory_gb=required_memory_gb,
+            reserved_memory_gb=reserved_snapshot,
+            inflight_counts=inflight_counts_snapshot,
+            max_running=max_running,
+            timeout_seconds=BACKTEST_METRICS_TIMEOUT_SECONDS,
+            cpu_percent_lt=CPU_PERCENT_LT,
+            require_memory_gt=True,
+        )
+        if bronze is not None:
+            return bronze
 
     return await asyncio.to_thread(
         select_backtest_docker,
@@ -607,6 +629,7 @@ async def pick_backtest_target(required_memory_gb: float):
         inflight_counts=inflight_counts_snapshot,
         max_running=max_running,
         timeout_seconds=BACKTEST_METRICS_TIMEOUT_SECONDS,
+        cpu_percent_lt=CPU_PERCENT_LT,
     )
 
 
@@ -617,6 +640,7 @@ async def submit_with_queue_control(
     strategy_bytes: bytes,
     runner_bytes: bytes,
     required_memory_gb: float,
+    symbol_count: int,
 ) -> tuple[str, str | None]:
     """
     Returns: (hub_status, backtest_docker_run_id)
@@ -636,7 +660,7 @@ async def submit_with_queue_control(
             )
             return "queued", None
 
-    selection = await pick_backtest_target(required_memory_gb)
+    selection = await pick_backtest_target(required_memory_gb, symbol_count)
     if selection is None:
         async with QUEUE_STATE_LOCK:
             enqueue_backtest(backtest_id)
@@ -727,6 +751,7 @@ async def queue_scheduler() -> None:
                 try:
                     run_spec_payload = await asyncio.to_thread(load_run_spec_payload, backtest_id)
                     required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload)
+                    symbol_count = len(run_spec_payload["symbols"])
                 except Exception as exc:
                     update_mapping(
                         backtest_id,
@@ -735,7 +760,7 @@ async def queue_scheduler() -> None:
                     logger.warning("queue_scheduler_load_failed backtest_id=%s error=%s", backtest_id, exc)
                     break
 
-                selection = await pick_backtest_target(required_memory_gb)
+                selection = await pick_backtest_target(required_memory_gb, symbol_count)
                 if selection is None:
                     break
 
@@ -847,6 +872,7 @@ async def create_run(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload)
+    symbol_count = len(run_spec_payload["symbols"])
 
     # 3) 生成 run_id，并在本地保存上传内容，便于排查与追踪
     backtest_id = make_run_id()
@@ -892,6 +918,7 @@ async def create_run(
         strategy_bytes=strategy_bytes,
         runner_bytes=runner_bytes,
         required_memory_gb=required_memory_gb,
+        symbol_count=symbol_count,
     )
     logger.info(
         "create_run_done backtest_id=%s status=%s backtest_docker_run_id=%s",
