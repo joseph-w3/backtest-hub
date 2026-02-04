@@ -8,7 +8,7 @@ services:
       - "10033:10033"
     environment:
       HOST_API_KEY: ${HOST_API_KEY:-abcc}
-      BACKTEST_API_BASES: ${BACKTEST_API_BASES:-http://100.65.27.118:10001}
+      BACKTEST_API_BASES: ${BACKTEST_API_BASES:-http://100.65.27.118:10001,http://100.97.194.7:10001}
       BACKTEST_SUBMIT_PATH: ${BACKTEST_SUBMIT_PATH:-/v1/scripts/run_backtest}
       BACKTEST_RUNS_PATH: ${BACKTEST_RUNS_PATH:-/v1/runs}
       # Don't use a docker-compose default here: `{backtest_id}` conflicts with `${...}` parsing.
