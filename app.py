@@ -17,15 +17,27 @@ from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
 
-from scheduler import (
+from services.report_service import (
+    build_report_router,
+    ReportService,
+    ReportServiceConfig,
+)
+from services.scheduler import (
     parse_backtest_api_bases,
     required_memory_gb_from_run_spec,
     select_backtest_docker,
 )
 
 app = FastAPI()
+report_service: "ReportService | None" = None
+
+REPORT_SERVICE_TAG = "report_service"
+REPORT_SERVICE_DOCS_URL = "/report-service/docs"
+REPORT_SERVICE_OPENAPI_URL = "/report-service/openapi.json"
 
 
 def setup_logging() -> logging.Logger:
@@ -49,6 +61,24 @@ logger = setup_logging()
 @app.on_event("startup")
 async def on_startup() -> None:
     logger.info("app_started")
+    global report_service
+    report_service = ReportService(
+        ReportServiceConfig(
+            cache_path=REPORT_CACHE_PATH,
+            report_path=BACKTEST_REPORT_PATH,
+            data_download_path=BACKTEST_DATA_DOWNLOAD_PATH,
+            runs_path=BACKTEST_RUNS_PATH,
+            max_page_size=MAX_REPORT_PAGE_SIZE,
+        ),
+        backtest_headers=backtest_headers,
+        ensure_backtest_routable=ensure_backtest_routable,
+        update_mapping=update_mapping,
+        load_run_spec_payload=load_run_spec_payload,
+    )
+    try:
+        report_service.init_cache()
+    except Exception as exc:
+        logger.exception("report_cache_init_failed error=%s", exc)
     # Start background scheduler for queued submissions.
     asyncio.create_task(queue_scheduler())
 
@@ -96,6 +126,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_MOUNT_PATH = Path(env_or_default("DATA_MOUNT_PATH", "/opt/backtest"))
 RUN_STORAGE_PATH = Path(env_or_default("RUN_STORAGE_PATH", str(DATA_MOUNT_PATH / "runs")))
 RUN_MAPPING_PATH = Path(env_or_default("RUN_MAPPING_PATH", str(DATA_MOUNT_PATH / "run_mapping.json")))
+REPORT_CACHE_PATH = Path(env_or_default("REPORT_CACHE_PATH", str(DATA_MOUNT_PATH / "report_cache.sqlite3")))
 HOST_API_KEY = os.getenv("HOST_API_KEY", "")
 
 BACKTEST_API_BASES = parse_backtest_api_bases(os.getenv("BACKTEST_API_BASES"), "")
@@ -107,7 +138,12 @@ BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_b
 BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
 BACKTEST_LOGS_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/logs/download"
 BACKTEST_CSV_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/download_csv"
+BACKTEST_DATA_DOWNLOAD_PATH = env_or_default(
+    "BACKTEST_DATA_DOWNLOAD_PATH",
+    "/v1/runs/backtest/{backtest_id}/download_data",
+)
 BACKTEST_KILL_PATH = "/v1/runs/backtest/{backtest_id}/kill"
+BACKTEST_REPORT_PATH = env_or_default("BACKTEST_REPORT_PATH", "/v1/runs/backtest/{backtest_id}/report")
 BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 BACKTEST_WS_LOGS_PATH = env_or_default(
     "BACKTEST_WS_LOGS_PATH",
@@ -123,6 +159,7 @@ MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
 MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
 QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
 QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_queue.json")))
+MAX_REPORT_PAGE_SIZE = int(os.getenv("MAX_REPORT_PAGE_SIZE", "50"))
 
 BRONZE_SYMBOLS_THRESHOLD = 6
 CPU_PERCENT_LT = 80.0
@@ -335,6 +372,76 @@ def update_mapping(backtest_id: str, updates: dict[str, Any]) -> None:
 
 def normalize_join_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/" + path.lstrip("/")
+
+
+def get_report_service() -> ReportService:
+    global report_service
+    if report_service is None:
+        report_service = ReportService(
+            ReportServiceConfig(
+                cache_path=REPORT_CACHE_PATH,
+                report_path=BACKTEST_REPORT_PATH,
+                data_download_path=BACKTEST_DATA_DOWNLOAD_PATH,
+                runs_path=BACKTEST_RUNS_PATH,
+                max_page_size=MAX_REPORT_PAGE_SIZE,
+            ),
+            backtest_headers=backtest_headers,
+            ensure_backtest_routable=ensure_backtest_routable,
+            update_mapping=update_mapping,
+            load_run_spec_payload=load_run_spec_payload,
+        )
+    return report_service
+
+
+def get_report_service_openapi() -> dict[str, Any]:
+    report_routes = [
+        route
+        for route in app.routes
+        if getattr(route, "tags", None) and REPORT_SERVICE_TAG in route.tags
+    ]
+    return get_openapi(
+        title="backtest-hub report service",
+        version=app.version,
+        routes=report_routes,
+    )
+
+
+def get_main_openapi() -> dict[str, Any]:
+    main_routes = [
+        route
+        for route in app.routes
+        if not (getattr(route, "tags", None) and REPORT_SERVICE_TAG in route.tags)
+    ]
+    return get_openapi(
+        title=app.title or "FastAPI",
+        version=app.version,
+        routes=main_routes,
+    )
+
+
+app.openapi = get_main_openapi
+
+
+def get_active_base_urls() -> list[str]:
+    merged = BACKTEST_API_BASES + BACKTEST_BRONZE_API_BASES
+    seen: set[str] = set()
+    unique: list[str] = []
+    for base_url in merged:
+        if base_url not in seen:
+            seen.add(base_url)
+            unique.append(base_url)
+    return unique
+
+
+app.include_router(
+    build_report_router(
+        get_report_service=get_report_service,
+        read_mapping=read_mapping,
+        mapping_lock=MAPPING_LOCK,
+        max_report_page_size=MAX_REPORT_PAGE_SIZE,
+        active_base_urls=get_active_base_urls,
+    )
+)
 
 
 def read_queue(path: Path = QUEUE_PATH) -> list[dict[str, str]]:
@@ -840,6 +947,16 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "timestamp": utc_now()}
 
 
+@app.get(REPORT_SERVICE_OPENAPI_URL, include_in_schema=False)
+async def report_service_openapi() -> JSONResponse:
+    return JSONResponse(get_report_service_openapi())
+
+
+@app.get(REPORT_SERVICE_DOCS_URL, include_in_schema=False)
+async def report_service_docs() -> Response:
+    return get_swagger_ui_html(openapi_url=REPORT_SERVICE_OPENAPI_URL, title="Report Service API")
+
+
 @app.post("/runs")
 async def create_run(
     run_spec: UploadFile = File(...),
@@ -880,6 +997,10 @@ async def create_run(
 
     run_dir = RUN_STORAGE_PATH / backtest_id
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    requested_by = run_spec_payload.get("requested_by")
+    if isinstance(requested_by, str) and requested_by:
+        update_mapping(backtest_id, {"requested_by": requested_by})
 
     # 4) 保存策略文件（只保留文件名，避免路径穿越）
     strategy_filename = Path(strategy_file.filename or "strategy.py").name

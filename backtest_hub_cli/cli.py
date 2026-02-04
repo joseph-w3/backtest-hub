@@ -292,6 +292,14 @@ def command_submit(args: argparse.Namespace) -> int:
     with run_spec_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
+    requested_by = os.getenv("JUPYTERHUB_USER")
+    if requested_by and payload.get("requested_by") != requested_by:
+        payload["requested_by"] = requested_by
+        run_spec_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     run_spec_bytes = json.dumps(payload).encode("utf-8")
     strategy_bytes = strategy_path.read_bytes()
     body, content_type = build_multipart_form(

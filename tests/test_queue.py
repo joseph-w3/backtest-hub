@@ -1,10 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
+os.environ.setdefault("BACKTEST_API_BASES", "http://dummy")
 
 import app
+from services.scheduler import count_running_from_runs_payload
 
 
 class TestQueuePersistence(unittest.TestCase):
@@ -18,7 +21,7 @@ class TestQueuePersistence(unittest.TestCase):
                 {"run_id": "4", "status": "failed"},
             ],
         }
-        self.assertEqual(app.count_running_from_runs_payload(payload), 2)
+        self.assertEqual(count_running_from_runs_payload(payload), 2)
 
     def test_queue_roundtrip_and_position(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -69,4 +72,3 @@ class TestQueueFileCorruption(unittest.TestCase):
             qpath = Path(td) / "queue.json"
             qpath.write_text(json.dumps({"runs": []}), encoding="utf-8")
             self.assertEqual(app.read_queue(path=qpath), [])
-

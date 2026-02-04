@@ -1,5 +1,7 @@
+import os
 import unittest
 
+os.environ.setdefault("BACKTEST_API_BASES", "http://dummy")
 
 import app
 
@@ -68,4 +70,3 @@ class TestRunSpecLatencyConfig(unittest.TestCase):
         payload["latency_config"] = {"base_latency_nanos": -1}
         with self.assertRaises(ValueError):
             app.validate_run_spec(payload)
-
