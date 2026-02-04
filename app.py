@@ -19,13 +19,21 @@ import aiohttp
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
-from scheduler import (
+from services.report_service import (
+    ReportFetchError,
+    ReportHttpError,
+    ReportInvalidPayload,
+    ReportService,
+    ReportServiceConfig,
+)
+from services.scheduler import (
     parse_backtest_api_bases,
     required_memory_gb_from_run_spec,
     select_backtest_docker,
 )
 
 app = FastAPI()
+report_service: "ReportService | None" = None
 
 
 def setup_logging() -> logging.Logger:
@@ -49,6 +57,22 @@ logger = setup_logging()
 @app.on_event("startup")
 async def on_startup() -> None:
     logger.info("app_started")
+    global report_service
+    report_service = ReportService(
+        ReportServiceConfig(
+            cache_path=REPORT_CACHE_PATH,
+            report_path=BACKTEST_REPORT_PATH,
+            max_page_size=MAX_REPORT_PAGE_SIZE,
+        ),
+        backtest_headers=backtest_headers,
+        ensure_backtest_routable=ensure_backtest_routable,
+        update_mapping=update_mapping,
+        load_run_spec_payload=load_run_spec_payload,
+    )
+    try:
+        report_service.init_cache()
+    except Exception as exc:
+        logger.exception("report_cache_init_failed error=%s", exc)
     # Start background scheduler for queued submissions.
     asyncio.create_task(queue_scheduler())
 
@@ -96,6 +120,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_MOUNT_PATH = Path(env_or_default("DATA_MOUNT_PATH", "/opt/backtest"))
 RUN_STORAGE_PATH = Path(env_or_default("RUN_STORAGE_PATH", str(DATA_MOUNT_PATH / "runs")))
 RUN_MAPPING_PATH = Path(env_or_default("RUN_MAPPING_PATH", str(DATA_MOUNT_PATH / "run_mapping.json")))
+REPORT_CACHE_PATH = Path(env_or_default("REPORT_CACHE_PATH", str(DATA_MOUNT_PATH / "report_cache.sqlite3")))
 HOST_API_KEY = os.getenv("HOST_API_KEY", "")
 
 BACKTEST_API_BASES = parse_backtest_api_bases(os.getenv("BACKTEST_API_BASES"), "")
@@ -108,6 +133,7 @@ BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
 BACKTEST_LOGS_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/logs/download"
 BACKTEST_CSV_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/download_csv"
 BACKTEST_KILL_PATH = "/v1/runs/backtest/{backtest_id}/kill"
+BACKTEST_REPORT_PATH = env_or_default("BACKTEST_REPORT_PATH", "/v1/runs/backtest/{backtest_id}/report")
 BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 BACKTEST_WS_LOGS_PATH = env_or_default(
     "BACKTEST_WS_LOGS_PATH",
@@ -123,6 +149,7 @@ MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
 MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
 QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
 QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_queue.json")))
+MAX_REPORT_PAGE_SIZE = int(os.getenv("MAX_REPORT_PAGE_SIZE", "50"))
 
 BRONZE_SYMBOLS_THRESHOLD = 6
 CPU_PERCENT_LT = 80.0
@@ -335,6 +362,23 @@ def update_mapping(backtest_id: str, updates: dict[str, Any]) -> None:
 
 def normalize_join_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/" + path.lstrip("/")
+
+
+def get_report_service() -> ReportService:
+    global report_service
+    if report_service is None:
+        report_service = ReportService(
+            ReportServiceConfig(
+                cache_path=REPORT_CACHE_PATH,
+                report_path=BACKTEST_REPORT_PATH,
+                max_page_size=MAX_REPORT_PAGE_SIZE,
+            ),
+            backtest_headers=backtest_headers,
+            ensure_backtest_routable=ensure_backtest_routable,
+            update_mapping=update_mapping,
+            load_run_spec_payload=load_run_spec_payload,
+        )
+    return report_service
 
 
 def read_queue(path: Path = QUEUE_PATH) -> list[dict[str, str]]:
@@ -881,6 +925,10 @@ async def create_run(
     run_dir = RUN_STORAGE_PATH / backtest_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    requested_by = run_spec_payload.get("requested_by")
+    if isinstance(requested_by, str) and requested_by:
+        update_mapping(backtest_id, {"requested_by": requested_by})
+
     # 4) 保存策略文件（只保留文件名，避免路径穿越）
     strategy_filename = Path(strategy_file.filename or "strategy.py").name
     strategy_bytes = await strategy_file.read()
@@ -1012,12 +1060,74 @@ async def get_run(backtest_id: str) -> JSONResponse:
     return JSONResponse(payload)
 
 
+@app.get("/runs/backtest/reports")
+async def get_backtest_reports(
+    page: int = 1,
+    limit: int = 10,
+    requested_by: str | None = None,
+) -> JSONResponse:
+    if page < 1 or limit < 1:
+        raise HTTPException(status_code=400, detail="page/limit must be >= 1")
+    if limit > MAX_REPORT_PAGE_SIZE:
+        raise HTTPException(status_code=400, detail=f"limit exceeds max size {MAX_REPORT_PAGE_SIZE}")
+
+    with MAPPING_LOCK:
+        mapping = read_mapping()
+    service = get_report_service()
+    try:
+        items = service.get_report_page(
+            page=page,
+            limit=limit,
+            requested_by=requested_by,
+            mapping=mapping,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(
+        {
+            "page": page,
+            "limit": limit,
+            "count": len(items),
+            "items": items,
+        }
+    )
+
+
 @app.get("/runs/backtest/{backtest_id}")
 async def get_backtest_status(backtest_id: str) -> JSONResponse:
     logger.info("get_backtest_status_requested backtest_id=%s", backtest_id)
     entry = ensure_backtest_routable(backtest_id)
     base_url = entry["backtest_api_base"]
     payload = fetch_backtest_status(base_url, backtest_id)
+    return JSONResponse(payload)
+
+
+@app.get("/runs/backtest/{backtest_id}/report")
+async def get_backtest_report(backtest_id: str) -> JSONResponse:
+    logger.info("get_backtest_report_requested backtest_id=%s", backtest_id)
+    service = get_report_service()
+    try:
+        payload = service.get_report(backtest_id, allow_running_only=False)
+    except ReportHttpError as exc:
+        logger.warning(
+            "fetch_backtest_report_http_error backtest_id=%s status=%s detail=%s",
+            backtest_id,
+            exc.status_code,
+            exc.detail[:200] if exc.detail else "",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail or "backtest error") from exc
+    except ReportInvalidPayload as exc:
+        logger.warning("fetch_backtest_report_invalid_payload backtest_id=%s error=%s", backtest_id, exc)
+        raise HTTPException(status_code=502, detail="backtest report invalid response") from exc
+    except ReportFetchError as exc:
+        logger.exception("fetch_backtest_report_failed backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("fetch_backtest_report_failed backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     return JSONResponse(payload)
 
 
