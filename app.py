@@ -132,6 +132,10 @@ BACKTEST_SUBMIT_PATH = env_or_default("BACKTEST_SUBMIT_PATH", "/v1/scripts/run_b
 BACKTEST_RUNS_PATH = env_or_default("BACKTEST_RUNS_PATH", "/v1/runs")
 BACKTEST_LOGS_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/logs/download"
 BACKTEST_CSV_DOWNLOAD_PATH = "/v1/runs/backtest/{backtest_id}/download_csv"
+BACKTEST_DATA_DOWNLOAD_PATH = env_or_default(
+    "BACKTEST_DATA_DOWNLOAD_PATH",
+    "/v1/runs/backtest/{backtest_id}/download_data",
+)
 BACKTEST_KILL_PATH = "/v1/runs/backtest/{backtest_id}/kill"
 BACKTEST_REPORT_PATH = env_or_default("BACKTEST_REPORT_PATH", "/v1/runs/backtest/{backtest_id}/report")
 BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
@@ -235,6 +239,11 @@ def make_run_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = uuid.uuid4().hex
     return f"{ts}_{suffix}"
+
+
+def validate_backtest_id(backtest_id: str) -> None:
+    if not backtest_id or any(ch in backtest_id for ch in ("\\", "/", ".")):
+        raise HTTPException(status_code=400, detail="backtest_id has invalid characters")
 
 
 def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1257,6 +1266,39 @@ async def download_backtest_csv(backtest_id: str) -> Response:
         raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
     except Exception as exc:
         logger.exception("download_csv_request_failed backtest_id=%s", backtest_id)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return Response(content=data, media_type=content_type, headers=headers)
+
+
+@app.get("/runs/backtest/{backtest_id}/download_data")
+async def download_backtest_data(backtest_id: str) -> Response:
+    logger.info("download_data_requested backtest_id=%s", backtest_id)
+    validate_backtest_id(backtest_id)
+    entry = ensure_backtest_routable(backtest_id, allow_running_only=False)
+    base_url = entry["backtest_api_base"]
+    url = f"{base_url.rstrip('/')}{BACKTEST_DATA_DOWNLOAD_PATH.format(backtest_id=backtest_id)}"
+    req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
+    try:
+        logger.info("download_data_fetching backtest_id=%s url=%s", backtest_id, url)
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type", "application/octet-stream")
+            headers: dict[str, str] = {}
+            content_disposition = resp.headers.get("Content-Disposition")
+            if content_disposition:
+                headers["Content-Disposition"] = content_disposition
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        logger.warning(
+            "download_data_http_error backtest_id=%s status=%s detail=%s",
+            backtest_id,
+            exc.code,
+            detail[:200] if detail else "",
+        )
+        raise HTTPException(status_code=exc.code, detail=detail or "backtest error") from exc
+    except Exception as exc:
+        logger.exception("download_data_request_failed backtest_id=%s", backtest_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return Response(content=data, media_type=content_type, headers=headers)
