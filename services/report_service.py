@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import urllib.error
@@ -10,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+LOGGER = logging.getLogger("backtest_hub.report_service")
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -89,6 +91,7 @@ class ReportCache:
         self._lock = threading.Lock()
 
     def init_db(self) -> None:
+        LOGGER.info("report_cache_init_start path=%s", self._path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             with sqlite3.connect(self._path) as conn:
@@ -111,9 +114,11 @@ class ReportCache:
                     "CREATE INDEX IF NOT EXISTS idx_backtest_reports_created_at ON backtest_reports(run_created_at)"
                 )
                 conn.commit()
+        LOGGER.info("report_cache_init_ok path=%s", self._path)
 
     def get(self, backtest_id: str) -> dict[str, Any] | None:
         if not self._path.exists():
+            LOGGER.info("report_cache_miss backtest_id=%s reason=no_cache_file", backtest_id)
             return None
         with self._lock:
             with sqlite3.connect(self._path) as conn:
@@ -122,13 +127,17 @@ class ReportCache:
                     (backtest_id,),
                 ).fetchone()
         if not row:
+            LOGGER.info("report_cache_miss backtest_id=%s reason=not_found", backtest_id)
             return None
         try:
             payload = json.loads(row[0])
         except Exception:
+            LOGGER.info("report_cache_miss backtest_id=%s reason=invalid_json", backtest_id)
             return None
         if not isinstance(payload, dict):
+            LOGGER.info("report_cache_miss backtest_id=%s reason=invalid_payload", backtest_id)
             return None
+        LOGGER.info("report_cache_hit backtest_id=%s", backtest_id)
         return payload
 
     def upsert(
@@ -139,10 +148,17 @@ class ReportCache:
         run_created_at: str,
     ) -> None:
         if not isinstance(report, dict):
+            LOGGER.info("report_cache_upsert_skip backtest_id=%s reason=invalid_report", backtest_id)
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(report, ensure_ascii=True, indent=2)
         cached_at = utc_now()
+        LOGGER.info(
+            "report_cache_upsert_start backtest_id=%s requested_by=%s run_created_at=%s",
+            backtest_id,
+            requested_by,
+            run_created_at,
+        )
         with self._lock:
             with sqlite3.connect(self._path) as conn:
                 conn.execute(
@@ -163,6 +179,7 @@ class ReportCache:
                     (backtest_id, requested_by, run_created_at, payload, cached_at),
                 )
                 conn.commit()
+        LOGGER.info("report_cache_upsert_ok backtest_id=%s cached_at=%s", backtest_id, cached_at)
 
 
 @dataclass(frozen=True)
@@ -214,32 +231,47 @@ class ReportService:
     def fetch_report(self, base_url: str, backtest_id: str) -> dict[str, Any]:
         url = normalize_join_url(base_url, self._config.report_path.format(backtest_id=backtest_id))
         req = urllib.request.Request(url, headers=self._backtest_headers(), method="GET")
+        LOGGER.info("report_fetch_start backtest_id=%s base=%s url=%s", backtest_id, base_url, url)
         try:
             with urllib.request.urlopen(req) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8")
+            LOGGER.info(
+                "report_fetch_http_error backtest_id=%s status=%s detail=%s",
+                backtest_id,
+                exc.code,
+                detail,
+            )
             raise ReportHttpError(exc.code, detail or "backtest error") from exc
         except Exception as exc:
+            LOGGER.info("report_fetch_error backtest_id=%s error=%s", backtest_id, exc)
             raise ReportFetchError(str(exc)) from exc
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception as exc:
+            LOGGER.info("report_fetch_invalid_json backtest_id=%s", backtest_id)
             raise ReportInvalidPayload("backtest report invalid response") from exc
         if not isinstance(payload, dict):
+            LOGGER.info("report_fetch_invalid_payload backtest_id=%s", backtest_id)
             raise ReportInvalidPayload("backtest report invalid response")
+        LOGGER.info("report_fetch_ok backtest_id=%s", backtest_id)
         return payload
 
     def get_report(self, backtest_id: str, *, allow_running_only: bool = False) -> dict[str, Any]:
+        LOGGER.info("report_get_start backtest_id=%s allow_running_only=%s", backtest_id, allow_running_only)
         cached = self._cache.get(backtest_id)
         if cached is not None:
+            LOGGER.info("report_get_cache_hit backtest_id=%s", backtest_id)
             return cached
+        LOGGER.info("report_get_cache_miss backtest_id=%s", backtest_id)
 
         if allow_running_only:
             entry = self._ensure_backtest_routable(backtest_id)
         else:
             entry = self._ensure_backtest_routable(backtest_id, allow_running_only=False)  # type: ignore[call-arg]
         base_url = entry["backtest_api_base"]
+        LOGGER.info("report_get_routable backtest_id=%s base=%s", backtest_id, base_url)
         payload = self.fetch_report(base_url, backtest_id)
 
         if isinstance(payload, dict) and payload.get("report_available") is True:
@@ -247,6 +279,14 @@ class ReportService:
             cache_requested_by = requested_by or report_requested_by(payload)
             created_at = get_entry_created_at(backtest_id, entry)
             self._cache.upsert(backtest_id, payload, cache_requested_by, created_at)
+            LOGGER.info(
+                "report_get_cached backtest_id=%s requested_by=%s created_at=%s",
+                backtest_id,
+                cache_requested_by,
+                created_at,
+            )
+        else:
+            LOGGER.info("report_get_unavailable backtest_id=%s", backtest_id)
         return payload
 
     def get_report_page(
@@ -257,6 +297,13 @@ class ReportService:
         requested_by: str | None,
         mapping: dict[str, Any],
     ) -> list[dict[str, Any]]:
+        LOGGER.info(
+            "report_page_start page=%s limit=%s requested_by=%s mapping_size=%s",
+            page,
+            limit,
+            requested_by,
+            len(mapping),
+        )
         if page < 1 or limit < 1:
             raise ValueError("page/limit must be >= 1")
         if limit > self._config.max_page_size:
@@ -316,6 +363,14 @@ class ReportService:
                 if len(results) >= limit:
                     break
 
+        LOGGER.info(
+            "report_page_ok page=%s limit=%s requested_by=%s matched=%s returned=%s",
+            page,
+            limit,
+            requested_by,
+            matched,
+            len(results),
+        )
         return results
 
 
