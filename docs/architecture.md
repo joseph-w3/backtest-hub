@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-02-04 20:49:35
+- 当前梳理时间: 2026-02-04 21:15:25
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流；并在 hub 侧提供并发队列限制（避免 backtest docker 被无限提交打爆）。
@@ -65,8 +65,8 @@
   - `GET /runs/{backtest_id}` 读取映射并返回。
   - `GET /runs/backtest/{backtest_id}` 根据映射中的 `backtest_api_base` 透传目标 backtest docker 状态（status/pid/started_at）。
   - `GET /runs/backtest/{backtest_id}/report` 根据映射中的 `backtest_api_base` 透传回测报告，并在 hub 侧落入 SQLite 缓存（仅成功报告）。
-  - `GET /runs/backtest/reports` 按映射中的时间倒序聚合回测报告（分页 + requested_by 过滤）；优先命中 SQLite 缓存，未命中则透传 backtest docker，失败或不可用报告跳过。
-  - `GET /runs/backtest/active` 透传并汇总所有 backtest docker 的活跃任务（starting/running/stopping），按 created_at 倒序返回。
+  - `GET /runs/backtest/reports` 按映射中的时间倒序聚合回测报告（分页 + requested_by 过滤）；优先命中 SQLite 缓存，未命中则透传 backtest docker，失败或不可用报告跳过；聚合结果每条记录补充 `backtest_api_base`。
+  - `GET /runs/backtest/active` 透传并汇总所有 backtest docker 的活跃任务（starting/running/stopping），按 created_at 倒序返回；聚合结果每条记录补充 `backtest_api_base`。
   - `GET /runs/{backtest_id}/logs` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 日志。
   - `GET /runs/backtest/{backtest_id}/download_csv` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 回测 CSV ZIP。
   - `GET /runs/backtest/{backtest_id}/download_data` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 回测完整数据包 ZIP。
@@ -119,6 +119,11 @@
 - 观测与日志: `app.py` 统一记录请求日志；`scripts/run_backtest.py` 写入 `status.json`（包含状态/错误/traceback）。
 
 ## 改动概要/变更记录
+
+### 2026-02-04 21:15:25
+- 本次新增/更新要点: `/runs/backtest/reports` 与 `/runs/backtest/active` 聚合结果补充 `backtest_api_base`，便于识别来源 backtest docker。
+- 变更动机/需求来源: 用户要求聚合接口体现数据来源的 backtest docker。
+- 当前更新时间: 2026-02-04 21:15:25
 
 ### 2026-02-04 20:49:35
 - 本次新增/更新要点: 主 Swagger `/docs` 过滤 report_service 路由；report_service 仅在 `/report-service/docs` 展示。

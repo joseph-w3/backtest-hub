@@ -223,6 +223,14 @@ class ReportService:
     def init_cache(self) -> None:
         self._cache.init_db()
 
+    def attach_backtest_api_base(self, payload: dict[str, Any], base_url: str | None) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return payload
+        enriched = dict(payload)
+        if base_url:
+            enriched["backtest_api_base"] = base_url
+        return enriched
+
     def get_requested_by_from_entry(self, backtest_id: str, entry: dict[str, Any] | None) -> str | None:
         if isinstance(entry, dict):
             requested_by = entry.get("requested_by")
@@ -353,7 +361,7 @@ class ReportService:
             for run in runs:
                 status = run.get("status")
                 if status in active_statuses:
-                    active.append(run)
+                    active.append(self.attach_backtest_api_base(run, base_url))
         if success == 0:
             raise ReportFetchError("backtest active runs unavailable")
         active.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
@@ -416,6 +424,9 @@ class ReportService:
         results: list[dict[str, Any]] = []
 
         for created_at, backtest_id, entry in sorted_entries:
+            base_url = entry.get("backtest_api_base") if isinstance(entry, dict) else None
+            if not isinstance(base_url, str) or not base_url:
+                base_url = None
             mapping_match = False
             requested_by_value = None
             if requested_by:
@@ -433,13 +444,12 @@ class ReportService:
                         continue
                 matched += 1
                 if matched > offset:
-                    results.append(cached)
+                    results.append(self.attach_backtest_api_base(cached, base_url))
                     if len(results) >= limit:
                         break
                 continue
 
-            base_url = entry.get("backtest_api_base")
-            if not isinstance(base_url, str) or not base_url:
+            if not base_url:
                 continue
 
             try:
@@ -460,7 +470,7 @@ class ReportService:
 
             matched += 1
             if matched > offset:
-                results.append(payload)
+                results.append(self.attach_backtest_api_base(payload, base_url))
                 if len(results) >= limit:
                     break
 
