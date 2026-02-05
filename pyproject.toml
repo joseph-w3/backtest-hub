@@ -21,3 +21,8 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["backtest_hub_cli*"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]

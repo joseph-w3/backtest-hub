@@ -1301,8 +1301,26 @@ async def download_backtest_csv(backtest_id: str) -> Response:
 @app.post("/runs/backtest/{backtest_id}/kill")
 async def kill_backtest_run(backtest_id: str) -> JSONResponse:
     logger.info("kill_backtest_requested backtest_id=%s", backtest_id)
-    entry = ensure_backtest_routable(backtest_id, allow_running_only=False)
-    base_url = entry["backtest_api_base"]
+
+    entry = get_mapping_entry(backtest_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="backtest_id not found")
+
+    status = entry.get("status")
+    base_url = entry.get("backtest_api_base")
+
+    # If still queued, remove from queue and cancel
+    if status == "queued" or not base_url:
+        async with QUEUE_STATE_LOCK:
+            removed = remove_from_queue_batch([backtest_id])
+        if backtest_id in removed:
+            update_mapping(backtest_id, {"status": "cancelled", "cancelled_at": utc_now()})
+            logger.info("kill_backtest_cancelled_queued backtest_id=%s", backtest_id)
+            return JSONResponse({"backtest_id": backtest_id, "status": "cancelled"})
+        # Not in queue but no base_url - inconsistent state
+        raise HTTPException(status_code=409, detail="Backtest is still queued but not in queue")
+
+    # Forward kill to backtest docker
     url = f"{base_url.rstrip('/')}{BACKTEST_KILL_PATH.format(backtest_id=backtest_id)}"
     req = urllib.request.Request(url, headers=backtest_headers(), method="POST")
     try:
