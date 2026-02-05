@@ -158,6 +158,7 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
 MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
 MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
 QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
+QUEUE_DISPATCH_DELAY_SECONDS = float(os.getenv("QUEUE_DISPATCH_DELAY_SECONDS", "30"))
 QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_queue.json")))
 MAX_REPORT_PAGE_SIZE = int(os.getenv("MAX_REPORT_PAGE_SIZE", "50"))
 
@@ -918,6 +919,16 @@ async def queue_scheduler() -> None:
                         selection.base_url,
                     )
                     made_progress = True
+                    # Delay before dispatching next job to let CPU/RAM stabilize on target node.
+                    # Without this delay, concurrent submissions would hit the node before
+                    # metrics update, bypassing the 80% CPU threshold check.
+                    if QUEUE_DISPATCH_DELAY_SECONDS > 0:
+                        logger.info(
+                            "queue_scheduler_dispatch_delay backtest_id=%s delay_seconds=%.1f",
+                            backtest_id,
+                            QUEUE_DISPATCH_DELAY_SECONDS,
+                        )
+                        await asyncio.sleep(QUEUE_DISPATCH_DELAY_SECONDS)
                 except Exception as exc:
                     # Put back to queue head to retry later.
                     if item:
