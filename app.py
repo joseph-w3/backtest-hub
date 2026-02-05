@@ -765,91 +765,22 @@ async def submit_with_queue_control(
 ) -> tuple[str, str | None]:
     """
     Returns: (hub_status, backtest_docker_run_id)
-      - hub_status: "submitted" | "queued"
+      - hub_status: "queued" (always queued, scheduler dispatches with delay)
+      - backtest_docker_run_id: always None (set by scheduler after dispatch)
     """
-    # If the queue is not empty, enforce FIFO fairness (no bypass).
+    # Always queue requests. Let queue_scheduler dispatch with proper delay
+    # to ensure metrics update between submissions and prevent server overload.
     async with QUEUE_STATE_LOCK:
-        if read_queue():
-            enqueue_backtest(backtest_id)
-            update_mapping(
-                backtest_id,
-                {
-                    "status": "queued",
-                    "queued_at": utc_now(),
-                    "required_memory_gb": required_memory_gb,
-                },
-            )
-            return "queued", None
-
-    selection = await pick_backtest_target(required_memory_gb, symbol_count)
-    if selection is None:
-        async with QUEUE_STATE_LOCK:
-            enqueue_backtest(backtest_id)
-            update_mapping(
-                backtest_id,
-                {
-                    "status": "queued",
-                    "queued_at": utc_now(),
-                    "required_memory_gb": required_memory_gb,
-                    "last_error": "no_capacity",
-                },
-            )
-            return "queued", None
-
-    async with QUEUE_STATE_LOCK:
-        if read_queue():
-            enqueue_backtest(backtest_id)
-            update_mapping(
-                backtest_id,
-                {
-                    "status": "queued",
-                    "queued_at": utc_now(),
-                    "required_memory_gb": required_memory_gb,
-                },
-            )
-            return "queued", None
-
-        current_reserved = INFLIGHT_MEMORY_GB.get(selection.base_url, 0.0)
-        available = selection.metrics.memory_free_gb - current_reserved
-        if available < required_memory_gb:
-            enqueue_backtest(backtest_id)
-            update_mapping(
-                backtest_id,
-                {
-                    "status": "queued",
-                    "queued_at": utc_now(),
-                    "required_memory_gb": required_memory_gb,
-                    "last_error": "insufficient_memory",
-                },
-            )
-            return "queued", None
-
-        reserve_inflight(selection.base_url, required_memory_gb)
-
-    try:
-        backtest_docker_run_id = await asyncio.to_thread(
-            submit_to_backtest,
-            selection.base_url,
-            backtest_id,
-            run_spec_bytes,
-            strategy_filename,
-            strategy_bytes,
-            runner_bytes,
-        )
+        enqueue_backtest(backtest_id)
         update_mapping(
             backtest_id,
             {
-                "status": "submitted",
-                "submitted_at": utc_now(),
-                "backtest_docker_run_id": backtest_docker_run_id,
-                "backtest_api_base": selection.base_url,
+                "status": "queued",
+                "queued_at": utc_now(),
                 "required_memory_gb": required_memory_gb,
             },
         )
-        return "submitted", backtest_docker_run_id
-    finally:
-        async with QUEUE_STATE_LOCK:
-            release_inflight(selection.base_url, required_memory_gb)
+    return "queued", None
 
 
 async def queue_scheduler() -> None:
@@ -955,8 +886,9 @@ async def queue_scheduler() -> None:
                         continue  # Removed by someone else
 
                     # Re-verify global resource (race condition check)
-                    current_global_reserved = INFLIGHT_MEMORY_GB.get(selection.base_url, 0.0)
-                    real_available = selection.metrics.memory_free_gb - current_global_reserved
+                    # 使用 local_reserved（这一轮中累积的预留），而不是 INFLIGHT_MEMORY_GB（成功后会被释放）
+                    local_for_base = local_reserved.get(selection.base_url, 0.0)
+                    real_available = selection.metrics.memory_free_gb - local_for_base
 
                     if real_available >= required_memory_gb:
                         # Success! Reserve and dequeue
