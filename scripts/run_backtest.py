@@ -86,6 +86,7 @@ REQUIRED_FIELDS = {
 
 OPTIONAL_FIELDS = {
     "latency_config",
+    "starting_balance_usdt",
 }
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
