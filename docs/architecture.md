@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-02-04 21:15:25
+- 当前梳理时间: 2026-02-05 01:50:00
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流；并在 hub 侧提供并发队列限制（避免 backtest docker 被无限提交打爆）。
@@ -76,6 +76,7 @@
   - `DELETE /queue` 批量删除队列中的任务（仅影响 queued 任务，删除后标记为 cancelled）。
 - 队列调度链路:
   - hub 启动后后台调度器周期性拉取各 backtest docker 的 system metrics，按可用内存（扣除 inflight 预占）与 FIFO 出队并提交回测；若内存不足则保持排队。
+  - 每次成功提交后等待 `QUEUE_DISPATCH_DELAY_SECONDS`（默认 30s），让目标节点 CPU/RAM 有时间反映新负载，避免并发提交绕过 80% CPU 阈值检查。
 - 日志流链路:
   - 客户端连接 `/runs/backtest/{backtest_id}/logs/stream`，服务端按映射中的 `backtest_api_base` 建立到目标 backtest docker 的 WebSocket 连接并双向转发消息。
   - `backtest-hub-cli submit --follow-logs`（或 `scripts/submit_run.py --follow-logs`）通过 WebSocket 拉取日志并落盘到 `./live_logs/{backtest_id}.log`。
@@ -93,7 +94,7 @@
     `BACKTEST_REPORT_PATH`, `BACKTEST_API_KEY`, `BACKTEST_WS_LOGS_PATH`, `BACKTEST_RUNS_PATH`, `BACKTEST_METRICS_PATH`, `BACKTEST_DATA_DOWNLOAD_PATH`,
     `BACKTEST_METRICS_TIMEOUT_SECONDS`, `DATA_MOUNT_PATH`, `RUN_STORAGE_PATH`, `RUN_MAPPING_PATH`, `REPORT_CACHE_PATH`, `QUEUE_PATH`,
     `BACKTEST_RUNNER_PATH`, `MAX_SYMBOLS`, `MAX_RANGE_DAYS`, `MAX_RUNNING_BACKTESTS`, `MAX_REPORT_PAGE_SIZE`,
-    `QUEUE_POLL_INTERVAL_SECONDS`。
+    `QUEUE_POLL_INTERVAL_SECONDS`, `QUEUE_DISPATCH_DELAY_SECONDS`。
   - 固定路径: 日志下载 `/v1/runs/backtest/{backtest_id}/logs/download`，CSV `/v1/runs/backtest/{backtest_id}/download_csv`，数据包 `/v1/runs/backtest/{backtest_id}/download_data`，kill `/v1/runs/backtest/{backtest_id}/kill`。
   - 文档: report_service 独立 Swagger `/report-service/docs`（OpenAPI `/report-service/openapi.json`）；主 Swagger `/docs` 不包含 report_service 路由。
   - CLI: `BACKTEST_HUB_BASE_URL`（默认 `http://100.87.155.67:10033`）。
@@ -119,6 +120,11 @@
 - 观测与日志: `app.py` 统一记录请求日志；`scripts/run_backtest.py` 写入 `status.json`（包含状态/错误/traceback）。
 
 ## 改动概要/变更记录
+
+### 2026-02-05 01:50:00
+- 本次新增/更新要点: 新增 `QUEUE_DISPATCH_DELAY_SECONDS` 配置（默认 30s）；队列调度成功提交后等待延时，让目标节点 metrics 有时间更新，避免并发提交绕过 80% CPU 阈值检查；新增 `tests/test_scheduler.py` 单元测试（33 tests）覆盖调度器核心函数。
+- 变更动机/需求来源: 用户要求补充调度器测试并解决并发提交打满服务器 CPU/RAM 的问题。
+- 当前更新时间: 2026-02-05 01:50:00
 
 ### 2026-02-04 21:15:25
 - 本次新增/更新要点: `/runs/backtest/reports` 与 `/runs/backtest/active` 聚合结果补充 `backtest_api_base`，便于识别来源 backtest docker。
