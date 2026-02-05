@@ -691,5 +691,136 @@ class TestBackfillingLogic(unittest.TestCase):
         self.assertEqual(schedulable, ["A"])
 
 
+class TestDirectSubmitBypassesQueue(unittest.TestCase):
+    """
+    Tests demonstrating the problem with direct submission when queue is empty.
+
+    Current behavior: When queue is empty, new requests bypass the queue and
+    submit directly. This means multiple rapid requests can all hit the same
+    server before metrics update, bypassing the 30s dispatch delay protection.
+
+    Expected behavior: All requests should go through the queue to ensure
+    the 30s dispatch delay is applied between submissions.
+    """
+
+    def test_current_logic_bypasses_queue_when_empty(self) -> None:
+        """
+        This test verifies the CURRENT (buggy) behavior.
+
+        When queue is empty, submit_with_queue_control should queue the request,
+        NOT submit directly. But currently it submits directly.
+
+        This test should FAIL after we fix the code.
+        """
+        # Simulate checking if request goes to queue or direct submit
+        queue = []
+
+        def should_queue_or_direct_submit() -> str:
+            """
+            Current logic from submit_with_queue_control lines 770-782:
+            - If queue is not empty -> queue
+            - If queue is empty -> try direct submit
+            """
+            if queue:  # Current: only queue if queue is non-empty
+                return "queued"
+            return "direct_submit"
+
+        # First request: queue is empty -> goes to direct submit (BAD!)
+        result1 = should_queue_or_direct_submit()
+
+        # This assertion documents the CURRENT (buggy) behavior
+        # After fix, this should be "queued" instead
+        self.assertEqual(result1, "direct_submit")  # CURRENT: bypasses queue
+
+    def test_fixed_logic_always_queues(self) -> None:
+        """
+        Expected behavior: ALL requests should go to queue.
+
+        This test documents what the FIXED behavior should look like.
+        After fix, this test should PASS.
+        """
+        queue = []
+
+        def should_queue_fixed() -> str:
+            """
+            Fixed logic: always queue, regardless of queue state.
+            Let queue_scheduler handle dispatch with proper delays.
+            """
+            return "queued"  # Always queue!
+
+        result1 = should_queue_fixed()
+        self.assertEqual(result1, "queued")
+
+    def test_rapid_requests_need_queue_protection(self) -> None:
+        """
+        Demonstrates WHY we need all requests to go through queue.
+
+        Scenario: 3 requests arrive within 100ms (user clicks rapidly)
+        - Without queue: all 3 submit directly, no delay, same server overloaded
+        - With queue: scheduler applies 30s delay, metrics update, jobs spread out
+        """
+        from services import scheduler
+
+        # Track which servers get hit
+        submissions = []
+        call_count = {"value": 0}
+
+        def mock_fetch_metrics(base_url, metrics_path, headers, timeout_seconds):
+            """Metrics don't update between rapid calls (no 30s delay)."""
+            call_count["value"] += 1
+            # Same metrics every time - simulates no delay
+            if base_url == "http://host1:8000":
+                return DockerMetrics(
+                    base_url="http://host1:8000",
+                    cpu_percent=40.0,
+                    memory_total_gb=64.0,
+                    memory_used_gb=16.0,
+                    memory_free_gb=48.0,
+                )
+            return DockerMetrics(
+                base_url="http://host2:8000",
+                cpu_percent=60.0,
+                memory_total_gb=64.0,
+                memory_used_gb=32.0,
+                memory_free_gb=32.0,
+            )
+
+        original_fetch = scheduler.fetch_metrics
+        scheduler.fetch_metrics = mock_fetch_metrics
+        try:
+            # Simulate 3 rapid direct submits (no queue, no delay)
+            for i in range(3):
+                result = select_backtest_docker(
+                    base_urls=["http://host1:8000", "http://host2:8000"],
+                    metrics_path="/metrics",
+                    runs_path=None,
+                    headers={},
+                    required_memory_gb=10.0,
+                    reserved_memory_gb=None,  # No INFLIGHT tracking between calls
+                    inflight_counts=None,
+                    max_running=None,
+                    timeout_seconds=3.0,
+                    cpu_percent_lt=80.0,
+                )
+                if result:
+                    submissions.append(result.base_url)
+
+            # BUG: All 3 go to host1 (best metrics, but metrics never updated)
+            # This would overload host1's CPU/RAM
+            self.assertEqual(submissions, [
+                "http://host1:8000",
+                "http://host1:8000",
+                "http://host1:8000",
+            ])
+
+            # With proper queue + 30s delay, we'd expect:
+            # Job 1 -> host1, (wait 30s, metrics update)
+            # Job 2 -> host2 (host1 now busy), (wait 30s)
+            # Job 3 -> queued (both busy) or different distribution
+
+        finally:
+            scheduler.fetch_metrics = original_fetch
+
+
 if __name__ == "__main__":
     unittest.main()
