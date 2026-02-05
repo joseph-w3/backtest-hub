@@ -159,6 +159,10 @@ MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
 MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
 QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
 QUEUE_DISPATCH_DELAY_SECONDS = float(os.getenv("QUEUE_DISPATCH_DELAY_SECONDS", "30"))
+# Backfilling: only backfill tasks queued within this window after head task (seconds)
+BACKFILL_WINDOW_SECONDS = float(os.getenv("BACKFILL_WINDOW_SECONDS", "300"))
+# Backfilling: stop backfilling when head task has waited longer than this (seconds)
+BACKFILL_RESERVE_THRESHOLD_SECONDS = float(os.getenv("BACKFILL_RESERVE_THRESHOLD_SECONDS", "600"))
 QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_queue.json")))
 MAX_REPORT_PAGE_SIZE = int(os.getenv("MAX_REPORT_PAGE_SIZE", "50"))
 
@@ -700,10 +704,19 @@ def load_run_assets(backtest_id: str) -> tuple[bytes, str, bytes, bytes]:
     return run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes
 
 
-async def pick_backtest_target(required_memory_gb: float, symbol_count: int):
-    async with QUEUE_STATE_LOCK:
-        reserved_snapshot = dict(INFLIGHT_MEMORY_GB)
-        inflight_counts_snapshot = dict(INFLIGHT_COUNTS)
+async def pick_backtest_target(
+    required_memory_gb: float,
+    symbol_count: int,
+    reserved_override: dict[str, float] | None = None,
+    counts_override: dict[str, int] | None = None,
+):
+    if reserved_override is not None and counts_override is not None:
+        reserved_snapshot = reserved_override
+        inflight_counts_snapshot = counts_override
+    else:
+        async with QUEUE_STATE_LOCK:
+            reserved_snapshot = dict(INFLIGHT_MEMORY_GB)
+            inflight_counts_snapshot = dict(INFLIGHT_COUNTS)
 
     max_running = MAX_RUNNING_BACKTESTS if MAX_RUNNING_BACKTESTS > 0 else None
     runs_path = BACKTEST_RUNS_PATH if max_running is not None else None
@@ -844,18 +857,70 @@ async def queue_scheduler() -> None:
         try:
             async with QUEUE_STATE_LOCK:
                 queued = read_queue()
+                # Snapshot global state for this iteration
+                local_reserved = dict(INFLIGHT_MEMORY_GB)
+                local_counts = dict(INFLIGHT_COUNTS)
+
             if not queued:
                 await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
                 continue
-            made_progress = False
-            while True:
-                async with QUEUE_STATE_LOCK:
-                    queued = read_queue()
-                    if not queued:
-                        break
-                    head = queued[0]
 
-                backtest_id = head["backtest_id"]
+            head = queued[0]
+            head_queued_at = head.get("queued_at", "")
+            head_wait_seconds = 0.0
+            if head_queued_at:
+                try:
+                    head_wait_seconds = (datetime.now(timezone.utc) - parse_iso8601(head_queued_at)).total_seconds()
+                except Exception:
+                    pass
+
+            # Check if head has waited too long - enter reserve mode (no backfilling)
+            reserve_mode = head_wait_seconds > BACKFILL_RESERVE_THRESHOLD_SECONDS
+            if reserve_mode:
+                logger.info(
+                    "queue_scheduler_reserve_mode head_backtest_id=%s wait_seconds=%.1f threshold=%.1f",
+                    head.get("backtest_id"),
+                    head_wait_seconds,
+                    BACKFILL_RESERVE_THRESHOLD_SECONDS,
+                )
+
+            made_progress = False
+
+            # Iterate through all tasks (Backfilling)
+            for idx, item in enumerate(queued):
+                backtest_id = item.get("backtest_id")
+                if not backtest_id:
+                    continue
+
+                is_head = idx == 0
+                item_queued_at = item.get("queued_at", "")
+
+                # Anti-starvation: in reserve mode, only try head task
+                if reserve_mode and not is_head:
+                    logger.info(
+                        "queue_scheduler_skip_reserve_mode backtest_id=%s head_backtest_id=%s",
+                        backtest_id,
+                        head.get("backtest_id"),
+                    )
+                    continue
+
+                # Anti-starvation: only backfill tasks queued within window after head
+                if not is_head and head_queued_at and item_queued_at:
+                    try:
+                        head_time = parse_iso8601(head_queued_at)
+                        item_time = parse_iso8601(item_queued_at)
+                        if (item_time - head_time).total_seconds() > BACKFILL_WINDOW_SECONDS:
+                            logger.info(
+                                "queue_scheduler_skip_outside_window backtest_id=%s queued_at=%s head_queued_at=%s window=%.1f",
+                                backtest_id,
+                                item_queued_at,
+                                head_queued_at,
+                                BACKFILL_WINDOW_SECONDS,
+                            )
+                            continue
+                    except Exception:
+                        pass
+
                 try:
                     run_spec_payload = await asyncio.to_thread(load_run_spec_payload, backtest_id)
                     required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload)
@@ -866,29 +931,47 @@ async def queue_scheduler() -> None:
                         {"status": "queued", "last_error": str(exc), "last_error_at": utc_now()},
                     )
                     logger.warning("queue_scheduler_load_failed backtest_id=%s error=%s", backtest_id, exc)
-                    break
+                    continue
 
-                selection = await pick_backtest_target(required_memory_gb, symbol_count)
+                # Use local state to pick target (avoids double-booking in one pass)
+                selection = await pick_backtest_target(
+                    required_memory_gb,
+                    symbol_count,
+                    reserved_override=local_reserved,
+                    counts_override=local_counts,
+                )
+
                 if selection is None:
-                    break
+                    # Cannot fit this task, skip to next (Backfilling)
+                    continue
 
-                item = None
+                # Found a potential slot. Try to acquire lock and real resource.
+                should_run = False
+
                 async with QUEUE_STATE_LOCK:
-                    queued = read_queue()
-                    if not queued or queued[0].get("backtest_id") != backtest_id:
-                        continue
+                    # Re-verify queue presence (race condition check)
+                    current_queue_ids = {x.get("backtest_id") for x in read_queue()}
+                    if backtest_id not in current_queue_ids:
+                        continue  # Removed by someone else
 
-                    current_reserved = INFLIGHT_MEMORY_GB.get(selection.base_url, 0.0)
-                    available = selection.metrics.memory_free_gb - current_reserved
-                    if available < required_memory_gb:
-                        break
+                    # Re-verify global resource (race condition check)
+                    current_global_reserved = INFLIGHT_MEMORY_GB.get(selection.base_url, 0.0)
+                    real_available = selection.metrics.memory_free_gb - current_global_reserved
 
-                    item = dequeue_backtest()
-                    if not item:
-                        continue
+                    if real_available >= required_memory_gb:
+                        # Success! Reserve and dequeue
+                        reserve_inflight(selection.base_url, required_memory_gb)
+                        remove_from_queue_batch([backtest_id])
+                        should_run = True
 
-                    reserve_inflight(selection.base_url, required_memory_gb)
+                        # Update local state for next task in this loop
+                        local_reserved[selection.base_url] = local_reserved.get(selection.base_url, 0.0) + required_memory_gb
+                        local_counts[selection.base_url] = local_counts.get(selection.base_url, 0) + 1
 
+                if not should_run:
+                    continue
+
+                # Submit task
                 try:
                     run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes = await asyncio.to_thread(
                         load_run_assets, backtest_id
@@ -919,9 +1002,8 @@ async def queue_scheduler() -> None:
                         selection.base_url,
                     )
                     made_progress = True
-                    # Delay before dispatching next job to let CPU/RAM stabilize on target node.
-                    # Without this delay, concurrent submissions would hit the node before
-                    # metrics update, bypassing the 80% CPU threshold check.
+
+                    # Delay before dispatching next job to let CPU/RAM stabilize
                     if QUEUE_DISPATCH_DELAY_SECONDS > 0:
                         logger.info(
                             "queue_scheduler_dispatch_delay backtest_id=%s delay_seconds=%.1f",
@@ -929,20 +1011,20 @@ async def queue_scheduler() -> None:
                             QUEUE_DISPATCH_DELAY_SECONDS,
                         )
                         await asyncio.sleep(QUEUE_DISPATCH_DELAY_SECONDS)
+
                 except Exception as exc:
-                    # Put back to queue head to retry later.
-                    if item:
-                        async with QUEUE_STATE_LOCK:
-                            items = read_queue()
-                            items.insert(0, item)
-                            write_queue(items)
+                    # If submission fails, put back in queue
+                    async with QUEUE_STATE_LOCK:
+                        enqueue_backtest(backtest_id, queued_at=item.get("queued_at"))
+                        release_inflight(selection.base_url, required_memory_gb)
+
                     update_mapping(
                         backtest_id,
                         {"status": "queued", "last_error": str(exc), "last_error_at": utc_now()},
                     )
                     logger.warning("queue_scheduler_submit_failed backtest_id=%s error=%s", backtest_id, exc)
-                    break
-                finally:
+                else:
+                    # On success, release inflight reservation
                     async with QUEUE_STATE_LOCK:
                         release_inflight(selection.base_url, required_memory_gb)
 

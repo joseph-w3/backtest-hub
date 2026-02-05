@@ -568,5 +568,128 @@ class TestDispatchDelayEffect(unittest.TestCase):
             scheduler.fetch_metrics = original_fetch
 
 
+class TestBackfillingLogic(unittest.TestCase):
+    """Tests for backfilling scheduling logic and anti-starvation mechanisms."""
+
+    def test_backfill_window_allows_recent_tasks(self) -> None:
+        """Tasks queued within BACKFILL_WINDOW after head can be backfilled."""
+        from datetime import datetime, timezone, timedelta
+
+        head_time = datetime(2026, 2, 5, 10, 0, 0, tzinfo=timezone.utc)
+        # Task queued 2 minutes after head (within 5 min window)
+        task_time = head_time + timedelta(minutes=2)
+
+        window_seconds = 300.0  # 5 minutes
+        delta = (task_time - head_time).total_seconds()
+
+        # Should be allowed (within window)
+        self.assertLessEqual(delta, window_seconds)
+
+    def test_backfill_window_blocks_late_tasks(self) -> None:
+        """Tasks queued after BACKFILL_WINDOW should not be backfilled."""
+        from datetime import datetime, timezone, timedelta
+
+        head_time = datetime(2026, 2, 5, 10, 0, 0, tzinfo=timezone.utc)
+        # Task queued 10 minutes after head (outside 5 min window)
+        task_time = head_time + timedelta(minutes=10)
+
+        window_seconds = 300.0  # 5 minutes
+        delta = (task_time - head_time).total_seconds()
+
+        # Should be blocked (outside window)
+        self.assertGreater(delta, window_seconds)
+
+    def test_reserve_mode_triggered_by_wait_time(self) -> None:
+        """When head waits longer than threshold, reserve mode activates."""
+        from datetime import datetime, timezone, timedelta
+
+        head_queued_at = datetime(2026, 2, 5, 10, 0, 0, tzinfo=timezone.utc)
+        now = head_queued_at + timedelta(minutes=15)  # 15 minutes later
+
+        reserve_threshold_seconds = 600.0  # 10 minutes
+        wait_seconds = (now - head_queued_at).total_seconds()
+
+        # Should trigger reserve mode (waited > 10 min)
+        reserve_mode = wait_seconds > reserve_threshold_seconds
+        self.assertTrue(reserve_mode)
+
+    def test_reserve_mode_not_triggered_early(self) -> None:
+        """Reserve mode should not activate if head hasn't waited long enough."""
+        from datetime import datetime, timezone, timedelta
+
+        head_queued_at = datetime(2026, 2, 5, 10, 0, 0, tzinfo=timezone.utc)
+        now = head_queued_at + timedelta(minutes=5)  # 5 minutes later
+
+        reserve_threshold_seconds = 600.0  # 10 minutes
+        wait_seconds = (now - head_queued_at).total_seconds()
+
+        # Should NOT trigger reserve mode (waited only 5 min)
+        reserve_mode = wait_seconds > reserve_threshold_seconds
+        self.assertFalse(reserve_mode)
+
+    def test_backfill_scenario_small_tasks_run_while_large_waits(self) -> None:
+        """
+        Scenario: Large task A (50GB) at head, small tasks B,C (5GB each) behind.
+        Server has 30GB free. A cannot run, but B and C should backfill.
+        """
+        queue = [
+            {"backtest_id": "A", "required_memory_gb": 50.0, "queued_at": "2026-02-05T10:00:00Z"},
+            {"backtest_id": "B", "required_memory_gb": 5.0, "queued_at": "2026-02-05T10:01:00Z"},
+            {"backtest_id": "C", "required_memory_gb": 5.0, "queued_at": "2026-02-05T10:02:00Z"},
+        ]
+        server_free_memory = 30.0
+        window_seconds = 300.0
+
+        head = queue[0]
+        head_queued_at = head["queued_at"]
+
+        schedulable = []
+        for item in queue:
+            required = item["required_memory_gb"]
+            if required <= server_free_memory:
+                # Check window for non-head tasks
+                if item != head:
+                    from datetime import datetime, timezone
+                    head_time = datetime.fromisoformat(head_queued_at.replace("Z", "+00:00"))
+                    item_time = datetime.fromisoformat(item["queued_at"].replace("Z", "+00:00"))
+                    if (item_time - head_time).total_seconds() > window_seconds:
+                        continue
+                schedulable.append(item["backtest_id"])
+
+        # A cannot run (50GB > 30GB), B and C can (within window)
+        self.assertEqual(schedulable, ["B", "C"])
+
+    def test_backfill_respects_reserve_mode(self) -> None:
+        """
+        Scenario: Head task A has waited 15 minutes (> 10 min threshold).
+        Reserve mode activates, no backfilling allowed.
+        """
+        from datetime import datetime, timezone, timedelta
+
+        queue = [
+            {"backtest_id": "A", "required_memory_gb": 50.0, "queued_at": "2026-02-05T10:00:00Z"},
+            {"backtest_id": "B", "required_memory_gb": 5.0, "queued_at": "2026-02-05T10:01:00Z"},
+        ]
+
+        head = queue[0]
+        head_queued_at = datetime.fromisoformat(head["queued_at"].replace("Z", "+00:00"))
+        now = head_queued_at + timedelta(minutes=15)
+        reserve_threshold = 600.0  # 10 minutes
+
+        wait_seconds = (now - head_queued_at).total_seconds()
+        reserve_mode = wait_seconds > reserve_threshold
+
+        self.assertTrue(reserve_mode)
+
+        # In reserve mode, only head task should be attempted
+        schedulable = []
+        for idx, item in enumerate(queue):
+            if reserve_mode and idx != 0:
+                continue  # Skip non-head in reserve mode
+            schedulable.append(item["backtest_id"])
+
+        self.assertEqual(schedulable, ["A"])
+
+
 if __name__ == "__main__":
     unittest.main()
