@@ -227,7 +227,7 @@ REQUIRED_FIELDS = {
     "seed",
     "tags",
 }
-OPTIONAL_FIELDS = {"latency_config"}
+OPTIONAL_FIELDS = {"latency_config", "starting_balance_usdt"}
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 
@@ -344,11 +344,18 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
     parse_decimal_field("futures_maker_fee", payload["futures_maker_fee"])
     parse_decimal_field("futures_taker_fee", payload["futures_taker_fee"])
 
+    if "starting_balance_usdt" in payload:
+        raw_balance = payload["starting_balance_usdt"]
+        if not isinstance(raw_balance, (int, float)) or raw_balance <= 0:
+            raise ValueError("starting_balance_usdt must be a positive number")
+
     sanitized: dict[str, Any] = {}
     for field in REQUIRED_FIELDS:
         sanitized[field] = payload[field]
     if "latency_config" in payload:
         sanitized["latency_config"] = payload["latency_config"]
+    if "starting_balance_usdt" in payload:
+        sanitized["starting_balance_usdt"] = payload["starting_balance_usdt"]
     return sanitized
 
 
