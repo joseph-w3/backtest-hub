@@ -1,6 +1,6 @@
 # 工程架构梳理
 
-- 当前梳理时间: 2026-02-05 04:50:00
+- 当前梳理时间: 2026-02-05 12:00:00
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流；并在 hub 侧提供并发队列限制（避免 backtest docker 被无限提交打爆）。
@@ -200,6 +200,7 @@
     `BACKTEST_METRICS_TIMEOUT_SECONDS`, `DATA_MOUNT_PATH`, `RUN_STORAGE_PATH`, `RUN_MAPPING_PATH`, `REPORT_CACHE_PATH`, `QUEUE_PATH`,
     `BACKTEST_RUNNER_PATH`, `MAX_SYMBOLS`, `MAX_RANGE_DAYS`, `MAX_RUNNING_BACKTESTS`, `MAX_REPORT_PAGE_SIZE`,
     `QUEUE_POLL_INTERVAL_SECONDS`, `QUEUE_DISPATCH_DELAY_SECONDS`, `BACKFILL_WINDOW_SECONDS`, `BACKFILL_RESERVE_THRESHOLD_SECONDS`。
+  - CORS: `CORS_ALLOW_ORIGINS`（默认 `*`）、`CORS_ALLOW_METHODS`（默认 `*`）、`CORS_ALLOW_HEADERS`（默认 `*`）、`CORS_ALLOW_CREDENTIALS`（默认 `false`）、`CORS_ALLOW_ORIGIN_REGEX`、`CORS_MAX_AGE`（默认 600s）。
   - 固定路径: 日志下载 `/v1/runs/backtest/{backtest_id}/logs/download`，CSV `/v1/runs/backtest/{backtest_id}/download_csv`，数据包 `/v1/runs/backtest/{backtest_id}/download_data`，kill `/v1/runs/backtest/{backtest_id}/kill`。
   - 文档: report_service 独立 Swagger `/report-service/docs`（OpenAPI `/report-service/openapi.json`）；主 Swagger `/docs` 不包含 report_service 路由。
   - CLI: `BACKTEST_HUB_BASE_URL`（默认 `http://100.87.155.67:10033`）。
@@ -225,6 +226,11 @@
 - 观测与日志: `app.py` 统一记录请求日志；`scripts/run_backtest.py` 写入 `status.json`（包含状态/错误/traceback）。
 
 ## 改动概要/变更记录
+
+### 2026-02-05 12:00:00
+- 本次新增/更新要点: 新增 CORS 支持；默认允许所有来源/方法/头（不启用凭证），可通过环境变量收敛；补充 CORS 配置说明。
+- 变更动机/需求来源: 用户要求支持跨域访问。
+- 当前更新时间: 2026-02-05 12:00:00
 
 ### 2026-02-05 04:50:00
 - 本次新增/更新要点: **修复快速提交绕过队列问题**：所有请求统一入队（`submit_with_queue_control` 总是返回 `queued`），由 `queue_scheduler` 统一调度；修复 `queue_scheduler` 的 double-check 使用 `local_reserved` 而非 `INFLIGHT_MEMORY_GB`（后者在成功提交后会被释放）；新增 7 个测试覆盖队列调度、30s 延时、失败回队、青铜分组、INFLIGHT 资源追踪等场景（总计 70 tests）。
