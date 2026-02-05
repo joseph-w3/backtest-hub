@@ -14,6 +14,7 @@
   "spot_taker_fee": 0.001,
   "futures_maker_fee": 0.001,
   "futures_taker_fee": 0.001,
+  "starting_balance_usdt": 100000,
   "latency_config": {
     "base_latency_nanos": 20000000,
     "insert_latency_nanos": 2000000,
