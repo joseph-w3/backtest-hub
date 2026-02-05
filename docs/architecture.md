@@ -57,10 +57,9 @@
   1) 校验 run_spec（字段/费用/时间范围/`latency_config`）。
   2) 生成 `backtest_id`，写入 `/opt/backtest/runs/{backtest_id}`。
   3) 保存策略文件与更新后的 `run_spec.json`（写入 backtest_id 与实际文件名）。
-  4) 拉取各 backtest docker 的 system metrics（`BACKTEST_METRICS_PATH`），按 symbols 数量估算所需内存（1 symbol ≈ 1GB），选择可用内存满足且运行数未超限的 docker；若队列非空则直接入队（不绕过 FIFO），内存不足也入队。
-  5) 若立即提交：读取 runner 脚本，与 run_spec/策略一并转发至 backtest docker（multipart 字段: `runer`/`strategies`/`configs`），并记录 `backtest_docker_run_id`。
-  6) 保存 mapping（包含 `status`、`queued_at`/`submitted_at`/`cancelled_at`、`created_at` 等）与队列文件（如排队）。
-  7) 返回 `backtest_id`，并返回 `status`（`submitted` 或 `queued`）；当 `queued` 时 `backtest_docker_run_id` 为空。
+  4) **所有请求统一入队**（`submit_with_queue_control` 总是返回 `queued`），由后台 `queue_scheduler` 统一调度。
+  5) 保存 mapping（包含 `status`、`queued_at`/`submitted_at`/`cancelled_at`、`created_at` 等）与队列文件。
+  6) 返回 `backtest_id` 与 `status=queued`；`backtest_docker_run_id` 为空（由 scheduler 提交后填充）。
 - 查询链路:
   - `GET /runs/{backtest_id}` 读取映射并返回。
   - `GET /runs/backtest/{backtest_id}` 根据映射中的 `backtest_api_base` 透传目标 backtest docker 状态（status/pid/started_at）。
@@ -74,20 +73,124 @@
 - 队列管理链路:
   - `GET /queue` 查询当前 hub 队列（支持分页与查询 position）。
   - `DELETE /queue` 批量删除队列中的任务（仅影响 queued 任务，删除后标记为 cancelled）。
-- 队列调度链路:
-  - hub 启动后后台调度器周期性拉取各 backtest docker 的 system metrics，采用 **Backfilling** 策略调度：若队首大任务无法调度（内存不足），则尝试调度后续小任务，提高资源利用率。
-  - **防饥饿机制 A（时间窗口）**：只 backfill 在队首任务入队后 `BACKFILL_WINDOW_SECONDS`（默认 5 分钟）内入队的任务，防止后续新任务无限跳过老任务。
-  - **防饥饿机制 B（资源预留）**：当队首任务等待时间超过 `BACKFILL_RESERVE_THRESHOLD_SECONDS`（默认 10 分钟）后，进入资源预留模式，停止所有 backfill，只等待队首任务资源就绪。
-  - 每次成功提交后等待 `QUEUE_DISPATCH_DELAY_SECONDS`（默认 30s），让目标节点 CPU/RAM 有时间反映新负载，避免并发提交绕过 80% CPU 阈值检查。
+
+### queue_scheduler 调度流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    queue_scheduler 主循环                        │
+│                      while True:                                │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 读取队列快照 + local_reserved/local_counts                    │
+│    queued = read_queue()                                        │
+│    local_reserved = dict(INFLIGHT_MEMORY_GB)                    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                    队列为空？ ─── 是 ──→ sleep(5s) → 继续循环
+                              │
+                              否
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. 检查队首等待时间 → 决定是否进入"预留模式"                      │
+│    head_wait_seconds > 600s → reserve_mode = True               │
+│    （预留模式：只调度队首，不 backfill）                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. 遍历队列中的每个任务（Backfilling）                           │
+│    for idx, item in enumerate(queued):                          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┴─────────────────────┐
+        │                                           │
+        ▼                                           ▼
+┌───────────────────────┐                 ┌───────────────────────┐
+│ 防饥饿检查 A:          │                 │ 防饥饿检查 B:          │
+│ 预留模式 + 非队首      │                 │ 任务入队时间超出窗口   │
+│ → skip                │                 │ (> 5分钟) → skip      │
+└───────────────────────┘                 └───────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. 读取 run_spec，估算内存需求                                   │
+│    required_memory_gb = len(symbols)  # 1 symbol ≈ 1GB          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. 选择目标 docker (pick_backtest_target)                        │
+│    - 获取最新 metrics（docker 容器级别的 CPU/RAM）               │
+│    - CPU < 80% 门槛                                             │
+│    - 可用内存 = metrics.free_gb - local_reserved                │
+│    - symbols < 6 → 优先青铜分组                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+               selection == None? ─── 是 ──→ 跳过这个任务，尝试下一个
+                              │
+                              否
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 6. Double-check（获取锁后再次验证）                              │
+│    - 任务还在队列中？                                            │
+│    - real_available = metrics.free_gb - local_reserved          │
+│    - 资源足够？ → 预留 + 出队                                    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 7. 提交任务到 backtest docker                                    │
+│    submit_to_backtest(selection.base_url, ...)                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+               成功？ ────────┼──────────
+                  │           │         │
+                  ▼           │         ▼
+        ┌─────────────┐       │  ┌─────────────────┐
+        │ 更新 mapping │       │  │ 失败：放回队列   │
+        │ status=submitted    │  │ 记录 last_error │
+        └─────────────┘       │  └─────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 8. 等待 30 秒让 metrics 更新                                     │
+│    await asyncio.sleep(QUEUE_DISPATCH_DELAY_SECONDS)            │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    继续处理下一个任务...
+                              │
+                    本轮结束后 ───────────────────────┐
+                              │                      │
+                    有进展？ ──── 否 ──→ sleep(5s)   │
+                              │                      │
+                              是                     │
+                              └──────────────────────┘
+```
+
+- 关键配置:
+  - `QUEUE_POLL_INTERVAL_SECONDS` = 5s（轮询间隔）
+  - `QUEUE_DISPATCH_DELAY_SECONDS` = 30s（提交后延时，让 metrics 更新）
+  - `BACKFILL_WINDOW_SECONDS` = 300s（5 分钟 backfill 窗口）
+  - `BACKFILL_RESERVE_THRESHOLD_SECONDS` = 600s（10 分钟触发预留模式）
+
 - 日志流链路:
   - 客户端连接 `/runs/backtest/{backtest_id}/logs/stream`，服务端按映射中的 `backtest_api_base` 建立到目标 backtest docker 的 WebSocket 连接并双向转发消息。
   - `backtest-hub-cli submit --follow-logs`（或 `scripts/submit_run.py --follow-logs`）通过 WebSocket 拉取日志并落盘到 `./live_logs/{backtest_id}.log`。
 - 控制/调度流程:
-  - 调度要求 CPU < 80%；按内存优先：每个 symbol 估算 1GB，依据 metrics 计算可用内存（`total - used - inflight`）决定是否可提交；满足内存后再检查 running 上限（按 docker 维度）。
+  - 调度要求 CPU < 80%；按内存优先：每个 symbol 估算 1GB，依据 metrics 计算可用内存（`free_gb - local_reserved`）决定是否可提交；满足内存后再检查 running 上限（按 docker 维度）。
   - 若 symbols 数量 < 6 且青铜分组 docker 的 CPU < 80% 且可用内存大于估算内存（1 symbol ≈ 1GB），则优先调度到青铜分组。
-  - 队列非空时新提交直接排队，避免绕过 FIFO；提交前预留 inflight 内存/计数，避免并发超发。
+  - **所有请求统一入队**，由 `queue_scheduler` 统一调度，确保 30s 延时保护。
   - 队列与 inflight 通过 `asyncio.Lock` 保护；mapping 文件通过 `threading.Lock` 保护读写。
   - 异常以 HTTP 4xx/5xx 返回并记录日志；backtest docker 请求失败统一返回 502；调度提交失败会回队并记录 `last_error`。
+- Metrics 说明:
+  - metrics 来自 backtest docker 容器内部的 cgroup 数据（`/sys/fs/cgroup/`），反映的是 **docker 容器** 的资源使用，而非整个服务器。
+  - `memory_total_gb` = docker 容器的内存限制
+  - `memory_used_gb` = docker 容器当前使用的内存
+  - `cpu_percent` = docker 容器的 CPU 使用率（归一化到核心数，0-100%）
 
 ### 关键配置
 - 配置文件: `docker-compose.yml`, `run_spec.json`, `pyproject.toml`。
