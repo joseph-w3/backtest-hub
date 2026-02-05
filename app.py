@@ -17,6 +17,7 @@ from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 from fastapi import Body, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, Response
@@ -122,6 +123,18 @@ def env_or_default(name: str, default: str) -> str:
     return value if value else default
 
 
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_csv(value: str) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_MOUNT_PATH = Path(env_or_default("DATA_MOUNT_PATH", "/opt/backtest"))
 RUN_STORAGE_PATH = Path(env_or_default("RUN_STORAGE_PATH", str(DATA_MOUNT_PATH / "runs")))
@@ -168,6 +181,23 @@ MAX_REPORT_PAGE_SIZE = int(os.getenv("MAX_REPORT_PAGE_SIZE", "50"))
 
 BRONZE_SYMBOLS_THRESHOLD = 6
 CPU_PERCENT_LT = 80.0
+
+CORS_ALLOW_ORIGINS = parse_csv(env_or_default("CORS_ALLOW_ORIGINS", "*"))
+CORS_ALLOW_METHODS = parse_csv(env_or_default("CORS_ALLOW_METHODS", "*"))
+CORS_ALLOW_HEADERS = parse_csv(env_or_default("CORS_ALLOW_HEADERS", "*"))
+CORS_ALLOW_CREDENTIALS = parse_bool(os.getenv("CORS_ALLOW_CREDENTIALS"), False)
+CORS_ALLOW_ORIGIN_REGEX = os.getenv("CORS_ALLOW_ORIGIN_REGEX") or None
+CORS_MAX_AGE = int(os.getenv("CORS_MAX_AGE", "600"))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_methods=CORS_ALLOW_METHODS,
+    allow_headers=CORS_ALLOW_HEADERS,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
+    allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,
+    max_age=CORS_MAX_AGE,
+)
 
 DEFAULT_LATENCY_CONFIG: dict[str, int] = {
     "base_latency_nanos": 20_000_000,
@@ -1111,7 +1141,9 @@ async def get_queue(
 
 
 @app.delete("/queue")
-async def delete_queue(payload: dict[str, Any] = Body(...)) -> JSONResponse:
+async def delete_queue(
+    payload: dict[str, Any] = Body(..., example={"backtest_ids": ["bt_123", "bt_456"]})
+) -> JSONResponse:
     backtest_ids = payload.get("backtest_ids")
     if not isinstance(backtest_ids, list) or not all(isinstance(x, str) and x for x in backtest_ids):
         raise HTTPException(status_code=400, detail="backtest_ids must be a non-empty list of strings")
