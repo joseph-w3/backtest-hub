@@ -1,7 +1,6 @@
 {
   "schema_version": "1.0",
   "requested_by": "researcher_001",
-  "strategy_file": "spot_futures_arb_diagnostics.py",
   "strategy_entry": "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnostics",
   "strategy_config_path": "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnosticsConfig",
   "strategy_config": {
@@ -38,5 +37,6 @@
   "seed": 12345,
   "tags": {
     "purpose": "example"
-  }
+  },
+  "strategy_bundle": "strategies.zip"
 }
