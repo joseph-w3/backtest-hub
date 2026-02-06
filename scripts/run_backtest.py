@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.util
 import json
 import os
 import random
 import secrets
+import shutil
 import sys
 import traceback
+import zipfile
 from datetime import datetime
 from datetime import timezone
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from quant_trade_v1.backtest.config import BacktestDataConfig
 from quant_trade_v1.backtest.config import BacktestEngineConfig
@@ -50,6 +53,7 @@ DEFAULT_MIN_NOTIONAL = 10.0
 DEFAULT_MARGIN_INIT = Decimal("0.05")
 DEFAULT_MARGIN_MAINT = Decimal("0.025")
 DEFAULT_BOOK_TYPE = "L2_MBP"
+DEFAULT_STARTING_BALANCES = ["100000 USDT"]
 
 DEFAULT_LATENCY_CONFIG: dict[str, int] = {
     "base_latency_nanos": 20_000_000,
@@ -66,7 +70,6 @@ REQUIRED_FIELDS = {
     "backtest_id",
     "schema_version",
     "requested_by",
-    "strategy_file",
     "strategy_entry",
     "strategy_config_path",
     "strategy_config",
@@ -86,6 +89,10 @@ REQUIRED_FIELDS = {
 
 OPTIONAL_FIELDS = {
     "latency_config",
+    "starting_balances_spot",
+    "starting_balances_futures",
+    "strategy_file",
+    "strategy_bundle",
 }
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
@@ -107,7 +114,7 @@ def _load_run_spec(path: Path) -> dict:
     return data
 
 
-def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> Path:
+def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> tuple[Path | None, Path | None]:
     missing = REQUIRED_FIELDS - set(run_spec.keys())
     extra = set(run_spec.keys()) - ALLOWED_FIELDS
     if missing:
@@ -128,6 +135,10 @@ def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> Path:
 
     if "latency_config" in run_spec:
         _parse_latency_config(run_spec["latency_config"])
+    if "starting_balances_spot" in run_spec:
+        _parse_starting_balances("starting_balances_spot", run_spec["starting_balances_spot"])
+    if "starting_balances_futures" in run_spec:
+        _parse_starting_balances("starting_balances_futures", run_spec["starting_balances_futures"])
 
     for field in ("strategy_entry", "strategy_config_path"):
         value = run_spec[field]
@@ -137,15 +148,35 @@ def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> Path:
         if not class_name:
             raise ValueError(f"RunSpec {field} missing class name.")
 
-    if not isinstance(run_spec.get("strategy_file"), str) or not run_spec["strategy_file"].strip():
+    strategy_file = run_spec.get("strategy_file")
+    strategy_bundle = run_spec.get("strategy_bundle")
+    has_strategy_file = isinstance(strategy_file, str) and bool(strategy_file.strip())
+    has_strategy_bundle = isinstance(strategy_bundle, str) and bool(strategy_bundle.strip())
+    if has_strategy_file == has_strategy_bundle:
+        raise ValueError("RunSpec must set exactly one of strategy_file or strategy_bundle.")
+    if strategy_file is not None and not has_strategy_file:
         raise ValueError("RunSpec strategy_file must be a non-empty string.")
-    strategy_path = _resolve_strategy_file(run_spec_path, run_spec["strategy_file"])
+    if strategy_bundle is not None and not has_strategy_bundle:
+        raise ValueError("RunSpec strategy_bundle must be a non-empty string.")
+    strategy_path: Path | None = None
+    bundle_path: Path | None = None
+    if has_strategy_file:
+        strategy_path = _resolve_strategy_file(run_spec_path, str(strategy_file))
+    else:
+        bundle_path = _resolve_strategy_bundle(run_spec_path, str(strategy_bundle))
+
+    if has_strategy_bundle:
+        for field in ("strategy_entry", "strategy_config_path"):
+            value = run_spec[field]
+            module_part = value.split(":", 1)[0] if ":" in value else ""
+            if not module_part.strip():
+                raise ValueError(f"RunSpec {field} must include module path when using strategy_bundle.")
 
     if not isinstance(run_spec.get("backtest_id"), str) or not run_spec["backtest_id"].strip():
         raise ValueError("RunSpec backtest_id must be a non-empty string.")
 
     _validate_time_order(run_spec["start"], run_spec["end"])
-    return strategy_path
+    return strategy_path, bundle_path
 
 
 def _parse_decimal(field: str, value: object) -> Decimal:
@@ -181,6 +212,19 @@ def _parse_latency_config(value: object) -> dict[str, int]:
     return parsed
 
 
+def _parse_starting_balances(field: str, value: object | None) -> list[str]:
+    if value is None:
+        return list(DEFAULT_STARTING_BALANCES)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"RunSpec {field} must be a non-empty array of strings.")
+    parsed: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"RunSpec {field} must contain non-empty strings.")
+        parsed.append(item.strip())
+    return parsed
+
+
 def _validate_time_order(start: str | int, end: str | int) -> None:
     start_dt = _parse_time(start)
     end_dt = _parse_time(end)
@@ -211,6 +255,15 @@ def _resolve_strategy_file(run_spec_path: Path, strategy_file: str) -> Path:
     return candidate
 
 
+def _resolve_strategy_bundle(run_spec_path: Path, strategy_bundle: str) -> Path:
+    candidate = Path(strategy_bundle)
+    if not candidate.is_absolute():
+        candidate = run_spec_path.parent / candidate
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Strategy bundle not found: {candidate}")
+    return candidate
+
+
 def _load_strategy_module(strategy_path: Path) -> str:
     module_name = f"strategy_{strategy_path.stem}_{secrets.token_hex(4)}"
     spec = importlib.util.spec_from_file_location(module_name, strategy_path)
@@ -220,6 +273,66 @@ def _load_strategy_module(strategy_path: Path) -> str:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module_name
+
+
+def _validate_strategy_bundle_zip(bundle_path: Path) -> str:
+    with zipfile.ZipFile(bundle_path) as zf:
+        top_dirs: set[str] = set()
+        has_file = False
+        for info in zf.infolist():
+            name = info.filename
+            if not name:
+                continue
+            path = PurePosixPath(name)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(f"Strategy bundle contains unsafe path: {name}")
+            if name.endswith("/"):
+                if path.parts:
+                    top_dirs.add(path.parts[0])
+                continue
+            parts = path.parts
+            if len(parts) < 2:
+                raise ValueError("Strategy bundle must contain a single top-level directory.")
+            top_dirs.add(parts[0])
+            has_file = True
+        if not has_file:
+            raise ValueError("Strategy bundle is empty.")
+        if len(top_dirs) != 1:
+            raise ValueError(f"Strategy bundle must contain exactly one top-level directory: {sorted(top_dirs)}")
+        return next(iter(top_dirs))
+
+
+def _extract_strategy_bundle(bundle_path: Path, extract_root: Path) -> Path:
+    top_dir = _validate_strategy_bundle_zip(bundle_path)
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+    extract_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(bundle_path) as zf:
+        for info in zf.infolist():
+            name = info.filename
+            if not name or name.endswith("/"):
+                continue
+            rel_path = PurePosixPath(name)
+            if rel_path.is_absolute() or ".." in rel_path.parts:
+                raise ValueError(f"Strategy bundle contains unsafe path: {name}")
+            target = extract_root / rel_path.as_posix()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+    return extract_root / top_dir
+
+
+def _prepare_bundle_import(bundle_root: Path) -> None:
+    bundle_parent = bundle_root.parent.as_posix()
+    if bundle_parent not in sys.path:
+        sys.path.insert(0, bundle_parent)
+
+
+def _ensure_strategy_importable(import_path: str) -> None:
+    module_name = import_path.split(":", 1)[0] if ":" in import_path else ""
+    if not module_name:
+        raise ValueError(f"Invalid import path: {import_path}")
+    importlib.import_module(module_name)
 
 
 def _rewrite_import_path(value: str, module_name: str) -> str:
@@ -677,7 +790,7 @@ def main() -> int:
     args = _parse_args()
     run_spec_path = Path(args.run_spec).expanduser()
     run_spec = _load_run_spec(run_spec_path)
-    strategy_file_path = _validate_run_spec(run_spec, run_spec_path)
+    strategy_file_path, bundle_path = _validate_run_spec(run_spec, run_spec_path)
 
     backtest_id = run_spec["backtest_id"]
     log_root = REPORTS_OUTPUT_ROOT
@@ -692,9 +805,18 @@ def main() -> int:
 
     try:
         random.seed(run_spec["seed"])
-        module_name = _load_strategy_module(strategy_file_path)
-        strategy_entry = _rewrite_import_path(run_spec["strategy_entry"], module_name)
-        strategy_config_path = _rewrite_import_path(run_spec["strategy_config_path"], module_name)
+        if bundle_path is not None:
+            bundle_root = _extract_strategy_bundle(bundle_path, run_spec_path.parent / "strategy_bundle")
+            _prepare_bundle_import(bundle_root)
+            _ensure_strategy_importable(run_spec["strategy_entry"])
+            _ensure_strategy_importable(run_spec["strategy_config_path"])
+            strategy_entry = run_spec["strategy_entry"]
+            strategy_config_path = run_spec["strategy_config_path"]
+        else:
+            assert strategy_file_path is not None
+            module_name = _load_strategy_module(strategy_file_path)
+            strategy_entry = _rewrite_import_path(run_spec["strategy_entry"], module_name)
+            strategy_config_path = _rewrite_import_path(run_spec["strategy_config_path"], module_name)
 
         spot_symbols, futures_symbols = _parse_symbols(run_spec["symbols"])
         margin_init = _parse_decimal("margin_init", run_spec["margin_init"])
@@ -803,6 +925,13 @@ def main() -> int:
             config=_parse_latency_config(run_spec.get("latency_config")),
         )
 
+        starting_balances_spot = _parse_starting_balances(
+            "starting_balances_spot", run_spec.get("starting_balances_spot")
+        )
+        starting_balances_futures = _parse_starting_balances(
+            "starting_balances_futures", run_spec.get("starting_balances_futures")
+        )
+
         strategy_config = dict(run_spec["strategy_config"])
         book_type = DEFAULT_BOOK_TYPE
         venues_configs: list[BacktestVenueConfig] = []
@@ -813,7 +942,7 @@ def main() -> int:
                     oms_type="NETTING",
                     account_type="CASH",
                     base_currency=None,
-                    starting_balances=["100000 USDT"],
+                    starting_balances=starting_balances_spot,
                     book_type=book_type,
                     latency_model=latency_model_config,
                 )
@@ -825,7 +954,7 @@ def main() -> int:
                     oms_type="NETTING",
                     account_type="MARGIN",
                     base_currency=None,
-                    starting_balances=["100000 USDT"],
+                    starting_balances=starting_balances_futures,
                     book_type=book_type,
                     margin_model=MarginModelConfig(model_type="leveraged"),
                     latency_model=latency_model_config,

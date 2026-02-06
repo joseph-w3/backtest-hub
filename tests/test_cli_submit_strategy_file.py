@@ -33,6 +33,7 @@ class TestSubmitStrategyFileResolution(unittest.TestCase):
         run_spec: str,
         name: str = "test",
         strategy_file: str | None = None,
+        strategy_bundle: str | None = None,
         no_generate: bool = True,
         follow_logs: bool = False,
     ) -> Namespace:
@@ -40,6 +41,7 @@ class TestSubmitStrategyFileResolution(unittest.TestCase):
             run_spec=run_spec,
             name=name,
             strategy_file=strategy_file,
+            strategy_bundle=strategy_bundle,
             no_generate=no_generate,
             follow_logs=follow_logs,
         )
@@ -188,6 +190,6 @@ class TestSubmitStrategyFileResolution(unittest.TestCase):
 
                 self.assertEqual(rc, 1)
                 self.assertEqual(mock_urlopen.call_count, 0)
-                self.assertIn("strategy file not specified", err.getvalue())
+                self.assertIn("strategy file/bundle not specified", err.getvalue())
             finally:
                 os.chdir(cwd)
