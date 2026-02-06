@@ -86,7 +86,6 @@ REQUIRED_FIELDS = {
 
 OPTIONAL_FIELDS = {
     "latency_config",
-    "starting_balance_usdt",
 }
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
@@ -806,8 +805,6 @@ def main() -> int:
 
         strategy_config = dict(run_spec["strategy_config"])
         book_type = DEFAULT_BOOK_TYPE
-        starting_balance_usdt = run_spec.get("starting_balance_usdt", 100000)
-        starting_balances = [f"{starting_balance_usdt} USDT"]
         venues_configs: list[BacktestVenueConfig] = []
         if spot_instruments:
             venues_configs.append(
@@ -816,7 +813,7 @@ def main() -> int:
                     oms_type="NETTING",
                     account_type="CASH",
                     base_currency=None,
-                    starting_balances=starting_balances,
+                    starting_balances=["100000 USDT"],
                     book_type=book_type,
                     latency_model=latency_model_config,
                 )
@@ -828,7 +825,7 @@ def main() -> int:
                     oms_type="NETTING",
                     account_type="MARGIN",
                     base_currency=None,
-                    starting_balances=starting_balances,
+                    starting_balances=["100000 USDT"],
                     book_type=book_type,
                     margin_model=MarginModelConfig(model_type="leveraged"),
                     latency_model=latency_model_config,
