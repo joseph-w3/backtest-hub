@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from services.report_service import ReportCache, ReportCacheConfig, ReportService, ReportServiceConfig
 
@@ -29,6 +30,7 @@ class TestReportCache(unittest.TestCase):
                 ReportServiceConfig(
                     cache_path=db_path,
                     report_path="/v1/runs/backtest/{backtest_id}/report",
+                    report_batch_path="/v1/runs/backtest/reports/batch",
                     data_download_path="/v1/runs/backtest/{backtest_id}/download_data",
                     runs_path="/v1/runs",
                     max_page_size=50,
@@ -76,18 +78,21 @@ class TestReportCache(unittest.TestCase):
                 "2026-02-03T00:00:00Z",
             )
 
-            def fetcher(base_url: str, backtest_id: str):
-                if backtest_id == backtest_id_new:
-                    return {
-                        "report_available": True,
-                        "backtest_id": backtest_id_new,
-                        "requested_by": "alice",
-                    }
-                if backtest_id == backtest_id_old:
-                    raise AssertionError("cached report should avoid fetch")
-                return {"report_available": False}
+            def batch_fetcher(base_url: str, backtest_ids: list[str]) -> dict[str, dict[str, Any]]:
+                if base_url == "http://docker-b":
+                    raise AssertionError("cached report should avoid batch fetch")
+                if base_url == "http://docker-a":
+                    if backtest_id_new in backtest_ids:
+                        return {
+                            backtest_id_new: {
+                                "report_available": True,
+                                "backtest_id": backtest_id_new,
+                                "requested_by": "alice",
+                            }
+                        }
+                return {}
 
-            service.fetch_report = fetcher  # type: ignore[method-assign]
+            service.fetch_reports_batch = batch_fetcher  # type: ignore[method-assign]
 
             items = service.get_report_page(
                 page=1,

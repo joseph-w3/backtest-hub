@@ -807,26 +807,17 @@ def main() -> int:
     try:
         random.seed(run_spec["seed"])
         if bundle_path is not None:
-            print(f"[DEBUG] strategy_bundle_raw={run_spec.get('strategy_bundle')}")
-            print(f"[DEBUG] strategy_bundle_path={bundle_path}")
             bundle_root = _extract_strategy_bundle(bundle_path, run_spec_path.parent / "strategy_bundle")
-            print(f"[DEBUG] strategy_bundle_root={bundle_root}")
             _prepare_bundle_import(bundle_root)
-            print(f"[DEBUG] strategy_bundle_sys_path={bundle_root.parent}")
             _ensure_strategy_importable(run_spec["strategy_entry"])
             _ensure_strategy_importable(run_spec["strategy_config_path"])
             strategy_entry = run_spec["strategy_entry"]
             strategy_config_path = run_spec["strategy_config_path"]
         else:
             assert strategy_file_path is not None
-            print(f"[DEBUG] strategy_file_raw={run_spec.get('strategy_file')}")
-            print(f"[DEBUG] strategy_file_path={strategy_file_path}")
             module_name = _load_strategy_module(strategy_file_path)
-            print(f"[DEBUG] strategy_module_name={module_name}")
             strategy_entry = _rewrite_import_path(run_spec["strategy_entry"], module_name)
             strategy_config_path = _rewrite_import_path(run_spec["strategy_config_path"], module_name)
-            print(f"[DEBUG] strategy_entry_rewritten={strategy_entry}")
-            print(f"[DEBUG] strategy_config_path_rewritten={strategy_config_path}")
 
         spot_symbols, futures_symbols = _parse_symbols(run_spec["symbols"])
         margin_init = _parse_decimal("margin_init", run_spec["margin_init"])
