@@ -70,3 +70,23 @@ class TestRunSpecLatencyConfig(unittest.TestCase):
         payload["latency_config"] = {"base_latency_nanos": -1}
         with self.assertRaises(ValueError):
             app.validate_run_spec(payload)
+
+    def test_strategy_bundle_ok(self) -> None:
+        payload = _base_payload()
+        payload.pop("strategy_file", None)
+        payload["strategy_bundle"] = "bundle.zip"
+        sanitized = app.validate_run_spec(payload)
+        self.assertIn("strategy_bundle", sanitized)
+        self.assertNotIn("strategy_file", sanitized)
+
+    def test_strategy_bundle_and_file_rejected(self) -> None:
+        payload = _base_payload()
+        payload["strategy_bundle"] = "bundle.zip"
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_strategy_missing_rejected(self) -> None:
+        payload = _base_payload()
+        payload.pop("strategy_file", None)
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)

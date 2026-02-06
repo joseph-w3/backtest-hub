@@ -4,7 +4,7 @@
 
 ## 项目概览
 - 项目定位: FastAPI 服务，作为 backtest-hub 的中转层，接收研究端回测请求并转发至 backtest docker，同时维护 backtest_id 映射、状态查询、日志下载与日志流；并在 hub 侧提供并发队列限制（避免 backtest docker 被无限提交打爆）。
-- 主要能力: 接收 multipart 上传 run_spec.json 与策略文件；校验回测参数；落盘保存运行资料；**所有请求统一入队**，由 queue_scheduler 按 system metrics + symbols 估算内存进行调度与排队；调用 backtest docker 提交任务；查询 backtest_id 映射、状态、日志下载与 WebSocket 日志流；提供队列查询与队列任务删除接口。
+- 主要能力: 接收 multipart 上传 run_spec.json 与策略文件/策略包（zip）；校验回测参数；落盘保存运行资料；**所有请求统一入队**，由 queue_scheduler 按 system metrics + symbols 估算内存进行调度与排队；调用 backtest docker 提交任务；查询 backtest_id 映射、状态、日志下载与 WebSocket 日志流；提供队列查询与队列任务删除接口。
 - 关键输出: backtest_id/backtest_docker_run_id（可能为空，表示 queued）；`/opt/backtest/runs` 下的运行目录；`run_mapping.json`；`submit_queue.json`；日志下载/日志流代理返回。
 - 参数说明: backtest-hub 的 `backtest_id` 会作为 backtest docker 的 `backtest_id` 字段；backtest docker 返回的 `run_id` 记录为 `backtest_docker_run_id`。
 
@@ -30,8 +30,8 @@
   - `run_spec.json`: 回测配置样例。
 - 关键职责:
   - `app.py`: 提供 `/health`、`POST /runs`、`GET /runs/{backtest_id}`、`GET /runs/backtest/reports`、`GET /runs/backtest/active`、`GET /runs/backtest/{backtest_id}`、`GET /runs/backtest/{backtest_id}/report`、`GET /runs/{backtest_id}/logs`、`GET /runs/backtest/{backtest_id}/download_csv`、`GET /runs/backtest/{backtest_id}/download_data`、`POST /runs/backtest/{backtest_id}/kill`、`/runs/backtest/{backtest_id}/logs/stream`、`GET /queue`、`DELETE /queue`；校验字段/时间范围/`latency_config`；生成 backtest_id；落盘保存；**所有请求统一入队**（`submit_with_queue_control` 总是返回 `queued`），由后台 `queue_scheduler` 统一调度；调度器按 system metrics + symbols 估算内存选择目标 backtest docker；成功提交后等待 `QUEUE_DISPATCH_DELAY_SECONDS`（默认 30s）让 metrics 更新；维护 mapping（包含 queued/submitted/cancelled 状态、时间戳与 `backtest_api_base`）；通过 WebSocket 代理日志流；回测报告透传与 SQLite 缓存（支持分页聚合与 requested_by 过滤）。
-  - `scripts/run_backtest.py`: 校验 run_spec；动态加载策略模块；构建 spot/futures instruments 与 backtest configs；执行 `BacktestNode`；写入 `status.json`（运行/成功/失败）。
-  - `backtest_hub_cli/cli.py`: `init` 复制模板脚本到 `./scripts/generate_run_spec.py`；`submit` 调用本地 `scripts/generate_run_spec.py` 生成 run_spec（若未 init 则提示），`--strategy-file` 可指定策略文件（否则回退 run_spec 或 `./strategies/<basename>`）；可选 `--follow-logs` WebSocket 写入 `./live_logs/{backtest_id}.log`；`status` 查询 backtest 状态；`logs` 下载日志；`download-csv` 下载回测 CSV ZIP；`kill` 停止回测；`help` 展示命令总览；并写入 `./backtest_run_id_history` 记录历史。
+  - `scripts/run_backtest.py`: 校验 run_spec；支持策略包解压并按模块路径导入；单文件策略仍动态加载；构建 spot/futures instruments 与 backtest configs；执行 `BacktestNode`；写入 `status.json`（运行/成功/失败）。
+  - `backtest_hub_cli/cli.py`: `init` 复制模板脚本到 `./scripts/generate_run_spec.py`；`submit` 调用本地 `scripts/generate_run_spec.py` 生成 run_spec（若未 init 则提示），`--strategy-file` 可指定策略文件（否则回退 run_spec 或 `./strategies/<basename>`），`--strategy-bundle` 支持 zip/目录打包（读取 `.strategyignore` 过滤）；可选 `--follow-logs` WebSocket 写入 `./live_logs/{backtest_id}.log`；`status` 查询 backtest 状态；`logs` 下载日志；`download-csv` 下载回测 CSV ZIP；`kill` 停止回测；`help` 展示命令总览；并写入 `./backtest_run_id_history` 记录历史。
   - `scripts/submit_run.py`: 仅负责转发 CLI 的 submit 命令。
   - `scripts/backtest_hub_sdk.py`: 兼容命令 `get-backtest-status`/`download-backtest-logs`，内部转发至 CLI 的 `status`/`logs`。
 - 主要依赖:
@@ -43,7 +43,7 @@
 - 外部依赖:
   - backtest docker API（`BACKTEST_API_BASES` + `BACKTEST_SUBMIT_PATH`/`BACKTEST_STATUS_PATH`/`BACKTEST_REPORT_PATH`/`BACKTEST_RUNS_PATH`）与日志下载固定路径 `/v1/runs/backtest/{backtest_id}/logs/download`、CSV `/v1/runs/backtest/{backtest_id}/download_csv`、数据包 `/v1/runs/backtest/{backtest_id}/download_data`、kill `/v1/runs/backtest/{backtest_id}/kill`；日志流 WebSocket（`BACKTEST_WS_LOGS_PATH`）。
   - backtest docker system metrics（`BACKTEST_METRICS_PATH`），用于 CPU/内存占用与调度决策。
-  - 本地/挂载存储（默认 `/opt/backtest`）用于保存 run_spec 与策略文件。
+  - 本地/挂载存储（默认 `/opt/backtest`）用于保存 run_spec 与策略文件/策略包。
   - backtest 执行环境需提供 `quant_trade_v1`、`CATALOG_PATH` 数据目录与日志目录（默认 `/opt/backtest_logs`）。
   - CLI 依赖 backtest-hub HTTP/WS 服务（`BACKTEST_HUB_BASE_URL`）。
 - 内部依赖:
@@ -52,11 +52,11 @@
   - `QUEUE_PATH` 用于保存 hub 侧提交队列（FIFO）。
 
 ### 数据流/控制流
-- 数据来源: 客户端 `POST /runs` 上传 `run_spec.json` 与策略文件（multipart/form-data）。
+- 数据来源: 客户端 `POST /runs` 上传 `run_spec.json` 与策略文件/策略包（multipart/form-data）。
 - 数据处理链路:
   1) 校验 run_spec（字段/费用/时间范围/`latency_config`）。
   2) 生成 `backtest_id`，写入 `/opt/backtest/runs/{backtest_id}`。
-  3) 保存策略文件与更新后的 `run_spec.json`（写入 backtest_id 与实际文件名）。
+  3) 保存策略文件/策略包与更新后的 `run_spec.json`（写入 backtest_id 与实际文件名）。
   4) **所有请求统一入队**（`submit_with_queue_control` 总是返回 `queued`），由后台 `queue_scheduler` 统一调度。
   5) 保存 mapping（包含 `status`、`queued_at`/`submitted_at`/`cancelled_at`、`created_at` 等）与队列文件。
   6) 返回 `backtest_id` 与 `status=queued`；`backtest_docker_run_id` 为空（由 scheduler 提交后填充）。
@@ -73,6 +73,64 @@
 - 队列管理链路:
   - `GET /queue` 查询当前 hub 队列（支持分页与查询 position）。
   - `DELETE /queue` 批量删除队列中的任务（仅影响 queued 任务，删除后标记为 cancelled）。
+
+### 策略包打包逻辑与示例
+- 打包目标: **把策略文件依赖的通用方法/风控模块/工具类一并打包**，保证 backtest docker 内可直接按模块路径导入。
+- 规则约束:
+  - zip 内必须只有 **一个顶层目录**（作为 Python 包根目录）。
+  - 该顶层目录需包含 `__init__.py`，策略模块与其依赖模块均放在该目录下或其子目录下。
+  - `run_spec.json` 使用 `strategy_bundle` 字段，`strategy_entry`/`strategy_config_path` 必须是 **模块路径**（如 `pkg.module:ClassName`）。
+  - `.strategyignore` 使用 **gitignore 风格**（支持 `!` 反选、`#` 注释、空行忽略），可排除无需上传的文件。
+  - **CLI 不会解析 import**：策略依赖的通用方法/风控模块/工具类必须由用户**手动放入同一策略包目录**；不要求在 `strategies/` 目录内，但必须在该 bundle 顶层目录下。
+- 打包逻辑（CLI）:
+  - `--strategy-bundle <目录>` 时：CLI 遍历目录内所有文件，应用 `.strategyignore` + 默认忽略规则（如 `__pycache__/`, `*.pyc`, `.git/`, `.strategyignore` 等），生成 zip。
+    - 该目录就是**顶级目录**，zip 的顶层目录名固定为该目录名（确保单层目录结构）。
+  - `--strategy-bundle <zip>` 时：如果 zip 不存在，CLI 会尝试同路径同名目录（去掉 `.zip` 后缀）并自动打包。
+  - `--strategy-bundle <zip>` 时：CLI 仅校验 zip 是否满足以下要求：
+    - zip 内**必须只有一个顶层目录**（如 `strategies/`）。
+    - 所有策略代码与依赖都必须在该顶层目录下。
+    - zip 内路径必须安全（不允许绝对路径或 `..`）。
+  - `strategy_bundle` 不再使用 `./strategies/<name>` 作为 fallback，仅接受原路径存在的文件/目录；若是 zip 缺失则按上一条自动打包同名目录。
+
+示例（将 `strategies/spot_futures_arb_diagnostics.py` 与通用方法打包在同一顶级目录）:
+
+```
+strategies/
+  __init__.py
+  spot_futures_arb_diagnostics.py   # 策略入口
+  risk.py                           # 风控模块（被策略引用）
+  utils/
+    __init__.py
+    common.py                       # 通用工具函数
+```
+
+`spot_futures_arb_diagnostics.py` 内可直接相对导入:
+
+```
+from .risk import RiskManager
+from .utils.common import normalize_price
+```
+
+`.strategyignore` 示例:
+
+```
+__pycache__/
+*.pyc
+local_data/
+!local_data/keep_me.csv
+```
+
+`run_spec.json` 示例:
+
+```
+{
+  "strategy_bundle": "strategies.zip",
+  "strategy_entry": "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnostics",
+  "strategy_config_path": "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnosticsConfig",
+  "starting_balances_spot": ["100000 USDT"],
+  "starting_balances_futures": ["100000 USDT"]
+}
+```
 
 ### queue_scheduler 调度流程
 
@@ -211,7 +269,7 @@
 - 运行步骤:
   1) 启动服务（Docker/uvicorn）。
   2) 执行 `backtest-hub-cli init` 生成 `./scripts/generate_run_spec.py`，按需修改参数。
-  3) 调用 `POST /runs` 上传 run_spec 与策略文件（或使用 `backtest-hub-cli submit`/`scripts/submit_run.py`）。
+  3) 调用 `POST /runs` 上传 run_spec 与策略文件/策略包（或使用 `backtest-hub-cli submit`/`scripts/submit_run.py`）。
   4) 服务落盘；若队列非空则新提交直接排队；队列为空且目标 backtest docker 可用内存满足（且未达 running 上限）则立即转发提交，否则进入队列并返回 `status=queued`。
   5) 使用 `GET /runs/{backtest_id}` 查询映射信息。
   6) 使用 `GET /runs/backtest/{backtest_id}` 查询 backtest docker 状态。

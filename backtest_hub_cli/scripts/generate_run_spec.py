@@ -6,6 +6,7 @@ from pathlib import Path
 SCHEMA_VERSION = "1.0"
 REQUESTED_BY = "researcher_001"
 STRATEGY_FILE = "strategies/spot_futures_arb_diagnostics.py"
+STRATEGY_BUNDLE = None
 STRATEGY_ENTRY = "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnostics"
 STRATEGY_CONFIG_PATH = "strategies.spot_futures_arb_diagnostics:SpotFuturesArbDiagnosticsConfig"
 STRATEGY_CONFIG = {
@@ -24,6 +25,8 @@ LATENCY_CONFIG = {
     "update_latency_nanos": 3_000_000,
     "cancel_latency_nanos": 1_000_000,
 }
+STARTING_BALANCES_SPOT = ["100000 USDT"]
+STARTING_BALANCES_FUTURES = ["100000 USDT"]
 SYMBOLS = ["ACTUSDT", "ACTUSDT-PERP", "DOTUSDT", "DOTUSDT-PERP"]
 START_TIME = "2025-11-10T00:00:00.000Z"
 END_TIME = "2025-11-11T23:59:59.999Z"
@@ -36,18 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate run_spec.json for backtest hub.")
     parser.add_argument("--output", default="run_spec.json", help="Output path for run_spec.json")
     parser.add_argument("--requested-by", default=REQUESTED_BY)
-    parser.add_argument("--strategy-file", default=STRATEGY_FILE)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--strategy-file", default=STRATEGY_FILE)
+    group.add_argument("--strategy-bundle", default=STRATEGY_BUNDLE)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    strategy_file = Path(args.strategy_file)
-
     run_spec = {
         "schema_version": SCHEMA_VERSION,
         "requested_by": args.requested_by,
-        "strategy_file": strategy_file.name,
         "strategy_entry": STRATEGY_ENTRY,
         "strategy_config_path": STRATEGY_CONFIG_PATH,
         "strategy_config": STRATEGY_CONFIG,
@@ -58,6 +60,8 @@ def main() -> int:
         "futures_maker_fee": FUTURES_MAKER_FEE,
         "futures_taker_fee": FUTURES_TAKER_FEE,
         "latency_config": LATENCY_CONFIG,
+        "starting_balances_spot": STARTING_BALANCES_SPOT,
+        "starting_balances_futures": STARTING_BALANCES_FUTURES,
         "symbols": SYMBOLS,
         "start": START_TIME,
         "end": END_TIME,
@@ -65,6 +69,12 @@ def main() -> int:
         "seed": SEED,
         "tags": TAGS,
     }
+    if args.strategy_bundle:
+        strategy_bundle = Path(args.strategy_bundle)
+        run_spec["strategy_bundle"] = strategy_bundle.name
+    else:
+        strategy_file = Path(args.strategy_file)
+        run_spec["strategy_file"] = strategy_file.name
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

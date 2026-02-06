@@ -210,7 +210,6 @@ LATENCY_CONFIG_KEYS = set(DEFAULT_LATENCY_CONFIG.keys())
 REQUIRED_FIELDS = {
     "schema_version",
     "requested_by",
-    "strategy_file",
     "strategy_entry",
     "strategy_config_path",
     "strategy_config",
@@ -227,7 +226,13 @@ REQUIRED_FIELDS = {
     "seed",
     "tags",
 }
-OPTIONAL_FIELDS = {"latency_config"}
+OPTIONAL_FIELDS = {
+    "latency_config",
+    "starting_balances_spot",
+    "starting_balances_futures",
+    "strategy_file",
+    "strategy_bundle",
+}
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 
@@ -276,6 +281,19 @@ def parse_decimal_field(field: str, value: object) -> None:
         raise ValueError(f"{field} must be >= 0")
 
 
+def parse_starting_balances(field: str, value: object | None) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field} must be a non-empty list of strings")
+    parsed: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{field} must be a non-empty list of strings")
+        parsed.append(item.strip())
+    return parsed
+
+
 def make_run_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = uuid.uuid4().hex
@@ -300,8 +318,16 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(symbol, str) or not symbol.strip():
             raise ValueError("symbols must be list of strings")
 
-    if not isinstance(payload.get("strategy_file"), str) or not payload["strategy_file"].strip():
+    strategy_file = payload.get("strategy_file")
+    strategy_bundle = payload.get("strategy_bundle")
+    has_strategy_file = isinstance(strategy_file, str) and bool(strategy_file.strip())
+    has_strategy_bundle = isinstance(strategy_bundle, str) and bool(strategy_bundle.strip())
+    if has_strategy_file == has_strategy_bundle:
+        raise ValueError("Exactly one of strategy_file or strategy_bundle must be set")
+    if strategy_file is not None and not has_strategy_file:
         raise ValueError("strategy_file must be a non-empty string")
+    if strategy_bundle is not None and not has_strategy_bundle:
+        raise ValueError("strategy_bundle must be a non-empty string")
     if not isinstance(payload.get("strategy_config"), dict):
         raise ValueError("strategy_config must be an object")
     if not isinstance(payload.get("chunk_size"), int) or payload["chunk_size"] <= 0:
@@ -313,6 +339,14 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
 
     if "latency_config" in payload:
         payload["latency_config"] = parse_latency_config(payload["latency_config"])
+    if "starting_balances_spot" in payload:
+        payload["starting_balances_spot"] = parse_starting_balances(
+            "starting_balances_spot", payload["starting_balances_spot"]
+        )
+    if "starting_balances_futures" in payload:
+        payload["starting_balances_futures"] = parse_starting_balances(
+            "starting_balances_futures", payload["starting_balances_futures"]
+        )
 
     start_value = payload["start"]
     end_value = payload["end"]
@@ -347,8 +381,16 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
     sanitized: dict[str, Any] = {}
     for field in REQUIRED_FIELDS:
         sanitized[field] = payload[field]
+    if has_strategy_file:
+        sanitized["strategy_file"] = str(strategy_file)
+    if has_strategy_bundle:
+        sanitized["strategy_bundle"] = str(strategy_bundle)
     if "latency_config" in payload:
         sanitized["latency_config"] = payload["latency_config"]
+    if "starting_balances_spot" in payload:
+        sanitized["starting_balances_spot"] = payload["starting_balances_spot"]
+    if "starting_balances_futures" in payload:
+        sanitized["starting_balances_futures"] = payload["starting_balances_futures"]
     return sanitized
 
 
@@ -628,20 +670,29 @@ def submit_to_backtest(
     base_url: str,
     backtest_id: str,
     run_spec_bytes: bytes,
-    strategy_filename: str,
-    strategy_bytes: bytes,
+    strategy_filename: str | None,
+    strategy_bytes: bytes | None,
+    bundle_filename: str | None,
+    bundle_bytes: bytes | None,
     runner_bytes: bytes,
 ) -> str:
     url = normalize_join_url(base_url, BACKTEST_SUBMIT_PATH)
     logger.info("submit_to_backtest start backtest_id=%s url=%s", backtest_id, url)
-    # backtest docker 最新接口字段名：backtest_id / runer / strategies / configs
+    # backtest docker 最新接口字段名：backtest_id / runer / strategies / strategy_bundle / configs
+    files = [
+        ("runer", "run_backtest.py", "text/x-python", runner_bytes),
+        ("configs", "run_spec.json", "application/json", run_spec_bytes),
+    ]
+    if bundle_filename and bundle_bytes is not None:
+        files.append(("strategy_bundle", bundle_filename, "application/zip", bundle_bytes))
+    elif strategy_filename and strategy_bytes is not None:
+        files.append(("strategies", strategy_filename, "text/x-python", strategy_bytes))
+    else:
+        raise ValueError("strategy_file/strategy_bundle missing for backtest submission")
+
     form_body, content_type = build_multipart_form(
         fields=[("backtest_id", backtest_id)],
-        files=[
-            ("runer", "run_backtest.py", "text/x-python", runner_bytes),
-            ("strategies", strategy_filename, "text/x-python", strategy_bytes),
-            ("configs", "run_spec.json", "application/json", run_spec_bytes),
-        ],
+        files=files,
     )
     headers = {"Content-Type": content_type, **backtest_headers()}
     req = urllib.request.Request(url, data=form_body, headers=headers, method="POST")
@@ -720,18 +771,29 @@ def load_run_spec_payload(backtest_id: str) -> dict[str, Any]:
     return parse_run_spec_bytes(run_spec_bytes)
 
 
-def load_run_assets(backtest_id: str) -> tuple[bytes, str, bytes, bytes]:
+def load_run_assets(backtest_id: str) -> tuple[bytes, str | None, bytes | None, str | None, bytes | None, bytes]:
     run_dir = RUN_STORAGE_PATH / backtest_id
     run_spec_path = run_dir / "run_spec.json"
     run_spec_bytes = run_spec_path.read_bytes()
     run_spec_payload = parse_run_spec_bytes(run_spec_bytes)
-    strategy_filename = Path(str(run_spec_payload.get("strategy_file") or "strategy.py")).name
-    strategy_path = run_dir / strategy_filename
-    strategy_bytes = strategy_path.read_bytes()
+    strategy_filename: str | None = None
+    strategy_bytes: bytes | None = None
+    bundle_filename: str | None = None
+    bundle_bytes: bytes | None = None
+    if run_spec_payload.get("strategy_bundle"):
+        bundle_filename = Path(str(run_spec_payload.get("strategy_bundle"))).name
+        bundle_path = run_dir / bundle_filename
+        bundle_bytes = bundle_path.read_bytes()
+    elif run_spec_payload.get("strategy_file"):
+        strategy_filename = Path(str(run_spec_payload.get("strategy_file"))).name
+        strategy_path = run_dir / strategy_filename
+        strategy_bytes = strategy_path.read_bytes()
+    else:
+        raise ValueError("strategy_file/strategy_bundle missing in stored run_spec.json")
     if not RUNNER_PATH.is_file():
         raise FileNotFoundError(f"run_backtest.py not found: {RUNNER_PATH}")
     runner_bytes = RUNNER_PATH.read_bytes()
-    return run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes
+    return run_spec_bytes, strategy_filename, strategy_bytes, bundle_filename, bundle_bytes, runner_bytes
 
 
 async def pick_backtest_target(
@@ -787,8 +849,8 @@ async def pick_backtest_target(
 async def submit_with_queue_control(
     backtest_id: str,
     run_spec_bytes: bytes,
-    strategy_filename: str,
-    strategy_bytes: bytes,
+    strategy_filename: str | None,
+    strategy_bytes: bytes | None,
     runner_bytes: bytes,
     required_memory_gb: float,
     symbol_count: int,
@@ -935,9 +997,14 @@ async def queue_scheduler() -> None:
 
                 # Submit task
                 try:
-                    run_spec_bytes, strategy_filename, strategy_bytes, runner_bytes = await asyncio.to_thread(
-                        load_run_assets, backtest_id
-                    )
+                    (
+                        run_spec_bytes,
+                        strategy_filename,
+                        strategy_bytes,
+                        bundle_filename,
+                        bundle_bytes,
+                        runner_bytes,
+                    ) = await asyncio.to_thread(load_run_assets, backtest_id)
                     backtest_docker_run_id = await asyncio.to_thread(
                         submit_to_backtest,
                         selection.base_url,
@@ -945,6 +1012,8 @@ async def queue_scheduler() -> None:
                         run_spec_bytes,
                         strategy_filename,
                         strategy_bytes,
+                        bundle_filename,
+                        bundle_bytes,
                         runner_bytes,
                     )
                     update_mapping(
@@ -1015,13 +1084,15 @@ async def report_service_docs() -> Response:
 @app.post("/runs")
 async def create_run(
     run_spec: UploadFile = File(...),
-    strategy_file: UploadFile = File(...),
+    strategy_file: UploadFile | None = File(None),
+    strategy_bundle: UploadFile | None = File(None),
 ) -> JSONResponse:
     # 入口：research docker 上传 run_spec.json 与策略文件（multipart/form-data）
     logger.info(
-        "create_run_received run_spec=%s strategy_file=%s",
+        "create_run_received run_spec=%s strategy_file=%s strategy_bundle=%s",
         run_spec.filename or "-",
-        strategy_file.filename or "-",
+        strategy_file.filename if strategy_file else "-",
+        strategy_bundle.filename if strategy_bundle else "-",
     )
 
     try:
@@ -1036,8 +1107,40 @@ async def create_run(
         logger.warning("create_run_spec_not_object type=%s", type(payload).__name__)
         raise HTTPException(status_code=400, detail="run_spec.json must be an object")
 
+    if strategy_file and strategy_bundle:
+        raise HTTPException(status_code=400, detail="strategy_file and strategy_bundle are mutually exclusive")
+    if not strategy_file and not strategy_bundle:
+        raise HTTPException(status_code=400, detail="strategy_file or strategy_bundle is required")
+
+    # 2) 生成 run_id，并在本地保存上传内容，便于排查与追踪
+    backtest_id = make_run_id()
+    logger.info("create_run_generated backtest_id=%s", backtest_id)
+
+    # 3) 读取策略文件或策略包（只保留文件名，避免路径穿越）
+    strategy_filename: str | None = None
+    strategy_bytes: bytes | None = None
+    bundle_filename: str | None = None
+    bundle_bytes: bytes | None = None
+    if strategy_file:
+        strategy_filename = Path(strategy_file.filename or "strategy.py").name
+        strategy_bytes = await strategy_file.read()
+        if not strategy_bytes:
+            logger.warning("create_run_empty_strategy backtest_id=%s", backtest_id)
+            raise HTTPException(status_code=400, detail="strategy_file is empty")
+        payload["strategy_file"] = strategy_filename
+        payload.pop("strategy_bundle", None)
+    else:
+        assert strategy_bundle is not None
+        bundle_filename = Path(strategy_bundle.filename or "strategy_bundle.zip").name
+        bundle_bytes = await strategy_bundle.read()
+        if not bundle_bytes:
+            logger.warning("create_run_empty_bundle backtest_id=%s", backtest_id)
+            raise HTTPException(status_code=400, detail="strategy_bundle is empty")
+        payload["strategy_bundle"] = bundle_filename
+        payload.pop("strategy_file", None)
+
     try:
-        # 2) 校验 run_spec 内容（字段、时间范围、费用等）
+        # 4) 校验 run_spec 内容（字段、时间范围、费用等）
         run_spec_payload = validate_run_spec(payload)
     except ValueError as exc:
         logger.warning("create_run_spec_validation_failed error=%s", exc)
@@ -1046,38 +1149,33 @@ async def create_run(
     required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload)
     symbol_count = len(run_spec_payload["symbols"])
 
-    # 3) 生成 run_id，并在本地保存上传内容，便于排查与追踪
-    backtest_id = make_run_id()
-    logger.info("create_run_generated backtest_id=%s", backtest_id)
-
-    run_dir = RUN_STORAGE_PATH / backtest_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
     requested_by = run_spec_payload.get("requested_by")
     if isinstance(requested_by, str) and requested_by:
         update_mapping(backtest_id, {"requested_by": requested_by})
 
-    # 4) 保存策略文件（只保留文件名，避免路径穿越）
-    strategy_filename = Path(strategy_file.filename or "strategy.py").name
-    strategy_bytes = await strategy_file.read()
-    if not strategy_bytes:
-        logger.warning("create_run_empty_strategy backtest_id=%s", backtest_id)
-        raise HTTPException(status_code=400, detail="strategy_file is empty")
-    strategy_path = run_dir / strategy_filename
-    strategy_path.write_bytes(strategy_bytes)
+    # 5) 落盘保存策略文件/策略包与 run_spec
+    run_dir = RUN_STORAGE_PATH / backtest_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    # 5) 将 run_spec 中的 strategy_file 更新为实际保存的文件名，并落盘
-    run_spec_payload["strategy_file"] = strategy_filename
+    if strategy_filename and strategy_bytes is not None:
+        strategy_path = run_dir / strategy_filename
+        strategy_path.write_bytes(strategy_bytes)
+    if bundle_filename and bundle_bytes is not None:
+        bundle_path = run_dir / bundle_filename
+        bundle_path.write_bytes(bundle_bytes)
+
     run_spec_payload["backtest_id"] = backtest_id
     run_spec_path = run_dir / "run_spec.json"
     run_spec_bytes = json.dumps(run_spec_payload, ensure_ascii=True, indent=2).encode("utf-8")
     run_spec_path.write_bytes(run_spec_bytes)
     logger.info(
-        "create_run_saved backtest_id=%s strategy_filename=%s run_spec_bytes=%s strategy_bytes=%s",
+        "create_run_saved backtest_id=%s strategy_filename=%s strategy_bundle=%s run_spec_bytes=%s strategy_bytes=%s bundle_bytes=%s",
         backtest_id,
-        strategy_filename,
+        strategy_filename or "-",
+        bundle_filename or "-",
         len(run_spec_bytes),
-        len(strategy_bytes),
+        len(strategy_bytes or b""),
+        len(bundle_bytes or b""),
     )
 
     # 6) 从本仓库读取 run_backtest.py，并一并转发给 backtest docker

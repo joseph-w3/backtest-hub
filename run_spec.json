@@ -20,6 +20,12 @@
     "update_latency_nanos": 3000000,
     "cancel_latency_nanos": 1000000
   },
+  "starting_balances_spot": [
+    "100000 USDT"
+  ],
+  "starting_balances_futures": [
+    "100000 USDT"
+  ],
   "symbols": [
     "ACTUSDT",
     "ACTUSDT-PERP",
