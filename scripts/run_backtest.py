@@ -1028,15 +1028,22 @@ def main() -> int:
         _write_status(status_path, status)
         return 0
     except Exception as exc:
+        tb = traceback.format_exc()
         status.update(
             {
                 "status": "failed",
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "error": str(exc),
-                "traceback": traceback.format_exc(),
+                "traceback": tb,
             }
         )
         _write_status(status_path, status)
+        print("\n" + "=" * 70, file=sys.stderr)
+        print("[ERROR] Backtest failed", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
+        print("Traceback:", file=sys.stderr)
+        print(tb, file=sys.stderr)
+        print("=" * 70 + "\n", file=sys.stderr, flush=True)
         return 1
 
 

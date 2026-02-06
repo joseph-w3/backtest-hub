@@ -43,6 +43,18 @@ class ReportFetchError(ReportServiceError):
         self.detail = detail
 
 
+class ReportNotFound(ReportServiceError):
+    def __init__(self, detail: str = "backtest report not found") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class ReportNotReady(ReportServiceError):
+    def __init__(self, detail: str = "backtest report not ready") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 def validate_backtest_id(backtest_id: str) -> None:
     if not backtest_id or any(ch in backtest_id for ch in ("\\", "/", ".")):
         raise HTTPException(status_code=400, detail="backtest_id has invalid characters")
@@ -195,6 +207,7 @@ class ReportServiceConfig:
     cache_path: Path
     report_path: str
     report_batch_path: str
+    status_path: str
     data_download_path: str
     runs_path: str
     max_page_size: int
@@ -276,6 +289,46 @@ class ReportService:
             raise ReportInvalidPayload("backtest report invalid response")
         LOGGER.info("report_fetch_ok backtest_id=%s", backtest_id)
         return payload
+
+    def fetch_status(self, base_url: str, backtest_id: str) -> dict[str, Any]:
+        url = normalize_join_url(base_url, self._config.status_path.format(backtest_id=backtest_id))
+        req = urllib.request.Request(url, headers=self._backtest_headers(), method="GET")
+        LOGGER.info("status_fetch_start backtest_id=%s base=%s url=%s", backtest_id, base_url, url)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8")
+            LOGGER.info(
+                "status_fetch_http_error backtest_id=%s status=%s detail=%s",
+                backtest_id,
+                exc.code,
+                detail,
+            )
+            raise ReportHttpError(exc.code, detail or "backtest error") from exc
+        except Exception as exc:
+            LOGGER.info("status_fetch_error backtest_id=%s error=%s", backtest_id, exc)
+            raise ReportFetchError(str(exc)) from exc
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception as exc:
+            LOGGER.info("status_fetch_invalid_json backtest_id=%s", backtest_id)
+            raise ReportInvalidPayload("backtest status invalid response") from exc
+        if not isinstance(payload, dict):
+            LOGGER.info("status_fetch_invalid_payload backtest_id=%s", backtest_id)
+            raise ReportInvalidPayload("backtest status invalid response")
+        LOGGER.info("status_fetch_ok backtest_id=%s", backtest_id)
+        return payload
+
+    @staticmethod
+    def _status_text(status: Any) -> str | None:
+        if not isinstance(status, str):
+            return None
+        normalized = status.strip().lower()
+        if not normalized:
+            return None
+        return normalized
 
     def fetch_reports_batch(self, base_url: str, backtest_ids: list[str]) -> dict[str, dict[str, Any]]:
         if not backtest_ids:
@@ -439,8 +492,14 @@ class ReportService:
         LOGGER.info("report_get_start backtest_id=%s allow_running_only=%s", backtest_id, allow_running_only)
         cached = self._cache.get(backtest_id)
         if cached is not None:
-            LOGGER.info("report_get_cache_hit backtest_id=%s", backtest_id)
-            return cached
+            if cached.get("report_available") is True:
+                LOGGER.info("report_get_cache_hit backtest_id=%s", backtest_id)
+                return cached
+            status = self._status_text(cached.get("status"))
+            LOGGER.info("report_get_cache_negative backtest_id=%s status=%s", backtest_id, status)
+            if status == "running":
+                raise ReportNotReady()
+            raise ReportNotFound()
         LOGGER.info("report_get_cache_miss backtest_id=%s", backtest_id)
 
         if allow_running_only:
@@ -462,9 +521,26 @@ class ReportService:
                 cache_requested_by,
                 created_at,
             )
-        else:
-            LOGGER.info("report_get_unavailable backtest_id=%s", backtest_id)
-        return payload
+            return payload
+
+        status_payload = self.fetch_status(base_url, backtest_id)
+        status = self._status_text(status_payload.get("status"))
+        LOGGER.info("report_get_unavailable backtest_id=%s status=%s", backtest_id, status)
+        if status == "running":
+            raise ReportNotReady()
+
+        requested_by = self.get_requested_by_from_entry(backtest_id, entry)
+        created_at = get_entry_created_at(backtest_id, entry)
+        negative_payload: dict[str, Any] = {
+            "report_available": False,
+            "backtest_id": backtest_id,
+            "status": status or "unknown",
+        }
+        if requested_by:
+            negative_payload["requested_by"] = requested_by
+        self._cache.upsert(backtest_id, negative_payload, requested_by, created_at)
+        LOGGER.info("report_get_negative_cached backtest_id=%s status=%s", backtest_id, status or "unknown")
+        raise ReportNotFound()
 
     def get_report_page(
         self,
@@ -527,6 +603,8 @@ class ReportService:
                 cached = self._cache.get(item["backtest_id"])
                 if cached is None:
                     continue
+                if cached.get("report_available") is not True:
+                    continue
                 if requested_by and not item["mapping_match"]:
                     cached_requested_by = report_requested_by(cached)
                     if cached_requested_by != requested_by:
@@ -557,6 +635,8 @@ class ReportService:
 
             cached = self._cache.get(backtest_id)
             if cached is not None:
+                if cached.get("report_available") is not True:
+                    continue
                 if pending:
                     if flush_pending():
                         break
@@ -654,6 +734,12 @@ def build_report_router(
         service = get_report_service()
         try:
             payload = service.get_report(backtest_id, allow_running_only=False)
+        except ReportNotFound as exc:
+            LOGGER.info("fetch_backtest_report_not_found backtest_id=%s", backtest_id)
+            raise HTTPException(status_code=404, detail=exc.detail) from exc
+        except ReportNotReady as exc:
+            LOGGER.info("fetch_backtest_report_not_ready backtest_id=%s", backtest_id)
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
         except ReportHttpError as exc:
             LOGGER.info(
                 "fetch_backtest_report_http_error backtest_id=%s status=%s detail=%s",
