@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -18,6 +19,7 @@ from urllib.parse import urlparse, urlunparse
 import aiohttp
 
 HUB_BASE_URL = os.getenv("BACKTEST_HUB_BASE_URL", "http://100.87.155.67:10033")
+FOLLOW_LOGS_DELAY_SECONDS = 35
 
 DEFAULT_STRATEGY_IGNORE = [
     ".git/",
@@ -394,10 +396,6 @@ def resolve_strategy_bundle_path(raw: str) -> Path | None:
     candidate = Path(str(raw))
     if candidate.exists() and (candidate.is_file() or candidate.is_dir()):
         return candidate
-    if not candidate.is_absolute():
-        fallback = Path.cwd() / "strategies" / candidate.name
-        if fallback.exists() and (fallback.is_file() or fallback.is_dir()):
-            return fallback
     return None
 
 
@@ -492,17 +490,19 @@ def command_submit(args: argparse.Namespace) -> int:
     else:
         assert raw_bundle is not None
         bundle_path = resolve_strategy_bundle_path(raw_bundle)
+        auto_pack_dir: Path | None = None
         if bundle_path is None:
             candidate = Path(str(raw_bundle))
-            tried_fallback = Path.cwd() / "strategies" / candidate.name
-            if candidate.is_absolute():
+            if candidate.suffix == ".zip":
+                candidate_dir = candidate.with_suffix("")
+                if candidate_dir.is_dir():
+                    bundle_path = candidate_dir
+                    auto_pack_dir = candidate_dir
+            if bundle_path is None:
                 print(f"strategy bundle not found: {candidate}", file=sys.stderr)
-            else:
-                print(
-                    f"strategy bundle not found: {candidate} (also tried: {tried_fallback})",
-                    file=sys.stderr,
-                )
-            return 1
+                return 1
+        if auto_pack_dir is not None:
+            print(f"strategy bundle zip not found; auto packing from directory: {auto_pack_dir.resolve()}")
         print(f"Using strategy bundle: {bundle_path.resolve()}")
         try:
             if bundle_path.is_dir():
@@ -596,6 +596,8 @@ def command_submit(args: argparse.Namespace) -> int:
                     )
                     output_path = Path.cwd() / "live_logs" / f"{backtest_id}.log"
                     try:
+                        print(f"Waiting {FOLLOW_LOGS_DELAY_SECONDS}s before streaming logs...")
+                        time.sleep(FOLLOW_LOGS_DELAY_SECONDS)
                         asyncio.run(stream_logs(ws_url, output_path))
                     except KeyboardInterrupt:
                         print("\nLog streaming interrupted.")

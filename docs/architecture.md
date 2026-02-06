@@ -85,10 +85,12 @@
 - 打包逻辑（CLI）:
   - `--strategy-bundle <目录>` 时：CLI 遍历目录内所有文件，应用 `.strategyignore` + 默认忽略规则（如 `__pycache__/`, `*.pyc`, `.git/`, `.strategyignore` 等），生成 zip。
     - 该目录就是**顶级目录**，zip 的顶层目录名固定为该目录名（确保单层目录结构）。
+  - `--strategy-bundle <zip>` 时：如果 zip 不存在，CLI 会尝试同路径同名目录（去掉 `.zip` 后缀）并自动打包。
   - `--strategy-bundle <zip>` 时：CLI 仅校验 zip 是否满足以下要求：
     - zip 内**必须只有一个顶层目录**（如 `strategies/`）。
     - 所有策略代码与依赖都必须在该顶层目录下。
     - zip 内路径必须安全（不允许绝对路径或 `..`）。
+  - `strategy_bundle` 不再使用 `./strategies/<name>` 作为 fallback，仅接受原路径存在的文件/目录；若是 zip 缺失则按上一条自动打包同名目录。
 
 示例（将 `strategies/spot_futures_arb_diagnostics.py` 与通用方法打包在同一顶级目录）:
 
