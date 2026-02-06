@@ -194,6 +194,7 @@ class ReportCache:
 class ReportServiceConfig:
     cache_path: Path
     report_path: str
+    report_batch_path: str
     data_download_path: str
     runs_path: str
     max_page_size: int
@@ -275,6 +276,73 @@ class ReportService:
             raise ReportInvalidPayload("backtest report invalid response")
         LOGGER.info("report_fetch_ok backtest_id=%s", backtest_id)
         return payload
+
+    def fetch_reports_batch(self, base_url: str, backtest_ids: list[str]) -> dict[str, dict[str, Any]]:
+        if not backtest_ids:
+            return {}
+        url = normalize_join_url(base_url, self._config.report_batch_path)
+        body = json.dumps({"backtest_ids": backtest_ids}, ensure_ascii=True).encode("utf-8")
+        headers = dict(self._backtest_headers())
+        headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        LOGGER.info("report_batch_fetch_start base=%s url=%s count=%s", base_url, url, len(backtest_ids))
+        try:
+            with urllib.request.urlopen(req) as resp:
+                payload_bytes = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8")
+            LOGGER.info(
+                "report_batch_fetch_http_error base=%s status=%s detail=%s",
+                base_url,
+                exc.code,
+                detail,
+            )
+            raise ReportHttpError(exc.code, detail or "backtest error") from exc
+        except Exception as exc:
+            LOGGER.info("report_batch_fetch_error base=%s error=%s", base_url, exc)
+            raise ReportFetchError(str(exc)) from exc
+
+        try:
+            payload = json.loads(payload_bytes.decode("utf-8"))
+        except Exception as exc:
+            LOGGER.info("report_batch_fetch_invalid_json base=%s", base_url)
+            raise ReportInvalidPayload("backtest report invalid response") from exc
+        if not isinstance(payload, dict):
+            LOGGER.info("report_batch_fetch_invalid_payload base=%s", base_url)
+            raise ReportInvalidPayload("backtest report invalid response")
+
+        reports = payload.get("reports")
+        if not isinstance(reports, list):
+            LOGGER.info("report_batch_fetch_missing_reports base=%s", base_url)
+            raise ReportInvalidPayload("backtest report invalid response")
+
+        results: dict[str, dict[str, Any]] = {}
+        for item in reports:
+            if not isinstance(item, dict):
+                continue
+            backtest_id = item.get("backtest_id")
+            report = item.get("report")
+            requested_by = item.get("requested_by")
+            if not isinstance(backtest_id, str) or not backtest_id:
+                continue
+            if not isinstance(report, dict):
+                continue
+            payload_item: dict[str, Any] = {
+                "report_available": True,
+                "backtest_id": backtest_id,
+                "report": report,
+            }
+            if isinstance(requested_by, str):
+                payload_item["requested_by"] = requested_by
+            results[backtest_id] = payload_item
+
+        LOGGER.info(
+            "report_batch_fetch_ok base=%s requested=%s returned=%s",
+            base_url,
+            len(backtest_ids),
+            len(results),
+        )
+        return results
 
     def fetch_data_package(self, backtest_id: str) -> tuple[bytes, str, dict[str, str]]:
         validate_backtest_id(backtest_id)
@@ -422,6 +490,57 @@ class ReportService:
         offset = (page - 1) * limit
         matched = 0
         results: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
+        batch_size = self._config.max_page_size
+
+        def flush_pending() -> bool:
+            nonlocal matched, results, pending
+            if not pending:
+                return False
+            pending_by_base: dict[str, list[str]] = {}
+            pending_by_id: dict[str, dict[str, Any]] = {}
+            for item in pending:
+                pending_by_id[item["backtest_id"]] = item
+                pending_by_base.setdefault(item["base_url"], []).append(item["backtest_id"])
+
+            for base_url, backtest_ids in pending_by_base.items():
+                try:
+                    batch_payloads = self.fetch_reports_batch(base_url, backtest_ids)
+                except ReportServiceError as exc:
+                    LOGGER.info("report_batch_fetch_failed base=%s error=%s", base_url, exc)
+                    continue
+                for backtest_id, payload in batch_payloads.items():
+                    entry = pending_by_id.get(backtest_id)
+                    if entry is None:
+                        continue
+                    if not isinstance(payload, dict) or payload.get("report_available") is not True:
+                        continue
+                    cache_requested_by = entry["requested_by_value"] or report_requested_by(payload)
+                    self._cache.upsert(
+                        backtest_id,
+                        payload,
+                        cache_requested_by,
+                        entry["created_at"],
+                    )
+
+            for item in pending:
+                cached = self._cache.get(item["backtest_id"])
+                if cached is None:
+                    continue
+                if requested_by and not item["mapping_match"]:
+                    cached_requested_by = report_requested_by(cached)
+                    if cached_requested_by != requested_by:
+                        continue
+                matched += 1
+                if matched > offset:
+                    results.append(self.attach_backtest_api_base(cached, item["base_url"]))
+                    if len(results) >= limit:
+                        pending = []
+                        return True
+            pending = []
+            return False
+
+        needed = offset + limit
 
         for created_at, backtest_id, entry in sorted_entries:
             base_url = entry.get("backtest_api_base") if isinstance(entry, dict) else None
@@ -438,6 +557,9 @@ class ReportService:
 
             cached = self._cache.get(backtest_id)
             if cached is not None:
+                if pending:
+                    if flush_pending():
+                        break
                 if requested_by and not mapping_match:
                     cached_requested_by = report_requested_by(cached)
                     if cached_requested_by != requested_by:
@@ -452,27 +574,22 @@ class ReportService:
             if not base_url:
                 continue
 
-            try:
-                payload = self.fetch_report(base_url, backtest_id)
-            except Exception:
-                continue
+            pending.append(
+                {
+                    "backtest_id": backtest_id,
+                    "base_url": base_url,
+                    "mapping_match": mapping_match,
+                    "requested_by_value": requested_by_value,
+                    "created_at": created_at,
+                }
+            )
 
-            if not isinstance(payload, dict) or payload.get("report_available") is not True:
-                continue
-
-            if requested_by and not mapping_match:
-                payload_requested_by = report_requested_by(payload)
-                if payload_requested_by != requested_by:
-                    continue
-
-            cache_requested_by = requested_by_value or report_requested_by(payload)
-            self._cache.upsert(backtest_id, payload, cache_requested_by, created_at)
-
-            matched += 1
-            if matched > offset:
-                results.append(self.attach_backtest_api_base(payload, base_url))
-                if len(results) >= limit:
+            if pending and (len(pending) >= batch_size or matched + len(pending) >= needed):
+                if flush_pending():
                     break
+
+        if pending and len(results) < limit:
+            flush_pending()
 
         LOGGER.info(
             "report_page_ok page=%s limit=%s requested_by=%s matched=%s returned=%s",

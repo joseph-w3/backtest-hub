@@ -67,6 +67,7 @@ async def on_startup() -> None:
         ReportServiceConfig(
             cache_path=REPORT_CACHE_PATH,
             report_path=BACKTEST_REPORT_PATH,
+            report_batch_path=BACKTEST_REPORT_BATCH_PATH,
             data_download_path=BACKTEST_DATA_DOWNLOAD_PATH,
             runs_path=BACKTEST_RUNS_PATH,
             max_page_size=MAX_REPORT_PAGE_SIZE,
@@ -157,6 +158,10 @@ BACKTEST_DATA_DOWNLOAD_PATH = env_or_default(
 )
 BACKTEST_KILL_PATH = "/v1/runs/backtest/{backtest_id}/kill"
 BACKTEST_REPORT_PATH = env_or_default("BACKTEST_REPORT_PATH", "/v1/runs/backtest/{backtest_id}/report")
+BACKTEST_REPORT_BATCH_PATH = env_or_default(
+    "BACKTEST_REPORT_BATCH_PATH",
+    "/v1/runs/backtest/reports/batch",
+)
 BACKTEST_STATUS_PATH = env_or_default("BACKTEST_STATUS_PATH", "/v1/runs/backtest/{backtest_id}")
 BACKTEST_WS_LOGS_PATH = env_or_default(
     "BACKTEST_WS_LOGS_PATH",
@@ -458,6 +463,7 @@ def get_report_service() -> ReportService:
             ReportServiceConfig(
                 cache_path=REPORT_CACHE_PATH,
                 report_path=BACKTEST_REPORT_PATH,
+                report_batch_path=BACKTEST_REPORT_BATCH_PATH,
                 data_download_path=BACKTEST_DATA_DOWNLOAD_PATH,
                 runs_path=BACKTEST_RUNS_PATH,
                 max_page_size=MAX_REPORT_PAGE_SIZE,

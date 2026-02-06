@@ -41,7 +41,7 @@
 
 ### 依赖关系
 - 外部依赖:
-  - backtest docker API（`BACKTEST_API_BASES` + `BACKTEST_SUBMIT_PATH`/`BACKTEST_STATUS_PATH`/`BACKTEST_REPORT_PATH`/`BACKTEST_RUNS_PATH`）与日志下载固定路径 `/v1/runs/backtest/{backtest_id}/logs/download`、CSV `/v1/runs/backtest/{backtest_id}/download_csv`、数据包 `/v1/runs/backtest/{backtest_id}/download_data`、kill `/v1/runs/backtest/{backtest_id}/kill`；日志流 WebSocket（`BACKTEST_WS_LOGS_PATH`）。
+  - backtest docker API（`BACKTEST_API_BASES` + `BACKTEST_SUBMIT_PATH`/`BACKTEST_STATUS_PATH`/`BACKTEST_REPORT_PATH`/`BACKTEST_REPORT_BATCH_PATH`/`BACKTEST_RUNS_PATH`）与日志下载固定路径 `/v1/runs/backtest/{backtest_id}/logs/download`、CSV `/v1/runs/backtest/{backtest_id}/download_csv`、数据包 `/v1/runs/backtest/{backtest_id}/download_data`、kill `/v1/runs/backtest/{backtest_id}/kill`；日志流 WebSocket（`BACKTEST_WS_LOGS_PATH`）。
   - backtest docker system metrics（`BACKTEST_METRICS_PATH`），用于 CPU/内存占用与调度决策。
   - 本地/挂载存储（默认 `/opt/backtest`）用于保存 run_spec 与策略文件/策略包。
   - backtest 执行环境需提供 `quant_trade_v1`、`CATALOG_PATH` 数据目录与日志目录（默认 `/opt/backtest_logs`）。
@@ -64,7 +64,7 @@
   - `GET /runs/{backtest_id}` 读取映射并返回。
   - `GET /runs/backtest/{backtest_id}` 根据映射中的 `backtest_api_base` 透传目标 backtest docker 状态（status/pid/started_at）。
   - `GET /runs/backtest/{backtest_id}/report` 根据映射中的 `backtest_api_base` 透传回测报告，并在 hub 侧落入 SQLite 缓存（仅成功报告）。
-  - `GET /runs/backtest/reports` 按映射中的时间倒序聚合回测报告（分页 + requested_by 过滤）；优先命中 SQLite 缓存，未命中则透传 backtest docker，失败或不可用报告跳过；聚合结果每条记录补充 `backtest_api_base`。
+  - `GET /runs/backtest/reports` 按映射中的时间倒序聚合回测报告（分页 + requested_by 过滤）；优先命中 SQLite 缓存，未命中则按 `backtest_api_base` 分组批量调用 backtest docker `/runs/backtest/reports/batch`（仅返回已缓存报告），未返回的报告跳过；聚合结果每条记录补充 `backtest_api_base`。
   - `GET /runs/backtest/active` 透传并汇总所有 backtest docker 的活跃任务（starting/running/stopping），按 created_at 倒序返回；聚合结果每条记录补充 `backtest_api_base`。
   - `GET /runs/{backtest_id}/logs` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 日志。
   - `GET /runs/backtest/{backtest_id}/download_csv` 根据映射中的 `backtest_api_base` 代理下载 backtest docker 回测 CSV ZIP。
@@ -299,6 +299,11 @@ local_data/
 - 本次新增/更新要点: 实现 **Backfilling 调度策略**，队首大任务无法调度时允许后续小任务先跑；新增两层防饥饿机制：时间窗口（`BACKFILL_WINDOW_SECONDS`，默认 5 分钟）限制可 backfill 的任务范围，资源预留阈值（`BACKFILL_RESERVE_THRESHOLD_SECONDS`，默认 10 分钟）触发后停止 backfill；新增 6 个 backfilling 相关测试。
 - 变更动机/需求来源: 用户要求实现 backfilling 提高资源利用率，同时防止大任务饥饿。
 - 当前更新时间: 2026-02-05 03:20:00
+
+### 2026-02-06 00:00:00
+- 本次新增/更新要点: `/runs/backtest/reports` 聚合改为按 `backtest_api_base` 批量调用 backtest docker `/runs/backtest/reports/batch`，仅返回已缓存报告并写入缓存；新增 `BACKTEST_REPORT_BATCH_PATH` 配置。
+- 变更动机/需求来源: 用户要求优化 `/runs/backtest/reports` 性能并替换 backtest docker 批量接口。
+- 当前更新时间: 2026-02-06 00:00:00
 
 ### 2026-02-05 01:50:00
 - 本次新增/更新要点: 新增 `QUEUE_DISPATCH_DELAY_SECONDS` 配置（默认 30s）；队列调度成功提交后等待延时，让目标节点 metrics 有时间更新，避免并发提交绕过 80% CPU 阈值检查；新增 `tests/test_scheduler.py` 单元测试（33 tests）覆盖调度器核心函数。
