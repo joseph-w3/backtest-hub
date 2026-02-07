@@ -461,6 +461,69 @@ def _build_perp_instrument(
         taker_fee=taker_fee,
     )
 
+class _InstrumentOverrideCatalog:
+    def __init__(
+        self,
+        base_catalog: ParquetDataCatalog,
+        instruments: dict[str, CurrencyPair | CryptoPerpetual],
+    ) -> None:
+        self._base_catalog = base_catalog
+        self._instruments = instruments
+
+    def instruments(
+        self,
+        instrument_type: type | None = None,
+        instrument_ids: list[object] | None = None,
+        **kwargs: object,
+    ) -> list[CurrencyPair | CryptoPerpetual]:
+        instruments = list(self._instruments.values())
+        if instrument_ids is not None:
+            ids: set[str] = set()
+            for instrument_id in instrument_ids:
+                if hasattr(instrument_id, "value"):
+                    ids.add(instrument_id.value)
+                else:
+                    ids.add(str(instrument_id))
+            instruments = [instrument for instrument in instruments if instrument.id.value in ids]
+            if not instruments:
+                available = sorted(self._instruments.keys())
+                raise ValueError(
+                    "Instrument override missing for requested instrument_ids="
+                    f"{sorted(ids)}; available overrides={available}"
+                )
+        if instrument_type is not None:
+            instruments = [
+                instrument for instrument in instruments if isinstance(instrument, instrument_type)
+            ]
+        return instruments
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._base_catalog, name)
+
+
+class _InstrumentOverrideBacktestNode(BacktestNode):
+    _instrument_overrides: dict[str, CurrencyPair | CryptoPerpetual] = {}
+
+    def __init__(
+        self,
+        configs: list[BacktestRunConfig],
+        instruments: list[CurrencyPair | CryptoPerpetual],
+    ) -> None:
+        super().__init__(configs)
+        self.__class__._instrument_overrides = {
+            instrument.id.value: instrument for instrument in instruments
+        }
+
+    @classmethod
+    def load_catalog(cls, config: BacktestDataConfig) -> ParquetDataCatalog:
+        base_catalog = ParquetDataCatalog(
+            path=config.catalog_path,
+            fs_protocol=config.catalog_fs_protocol,
+            fs_storage_options=config.catalog_fs_storage_options,
+            fs_rust_storage_options=config.catalog_fs_rust_storage_options,
+        )
+        return _InstrumentOverrideCatalog(base_catalog, cls._instrument_overrides)
+
 
 def _load_or_create_instrument(
     catalog: ParquetDataCatalog,
@@ -995,7 +1058,10 @@ def main() -> int:
             end=run_spec["end"],
         )
 
-        node = BacktestNode(configs=[run_config])
+        node = _InstrumentOverrideBacktestNode(
+            configs=[run_config],
+            instruments=spot_instruments + futures_instruments,
+        )
         node.run()
 
         engine = node.get_engine(run_config.id)
