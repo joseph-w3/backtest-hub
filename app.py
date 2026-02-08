@@ -168,7 +168,7 @@ BACKTEST_WS_LOGS_PATH = env_or_default(
     "BACKTEST_WS_LOGS_PATH",
     "/v1/runs/backtest/{backtest_id}/logs/stream",
 )
-BACKTEST_METRICS_PATH = env_or_default("BACKTEST_METRICS_PATH", "v1/docker/metrics")
+BACKTEST_METRICS_PATH = env_or_default("BACKTEST_METRICS_PATH", "v1/system/metrics")
 BACKTEST_METRICS_TIMEOUT_SECONDS = float(os.getenv("BACKTEST_METRICS_TIMEOUT_SECONDS", "3"))
 
 RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
