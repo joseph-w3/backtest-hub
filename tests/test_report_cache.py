@@ -1,277 +1,133 @@
-import tempfile
+import threading
 import unittest
-from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
+
+from fastapi.testclient import TestClient
+from fastapi import FastAPI
 
 from services.report_service import (
-    ReportCache,
-    ReportCacheConfig,
-    ReportNotFound,
-    ReportNotReady,
     ReportService,
     ReportServiceConfig,
+    build_report_router,
 )
 
 
-class TestReportCache(unittest.TestCase):
-    def test_report_cache_roundtrip(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            db_path = Path(td) / "report_cache.sqlite3"
-            cache = ReportCache(ReportCacheConfig(path=db_path))
-            cache.init_db()
+def make_app(mapping: dict[str, Any], service: ReportService | None = None) -> FastAPI:
+    lock = threading.Lock()
 
-            report = {"report_available": True, "backtest_id": "b1"}
-            cache.upsert(
-                "b1",
-                report,
-                "alice",
-                "2026-02-04T00:00:00Z",
-            )
-            loaded = cache.get("b1")
-            self.assertEqual(loaded, report)
+    if service is None:
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/v1/runs/backtest/reports/batch"),
+            backtest_headers=lambda: {},
+        )
 
-    def test_collect_report_page_uses_cache_and_filters(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            db_path = Path(td) / "report_cache.sqlite3"
-            service = ReportService(
-                ReportServiceConfig(
-                    cache_path=db_path,
-                    report_path="/v1/runs/backtest/{backtest_id}/report",
-                    report_batch_path="/v1/runs/backtest/reports/batch",
-                    status_path="/v1/runs/backtest/{backtest_id}",
-                    data_download_path="/v1/runs/backtest/{backtest_id}/download_data",
-                    runs_path="/v1/runs",
-                    max_page_size=50,
-                ),
-                backtest_headers=lambda: {},
-                ensure_backtest_routable=lambda backtest_id, allow_running_only=True: {
-                    "backtest_api_base": "http://dummy"
-                },
-                update_mapping=lambda backtest_id, updates: None,
-                load_run_spec_payload=lambda backtest_id: {},
-            )
-            service.init_cache()
+    app = FastAPI()
+    app.include_router(
+        build_report_router(
+            get_report_service=lambda: service,
+            read_mapping=lambda: dict(mapping),
+            mapping_lock=lock,
+        )
+    )
+    return app
 
-            backtest_id_new = "20260204T000000Z_new"
-            backtest_id_old = "20260203T000000Z_old"
-            backtest_id_skip = "20260202T000000Z_skip"
 
-            mapping = {
-                backtest_id_new: {
-                    "backtest_api_base": "http://docker-a",
-                    "created_at": "2026-02-04T00:00:00Z",
-                    "requested_by": "alice",
-                },
-                backtest_id_old: {
-                    "backtest_api_base": "http://docker-b",
-                    "created_at": "2026-02-03T00:00:00Z",
-                    "requested_by": "alice",
-                },
-                backtest_id_skip: {
-                    "backtest_api_base": "http://docker-c",
-                    "created_at": "2026-02-02T00:00:00Z",
-                    "requested_by": "alice",
-                },
-            }
+class TestListBacktestIds(unittest.TestCase):
+    def test_filters_by_submitted_at_range(self) -> None:
+        mapping = {
+            "id_1": {"submitted_at": "2026-02-01T00:00:00Z", "backtest_api_base": "http://a"},
+            "id_2": {"submitted_at": "2026-02-03T00:00:00Z", "backtest_api_base": "http://a"},
+            "id_3": {"submitted_at": "2026-02-05T00:00:00Z", "backtest_api_base": "http://a"},
+            "id_queued": {"status": "queued"},  # no submitted_at
+        }
+        client = TestClient(make_app(mapping))
 
-            cached_report = {
-                "report_available": True,
-                "backtest_id": backtest_id_old,
-                "requested_by": "alice",
-            }
-            service.cache.upsert(
-                backtest_id_old,
-                cached_report,
-                "alice",
-                "2026-02-03T00:00:00Z",
-            )
+        resp = client.get(
+            "/runs/backtest/ids",
+            params={"submitted_after": "2026-02-02T00:00:00Z", "submitted_before": "2026-02-04T00:00:00Z"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["backtest_ids"], ["id_2"])
 
-            def batch_fetcher(base_url: str, backtest_ids: list[str]) -> dict[str, dict[str, Any]]:
-                if base_url == "http://docker-b":
-                    raise AssertionError("cached report should avoid batch fetch")
-                if base_url == "http://docker-a":
-                    if backtest_id_new in backtest_ids:
-                        return {
-                            backtest_id_new: {
-                                "report_available": True,
-                                "backtest_id": backtest_id_new,
-                                "requested_by": "alice",
-                            }
-                        }
-                return {}
+    def test_no_filters_returns_all_submitted(self) -> None:
+        mapping = {
+            "id_a": {"submitted_at": "2026-02-01T00:00:00Z"},
+            "id_b": {"submitted_at": "2026-02-02T00:00:00Z"},
+            "id_queued": {"status": "queued"},
+        }
+        client = TestClient(make_app(mapping))
 
-            service.fetch_reports_batch = batch_fetcher  # type: ignore[method-assign]
+        resp = client.get("/runs/backtest/ids")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["count"], 2)
+        # sorted by submitted_at desc
+        self.assertEqual(data["backtest_ids"], ["id_b", "id_a"])
 
-            items = service.get_report_page(
-                page=1,
-                limit=2,
-                requested_by="alice",
-                mapping=mapping,
-            )
+    def test_invalid_datetime_returns_400(self) -> None:
+        client = TestClient(make_app({}))
+        resp = client.get("/runs/backtest/ids", params={"submitted_after": "bad"})
+        self.assertEqual(resp.status_code, 400)
 
-            self.assertEqual(len(items), 2)
-            self.assertEqual(items[0]["backtest_id"], backtest_id_new)
-            self.assertEqual(items[1]["backtest_id"], backtest_id_old)
+    def test_after_gte_before_returns_400(self) -> None:
+        client = TestClient(make_app({}))
+        resp = client.get(
+            "/runs/backtest/ids",
+            params={"submitted_after": "2026-02-05T00:00:00Z", "submitted_before": "2026-02-01T00:00:00Z"},
+        )
+        self.assertEqual(resp.status_code, 400)
 
-            cached_new = service.cache.get(backtest_id_new)
-            self.assertIsNotNone(cached_new)
 
-    def test_get_report_caches_non_running_unavailable_as_negative(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            db_path = Path(td) / "report_cache.sqlite3"
-            service = ReportService(
-                ReportServiceConfig(
-                    cache_path=db_path,
-                    report_path="/v1/runs/backtest/{backtest_id}/report",
-                    report_batch_path="/v1/runs/backtest/reports/batch",
-                    status_path="/v1/runs/backtest/{backtest_id}",
-                    data_download_path="/v1/runs/backtest/{backtest_id}/download_data",
-                    runs_path="/v1/runs",
-                    max_page_size=50,
-                ),
-                backtest_headers=lambda: {},
-                ensure_backtest_routable=lambda backtest_id, allow_running_only=True: {
-                    "backtest_api_base": "http://docker-a",
-                    "created_at": "2026-02-04T00:00:00Z",
-                    "requested_by": "alice",
-                },
-                update_mapping=lambda backtest_id, updates: None,
-                load_run_spec_payload=lambda backtest_id: {},
-            )
-            service.init_cache()
+class TestBatchGetReports(unittest.TestCase):
+    def test_groups_by_base_and_returns_reports(self) -> None:
+        mapping = {
+            "id_1": {"backtest_api_base": "http://a", "submitted_at": "2026-02-01T00:00:00Z"},
+            "id_2": {"backtest_api_base": "http://a", "submitted_at": "2026-02-02T00:00:00Z"},
+            "id_3": {"backtest_api_base": "http://b", "submitted_at": "2026-02-03T00:00:00Z"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/v1/runs/backtest/reports/batch"),
+            backtest_headers=lambda: {},
+        )
 
-            backtest_id = "20260204T000000Z_finished"
-            calls = {"report": 0, "status": 0}
+        def mock_batch(base_url: str, bids: list[str]) -> dict[str, dict[str, Any]]:
+            return {bid: {"pnl": 100, "sharpe": 1.5} for bid in bids}
 
-            def report_fetcher(base_url: str, requested_backtest_id: str) -> dict[str, Any]:
-                calls["report"] += 1
-                self.assertEqual(base_url, "http://docker-a")
-                self.assertEqual(requested_backtest_id, backtest_id)
-                return {"report_available": False, "backtest_id": requested_backtest_id}
+        service.fetch_reports_batch = mock_batch  # type: ignore[method-assign]
 
-            def status_fetcher(base_url: str, requested_backtest_id: str) -> dict[str, Any]:
-                calls["status"] += 1
-                self.assertEqual(base_url, "http://docker-a")
-                self.assertEqual(requested_backtest_id, backtest_id)
-                return {"status": "finished"}
+        client = TestClient(make_app(mapping, service))
+        resp = client.post("/runs/backtest/reports", json={"backtest_ids": ["id_1", "id_2", "id_3"]})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["count"], 3)
+        self.assertEqual(data["not_found"], [])
+        self.assertEqual(data["errors"], {})
 
-            service.fetch_report = report_fetcher  # type: ignore[method-assign]
-            service.fetch_status = status_fetcher  # type: ignore[method-assign]
+        self.assertEqual(data["results"]["id_1"]["backtest_api_base"], "http://a")
+        self.assertEqual(data["results"]["id_3"]["backtest_api_base"], "http://b")
+        self.assertIn("report", data["results"]["id_1"])
 
-            with self.assertRaises(ReportNotFound):
-                service.get_report(backtest_id, allow_running_only=False)
+    def test_not_found_ids(self) -> None:
+        mapping = {
+            "id_1": {"backtest_api_base": "http://a"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/v1/runs/backtest/reports/batch"),
+            backtest_headers=lambda: {},
+        )
+        service.fetch_reports_batch = lambda base_url, bids: {bid: {"pnl": 0} for bid in bids}  # type: ignore[method-assign]
 
-            self.assertEqual(calls["report"], 1)
-            self.assertEqual(calls["status"], 1)
-            cached = service.cache.get(backtest_id)
-            self.assertIsNotNone(cached)
-            self.assertEqual(cached.get("report_available"), False)
-            self.assertEqual(cached.get("status"), "finished")
+        client = TestClient(make_app(mapping, service))
+        resp = client.post("/runs/backtest/reports", json={"backtest_ids": ["id_1", "id_missing"]})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["count"], 1)
+        self.assertIn("id_missing", data["not_found"])
 
-            service.fetch_report = (  # type: ignore[method-assign]
-                lambda base_url, requested_backtest_id: (_ for _ in ()).throw(AssertionError("should use cache"))
-            )
-            service.fetch_status = (  # type: ignore[method-assign]
-                lambda base_url, requested_backtest_id: (_ for _ in ()).throw(AssertionError("should use cache"))
-            )
-            with self.assertRaises(ReportNotFound):
-                service.get_report(backtest_id, allow_running_only=False)
-
-    def test_get_report_running_unavailable_not_cached(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            db_path = Path(td) / "report_cache.sqlite3"
-            service = ReportService(
-                ReportServiceConfig(
-                    cache_path=db_path,
-                    report_path="/v1/runs/backtest/{backtest_id}/report",
-                    report_batch_path="/v1/runs/backtest/reports/batch",
-                    status_path="/v1/runs/backtest/{backtest_id}",
-                    data_download_path="/v1/runs/backtest/{backtest_id}/download_data",
-                    runs_path="/v1/runs",
-                    max_page_size=50,
-                ),
-                backtest_headers=lambda: {},
-                ensure_backtest_routable=lambda backtest_id, allow_running_only=True: {
-                    "backtest_api_base": "http://docker-a",
-                    "created_at": "2026-02-04T00:00:00Z",
-                },
-                update_mapping=lambda backtest_id, updates: None,
-                load_run_spec_payload=lambda backtest_id: {},
-            )
-            service.init_cache()
-
-            backtest_id = "20260204T000000Z_running"
-            calls = {"report": 0, "status": 0}
-
-            def report_fetcher(base_url: str, requested_backtest_id: str) -> dict[str, Any]:
-                calls["report"] += 1
-                return {"report_available": False, "backtest_id": requested_backtest_id}
-
-            def status_fetcher(base_url: str, requested_backtest_id: str) -> dict[str, Any]:
-                calls["status"] += 1
-                return {"status": "running"}
-
-            service.fetch_report = report_fetcher  # type: ignore[method-assign]
-            service.fetch_status = status_fetcher  # type: ignore[method-assign]
-
-            with self.assertRaises(ReportNotReady):
-                service.get_report(backtest_id, allow_running_only=False)
-            self.assertIsNone(service.cache.get(backtest_id))
-
-            with self.assertRaises(ReportNotReady):
-                service.get_report(backtest_id, allow_running_only=False)
-
-            self.assertEqual(calls["report"], 2)
-            self.assertEqual(calls["status"], 2)
-
-    def test_report_page_skips_negative_cache_records(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            db_path = Path(td) / "report_cache.sqlite3"
-            service = ReportService(
-                ReportServiceConfig(
-                    cache_path=db_path,
-                    report_path="/v1/runs/backtest/{backtest_id}/report",
-                    report_batch_path="/v1/runs/backtest/reports/batch",
-                    status_path="/v1/runs/backtest/{backtest_id}",
-                    data_download_path="/v1/runs/backtest/{backtest_id}/download_data",
-                    runs_path="/v1/runs",
-                    max_page_size=50,
-                ),
-                backtest_headers=lambda: {},
-                ensure_backtest_routable=lambda backtest_id, allow_running_only=True: {
-                    "backtest_api_base": "http://dummy"
-                },
-                update_mapping=lambda backtest_id, updates: None,
-                load_run_spec_payload=lambda backtest_id: {},
-            )
-            service.init_cache()
-
-            positive_id = "20260205T000000Z_positive"
-            negative_id = "20260204T000000Z_negative"
-            mapping = {
-                positive_id: {
-                    "backtest_api_base": "http://docker-a",
-                    "created_at": "2026-02-05T00:00:00Z",
-                },
-                negative_id: {
-                    "backtest_api_base": "http://docker-a",
-                    "created_at": "2026-02-04T00:00:00Z",
-                },
-            }
-
-            service.cache.upsert(
-                positive_id,
-                {"report_available": True, "backtest_id": positive_id},
-                None,
-                "2026-02-05T00:00:00Z",
-            )
-            service.cache.upsert(
-                negative_id,
-                {"report_available": False, "backtest_id": negative_id, "status": "failed"},
-                None,
-                "2026-02-04T00:00:00Z",
-            )
-
-            items = service.get_report_page(page=1, limit=10, requested_by=None, mapping=mapping)
-            self.assertEqual(len(items), 1)
-            self.assertEqual(items[0]["backtest_id"], positive_id)
+    def test_empty_backtest_ids_returns_400(self) -> None:
+        client = TestClient(make_app({}))
+        resp = client.post("/runs/backtest/reports", json={"backtest_ids": []})
+        self.assertEqual(resp.status_code, 400)
