@@ -27,6 +27,7 @@ from services.report_service import (
     ReportService,
     ReportServiceConfig,
 )
+
 from services.scheduler import (
     parse_backtest_api_bases,
     required_memory_gb_from_run_spec,
@@ -65,23 +66,10 @@ async def on_startup() -> None:
     global report_service
     report_service = ReportService(
         ReportServiceConfig(
-            cache_path=REPORT_CACHE_PATH,
-            report_path=BACKTEST_REPORT_PATH,
             report_batch_path=BACKTEST_REPORT_BATCH_PATH,
-            status_path=BACKTEST_STATUS_PATH,
-            data_download_path=BACKTEST_DATA_DOWNLOAD_PATH,
-            runs_path=BACKTEST_RUNS_PATH,
-            max_page_size=MAX_REPORT_PAGE_SIZE,
         ),
         backtest_headers=backtest_headers,
-        ensure_backtest_routable=ensure_backtest_routable,
-        update_mapping=update_mapping,
-        load_run_spec_payload=load_run_spec_payload,
     )
-    try:
-        report_service.init_cache()
-    except Exception as exc:
-        logger.exception("report_cache_init_failed error=%s", exc)
     # Start background scheduler for queued submissions.
     asyncio.create_task(queue_scheduler())
 
@@ -462,18 +450,9 @@ def get_report_service() -> ReportService:
     if report_service is None:
         report_service = ReportService(
             ReportServiceConfig(
-                cache_path=REPORT_CACHE_PATH,
-                report_path=BACKTEST_REPORT_PATH,
                 report_batch_path=BACKTEST_REPORT_BATCH_PATH,
-                status_path=BACKTEST_STATUS_PATH,
-                data_download_path=BACKTEST_DATA_DOWNLOAD_PATH,
-                runs_path=BACKTEST_RUNS_PATH,
-                max_page_size=MAX_REPORT_PAGE_SIZE,
             ),
             backtest_headers=backtest_headers,
-            ensure_backtest_routable=ensure_backtest_routable,
-            update_mapping=update_mapping,
-            load_run_spec_payload=load_run_spec_payload,
         )
     return report_service
 
@@ -523,8 +502,6 @@ app.include_router(
         get_report_service=get_report_service,
         read_mapping=read_mapping,
         mapping_lock=MAPPING_LOCK,
-        max_report_page_size=MAX_REPORT_PAGE_SIZE,
-        active_base_urls=get_active_base_urls,
     )
 )
 
