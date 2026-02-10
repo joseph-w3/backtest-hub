@@ -146,3 +146,23 @@ class TestReportServiceStreaming(unittest.TestCase):
         
         mock_response.aclose.assert_awaited()
         mock_client.aclose.assert_awaited()
+
+    def test_download_logs_invalid_id(self):
+        client = self.make_client()
+        # Test dots
+        resp = client.get("/runs/backtest/test.id/logs/download")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("invalid characters", resp.json()["detail"])
+        
+        # Test backslash
+        resp = client.get("/runs/backtest/test\\id/logs/download")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_download_code_invalid_id(self):
+        client = self.make_client()
+        resp = client.get("/runs/backtest/id_with_forward/slash/download_code")
+        # This will actually 404 because of extra segment, but let's test a valid segment with invalid char
+        resp = client.get("/runs/backtest/test.zip/download_code")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("invalid characters", resp.json()["detail"])
+

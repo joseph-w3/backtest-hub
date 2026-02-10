@@ -44,6 +44,11 @@ def normalize_join_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/" + path.lstrip("/")
 
 
+def validate_backtest_id(backtest_id: str) -> None:
+    if not backtest_id or any(ch in backtest_id for ch in ("\\", "/", ".")):
+        raise HTTPException(status_code=400, detail="backtest_id has invalid characters")
+
+
 def parse_iso8601(value: str) -> datetime:
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
@@ -261,6 +266,7 @@ def build_report_router(
 
     @router.get("/runs/backtest/{backtest_id}/logs/download")
     async def download_logs_endpoint(backtest_id: str) -> StreamingResponse:
+        validate_backtest_id(backtest_id)
         with mapping_lock:
             mapping = read_mapping()
             entry = mapping.get(backtest_id)
@@ -288,19 +294,23 @@ def build_report_router(
                 
                 await response.aclose()
                 await client.aclose()
+                client = None # Guard against double close in except block
                 raise HTTPException(status_code=response.status_code, detail=f"Failed to download logs: {detail}")
 
             async def stream_with_cleanup():
+                nonlocal client, response
                 try:
                     async for chunk in response.aiter_bytes():
                         yield chunk
                 except Exception:
-                    # Log error during streaming if needed
                     LOGGER.error(f"stream_error backtest_id={backtest_id}", exc_info=True)
                     raise
                 finally:
-                    await response.aclose()
-                    await client.aclose()
+                    if response:
+                        await response.aclose()
+                    if client:
+                        await client.aclose()
+                    client = None # Mark as closed
 
             return StreamingResponse(
                 stream_with_cleanup(),
@@ -320,6 +330,7 @@ def build_report_router(
 
     @router.get("/runs/backtest/{backtest_id}/download_code")
     async def download_code_endpoint(backtest_id: str) -> StreamingResponse:
+        validate_backtest_id(backtest_id)
         with mapping_lock:
             mapping = read_mapping()
             entry = mapping.get(backtest_id)
@@ -346,9 +357,11 @@ def build_report_router(
                     
                 await response.aclose()
                 await client.aclose()
+                client = None # Guard against double close
                 raise HTTPException(status_code=response.status_code, detail=f"Failed to download code: {detail}")
 
             async def stream_with_cleanup():
+                nonlocal client, response
                 try:
                     async for chunk in response.aiter_bytes():
                         yield chunk
@@ -356,8 +369,11 @@ def build_report_router(
                     LOGGER.error(f"stream_error backtest_id={backtest_id}", exc_info=True)
                     raise
                 finally:
-                    await response.aclose()
-                    await client.aclose()
+                    if response:
+                        await response.aclose()
+                    if client:
+                        await client.aclose()
+                    client = None # Mark closed
 
             return StreamingResponse(
                 stream_with_cleanup(),
