@@ -17,6 +17,8 @@ ENV/
 .env
 .env.*
 
+tmp/
+
 # Test/coverage/cache
 .pytest_cache/
 .mypy_cache/
