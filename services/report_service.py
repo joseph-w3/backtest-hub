@@ -139,13 +139,13 @@ class ReportService:
     async def download_logs(self, base_url: str, backtest_id: str) -> tuple[httpx.AsyncClient, httpx.Response]:
         return await self._create_download_request(
             base_url, 
-            f"/runs/backtest/{backtest_id}/logs/download"
+            f"/v1/runs/backtest/{backtest_id}/logs/download"
         )
 
     async def download_code(self, base_url: str, backtest_id: str) -> tuple[httpx.AsyncClient, httpx.Response]:
         return await self._create_download_request(
             base_url, 
-            f"/runs/backtest/{backtest_id}/download_code"
+            f"/v1/runs/backtest/{backtest_id}/download_code"
         )
 
 

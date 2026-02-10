@@ -9,6 +9,7 @@
 - Added `backtest_id` input validation to prevent SSRF and path injection risks.
 - Deleted redundant `services/report_service_bak.py`.
 - Added timeout configuration to `httpx.AsyncClient` for report downloads.
+- Fixed 404 error in `download_logs` and `download_code` by adding missing `/v1` prefix to upstream URLs.
 
 
 ## [Unreleased]
