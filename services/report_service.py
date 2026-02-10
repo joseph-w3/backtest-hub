@@ -7,10 +7,11 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, AsyncIterator
+import httpx
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 LOGGER = logging.getLogger("backtest_hub.report_service")
@@ -113,6 +114,28 @@ class ReportService:
             base_url, len(backtest_ids), len(results),
         )
         return results
+
+    async def download_logs(self, base_url: str, backtest_id: str) -> AsyncIterator[bytes]:
+        url = normalize_join_url(base_url, f"/runs/backtest/{backtest_id}/logs/download")
+        headers = dict(self._backtest_headers())
+        
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.status_code != 200:
+                    raise ReportHttpError(response.status_code, f"Failed to download logs: {response.text}")
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+    async def download_code(self, base_url: str, backtest_id: str) -> AsyncIterator[bytes]:
+        url = normalize_join_url(base_url, f"/runs/backtest/{backtest_id}/download_code")
+        headers = dict(self._backtest_headers())
+        
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.status_code != 200:
+                    raise ReportHttpError(response.status_code, f"Failed to download code: {response.text}")
+                async for chunk in response.aiter_bytes():
+                     yield chunk
 
 
 class BatchReportsRequest(BaseModel):
@@ -229,5 +252,57 @@ def build_report_router(
             "not_found": not_found,
             "errors": errors,
         })
+
+    @router.get("/runs/backtest/{backtest_id}/logs/download")
+    async def download_logs_endpoint(backtest_id: str) -> StreamingResponse:
+        with mapping_lock:
+            mapping = read_mapping()
+            entry = mapping.get(backtest_id)
+        
+        if not entry or not isinstance(entry, dict):
+            raise HTTPException(status_code=404, detail="Backtest not found")
+            
+        base_url = entry.get("backtest_api_base")
+        if not isinstance(base_url, str) or not base_url:
+             raise HTTPException(status_code=404, detail="Backtest API base not found")
+
+        service = get_report_service()
+        try:
+            return StreamingResponse(
+                service.download_logs(base_url, backtest_id),
+                media_type="text/plain",
+                headers={"Content-Disposition": f'attachment; filename="{backtest_id}.log"'}
+            )
+        except ReportServiceError as e:
+             raise HTTPException(status_code=getattr(e, "status_code", 500), detail=str(e))
+        except Exception as e:
+             LOGGER.error(f"download_logs_error backtest_id={backtest_id} error={e}")
+             raise HTTPException(status_code=500, detail="Internal server error")
+
+    @router.get("/runs/backtest/{backtest_id}/download_code")
+    async def download_code_endpoint(backtest_id: str) -> StreamingResponse:
+        with mapping_lock:
+            mapping = read_mapping()
+            entry = mapping.get(backtest_id)
+        
+        if not entry or not isinstance(entry, dict):
+            raise HTTPException(status_code=404, detail="Backtest not found")
+            
+        base_url = entry.get("backtest_api_base")
+        if not isinstance(base_url, str) or not base_url:
+             raise HTTPException(status_code=404, detail="Backtest API base not found")
+
+        service = get_report_service()
+        try:
+            return StreamingResponse(
+                service.download_code(base_url, backtest_id),
+                media_type="application/zip",
+                headers={"Content-Disposition": f'attachment; filename="{backtest_id}_code.zip"'}
+            )
+        except ReportServiceError as e:
+             raise HTTPException(status_code=getattr(e, "status_code", 500), detail=str(e))
+        except Exception as e:
+             LOGGER.error(f"download_code_error backtest_id={backtest_id} error={e}")
+             raise HTTPException(status_code=500, detail="Internal server error")
 
     return router
