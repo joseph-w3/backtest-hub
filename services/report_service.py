@@ -115,27 +115,33 @@ class ReportService:
         )
         return results
 
-    async def download_logs(self, base_url: str, backtest_id: str) -> AsyncIterator[bytes]:
-        url = normalize_join_url(base_url, f"/runs/backtest/{backtest_id}/logs/download")
+    async def _create_download_request(self, base_url: str, path: str) -> tuple[httpx.AsyncClient, httpx.Response]:
+        url = normalize_join_url(base_url, path)
         headers = dict(self._backtest_headers())
         
-        async with httpx.AsyncClient() as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                if response.status_code != 200:
-                    raise ReportHttpError(response.status_code, f"Failed to download logs: {response.text}")
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+        # Increased timeout for downloads
+        timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+        client = httpx.AsyncClient(timeout=timeout)
+        
+        try:
+            req = client.build_request("GET", url, headers=headers)
+            response = await client.send(req, stream=True)
+            return client, response
+        except Exception:
+            await client.aclose()
+            raise
 
-    async def download_code(self, base_url: str, backtest_id: str) -> AsyncIterator[bytes]:
-        url = normalize_join_url(base_url, f"/runs/backtest/{backtest_id}/download_code")
-        headers = dict(self._backtest_headers())
-        
-        async with httpx.AsyncClient() as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                if response.status_code != 200:
-                    raise ReportHttpError(response.status_code, f"Failed to download code: {response.text}")
-                async for chunk in response.aiter_bytes():
-                     yield chunk
+    async def download_logs(self, base_url: str, backtest_id: str) -> tuple[httpx.AsyncClient, httpx.Response]:
+        return await self._create_download_request(
+            base_url, 
+            f"/runs/backtest/{backtest_id}/logs/download"
+        )
+
+    async def download_code(self, base_url: str, backtest_id: str) -> tuple[httpx.AsyncClient, httpx.Response]:
+        return await self._create_download_request(
+            base_url, 
+            f"/runs/backtest/{backtest_id}/download_code"
+        )
 
 
 class BatchReportsRequest(BaseModel):
@@ -267,17 +273,50 @@ def build_report_router(
              raise HTTPException(status_code=404, detail="Backtest API base not found")
 
         service = get_report_service()
+        client = None
+        response = None
         try:
+            client, response = await service.download_logs(base_url, backtest_id)
+            
+            if response.status_code != 200:
+                # Read body before closing to provide error detail
+                try:
+                    body = await response.aread()
+                    detail = body.decode("utf-8", errors="replace")
+                except Exception:
+                    detail = "Unknown error"
+                
+                await response.aclose()
+                await client.aclose()
+                raise HTTPException(status_code=response.status_code, detail=f"Failed to download logs: {detail}")
+
+            async def stream_with_cleanup():
+                try:
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+                except Exception:
+                    # Log error during streaming if needed
+                    LOGGER.error(f"stream_error backtest_id={backtest_id}", exc_info=True)
+                    raise
+                finally:
+                    await response.aclose()
+                    await client.aclose()
+
             return StreamingResponse(
-                service.download_logs(base_url, backtest_id),
+                stream_with_cleanup(),
                 media_type="text/plain",
                 headers={"Content-Disposition": f'attachment; filename="{backtest_id}.log"'}
             )
-        except ReportServiceError as e:
-             raise HTTPException(status_code=getattr(e, "status_code", 500), detail=str(e))
+
+        except HTTPException:
+            if client:
+                await client.aclose()
+            raise
         except Exception as e:
-             LOGGER.error(f"download_logs_error backtest_id={backtest_id} error={e}")
-             raise HTTPException(status_code=500, detail="Internal server error")
+            if client:
+                await client.aclose()
+            LOGGER.error(f"download_logs_error backtest_id={backtest_id} error={e}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
     @router.get("/runs/backtest/{backtest_id}/download_code")
     async def download_code_endpoint(backtest_id: str) -> StreamingResponse:
@@ -293,16 +332,47 @@ def build_report_router(
              raise HTTPException(status_code=404, detail="Backtest API base not found")
 
         service = get_report_service()
+        client = None
+        response = None
         try:
+            client, response = await service.download_code(base_url, backtest_id)
+
+            if response.status_code != 200:
+                try:
+                    body = await response.aread()
+                    detail = body.decode("utf-8", errors="replace")
+                except Exception:
+                    detail = "Unknown error"
+                    
+                await response.aclose()
+                await client.aclose()
+                raise HTTPException(status_code=response.status_code, detail=f"Failed to download code: {detail}")
+
+            async def stream_with_cleanup():
+                try:
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+                except Exception:
+                    LOGGER.error(f"stream_error backtest_id={backtest_id}", exc_info=True)
+                    raise
+                finally:
+                    await response.aclose()
+                    await client.aclose()
+
             return StreamingResponse(
-                service.download_code(base_url, backtest_id),
+                stream_with_cleanup(),
                 media_type="application/zip",
                 headers={"Content-Disposition": f'attachment; filename="{backtest_id}_code.zip"'}
             )
-        except ReportServiceError as e:
-             raise HTTPException(status_code=getattr(e, "status_code", 500), detail=str(e))
+
+        except HTTPException:
+            if client:
+                await client.aclose()
+            raise
         except Exception as e:
-             LOGGER.error(f"download_code_error backtest_id={backtest_id} error={e}")
-             raise HTTPException(status_code=500, detail="Internal server error")
+            if client:
+                 await client.aclose()
+            LOGGER.error(f"download_code_error backtest_id={backtest_id} error={e}")
+            raise HTTPException(status_code=500, detail="Internal server error")
 
     return router
