@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import secrets
 import shutil
 import sys
@@ -20,6 +21,7 @@ from quant_trade_v1.backtest.config import BacktestDataConfig
 from quant_trade_v1.backtest.config import BacktestEngineConfig
 from quant_trade_v1.backtest.config import BacktestRunConfig
 from quant_trade_v1.backtest.config import BacktestVenueConfig
+from quant_trade_v1.backtest.config import ImportableFillModelConfig
 from quant_trade_v1.backtest.config import ImportableLatencyModelConfig
 from quant_trade_v1.backtest.config import MarginModelConfig
 from quant_trade_v1.backtest.node import BacktestNode
@@ -93,6 +95,9 @@ OPTIONAL_FIELDS = {
     "starting_balances_futures",
     "strategy_file",
     "strategy_bundle",
+    "liquidity_consumption",
+    "trade_execution",
+    "fill_model_config",
 }
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
@@ -139,6 +144,14 @@ def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> tuple[Path | None
         _parse_starting_balances("starting_balances_spot", run_spec["starting_balances_spot"])
     if "starting_balances_futures" in run_spec:
         _parse_starting_balances("starting_balances_futures", run_spec["starting_balances_futures"])
+    if "liquidity_consumption" in run_spec:
+        if not isinstance(run_spec["liquidity_consumption"], bool):
+            raise ValueError("RunSpec liquidity_consumption must be a boolean.")
+    if "trade_execution" in run_spec:
+        if not isinstance(run_spec["trade_execution"], bool):
+            raise ValueError("RunSpec trade_execution must be a boolean.")
+    if "fill_model_config" in run_spec:
+        _validate_fill_model_config(run_spec["fill_model_config"])
 
     for field in ("strategy_entry", "strategy_config_path"):
         value = run_spec[field]
@@ -223,6 +236,35 @@ def _parse_starting_balances(field: str, value: object | None) -> list[str]:
             raise ValueError(f"RunSpec {field} must contain non-empty strings.")
         parsed.append(item.strip())
     return parsed
+
+
+_FILL_MODEL_CONFIG_REQUIRED_KEYS = {"fill_model_path", "config_path", "config"}
+_IMPORT_PATH_RE = re.compile(r"^[\w]+(\.[\w]+)*:[\w]+$")
+
+
+def _validate_fill_model_config(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("RunSpec fill_model_config must be an object.")
+    missing = _FILL_MODEL_CONFIG_REQUIRED_KEYS - set(value.keys())
+    if missing:
+        raise ValueError(f"RunSpec fill_model_config missing required keys: {sorted(missing)}")
+    unknown = set(value.keys()) - _FILL_MODEL_CONFIG_REQUIRED_KEYS
+    if unknown:
+        raise ValueError(f"RunSpec fill_model_config has unknown keys: {sorted(unknown)}")
+    for key in ("fill_model_path", "config_path"):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            raise ValueError(f"RunSpec fill_model_config.{key} must be a non-empty string.")
+        path = value[key].strip()
+        if not _IMPORT_PATH_RE.match(path):
+            raise ValueError(
+                f"RunSpec fill_model_config.{key} must be 'module.path:ClassName' format."
+            )
+        if not path.startswith("quant_trade_v1."):
+            raise ValueError(
+                f"RunSpec fill_model_config.{key} must start with 'quant_trade_v1.'."
+            )
+    if not isinstance(value.get("config"), dict):
+        raise ValueError("RunSpec fill_model_config.config must be an object.")
 
 
 def _validate_time_order(start: str | int, end: str | int) -> None:
@@ -998,6 +1040,19 @@ def main() -> int:
 
         strategy_config = dict(run_spec["strategy_config"])
         book_type = DEFAULT_BOOK_TYPE
+
+        liquidity_consumption = run_spec.get("liquidity_consumption", False)
+        trade_execution = run_spec.get("trade_execution", False)
+
+        fill_model_config = None
+        raw_fill_model = run_spec.get("fill_model_config")
+        if raw_fill_model is not None:
+            fill_model_config = ImportableFillModelConfig(
+                fill_model_path=raw_fill_model["fill_model_path"],
+                config_path=raw_fill_model["config_path"],
+                config=raw_fill_model["config"],
+            )
+
         venues_configs: list[BacktestVenueConfig] = []
         if spot_instruments:
             venues_configs.append(
@@ -1009,6 +1064,9 @@ def main() -> int:
                     starting_balances=starting_balances_spot,
                     book_type=book_type,
                     latency_model=latency_model_config,
+                    fill_model=fill_model_config,
+                    liquidity_consumption=liquidity_consumption,
+                    trade_execution=trade_execution,
                 )
             )
         if futures_instruments:
@@ -1022,6 +1080,9 @@ def main() -> int:
                     book_type=book_type,
                     margin_model=MarginModelConfig(model_type="leveraged"),
                     latency_model=latency_model_config,
+                    fill_model=fill_model_config,
+                    liquidity_consumption=liquidity_consumption,
+                    trade_execution=trade_execution,
                 )
             )
 

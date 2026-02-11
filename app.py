@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import uuid
 import threading
@@ -226,6 +227,9 @@ OPTIONAL_FIELDS = {
     "starting_balances_futures",
     "strategy_file",
     "strategy_bundle",
+    "liquidity_consumption",
+    "trade_execution",
+    "fill_model_config",
 }
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
@@ -342,6 +346,15 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
             "starting_balances_futures", payload["starting_balances_futures"]
         )
 
+    if "liquidity_consumption" in payload:
+        if not isinstance(payload["liquidity_consumption"], bool):
+            raise ValueError("liquidity_consumption must be a boolean")
+    if "trade_execution" in payload:
+        if not isinstance(payload["trade_execution"], bool):
+            raise ValueError("trade_execution must be a boolean")
+    if "fill_model_config" in payload:
+        payload["fill_model_config"] = parse_fill_model_config(payload["fill_model_config"])
+
     start_value = payload["start"]
     end_value = payload["end"]
     if isinstance(start_value, (int, float)) and isinstance(end_value, (int, float)):
@@ -385,6 +398,12 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
         sanitized["starting_balances_spot"] = payload["starting_balances_spot"]
     if "starting_balances_futures" in payload:
         sanitized["starting_balances_futures"] = payload["starting_balances_futures"]
+    if "liquidity_consumption" in payload:
+        sanitized["liquidity_consumption"] = payload["liquidity_consumption"]
+    if "trade_execution" in payload:
+        sanitized["trade_execution"] = payload["trade_execution"]
+    if "fill_model_config" in payload:
+        sanitized["fill_model_config"] = payload["fill_model_config"]
     return sanitized
 
 
@@ -402,6 +421,42 @@ def parse_latency_config(value: object) -> dict[str, int]:
             raise ValueError(f"latency_config.{key} must be a non-negative integer")
         parsed[str(key)] = raw
     return parsed
+
+
+FILL_MODEL_CONFIG_REQUIRED_KEYS = {"fill_model_path", "config_path", "config"}
+_IMPORT_PATH_RE = re.compile(r"^[\w]+(\.[\w]+)*:[\w]+$")
+
+
+def parse_fill_model_config(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("fill_model_config must be an object")
+    missing = FILL_MODEL_CONFIG_REQUIRED_KEYS - set(value.keys())
+    if missing:
+        raise ValueError(f"fill_model_config missing required keys: {sorted(missing)}")
+    unknown = set(value.keys()) - FILL_MODEL_CONFIG_REQUIRED_KEYS
+    if unknown:
+        raise ValueError(f"fill_model_config has unknown keys: {sorted(unknown)}")
+    if not isinstance(value["fill_model_path"], str) or not value["fill_model_path"].strip():
+        raise ValueError("fill_model_config.fill_model_path must be a non-empty string")
+    if not isinstance(value["config_path"], str) or not value["config_path"].strip():
+        raise ValueError("fill_model_config.config_path must be a non-empty string")
+    if not isinstance(value["config"], dict):
+        raise ValueError("fill_model_config.config must be an object")
+    for field in ("fill_model_path", "config_path"):
+        path = value[field].strip()
+        if not _IMPORT_PATH_RE.match(path):
+            raise ValueError(
+                f"fill_model_config.{field} must be 'module.path:ClassName' format"
+            )
+        if not path.startswith("quant_trade_v1."):
+            raise ValueError(
+                f"fill_model_config.{field} must start with 'quant_trade_v1.'"
+            )
+    return {
+        "fill_model_path": value["fill_model_path"].strip(),
+        "config_path": value["config_path"].strip(),
+        "config": value["config"],
+    }
 
 
 def require_api_key(api_key: str | None) -> None:

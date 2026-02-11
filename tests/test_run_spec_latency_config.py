@@ -90,3 +90,102 @@ class TestRunSpecLatencyConfig(unittest.TestCase):
         payload.pop("strategy_file", None)
         with self.assertRaises(ValueError):
             app.validate_run_spec(payload)
+
+
+class TestRunSpecFillModelConfig(unittest.TestCase):
+    def test_liquidity_consumption_true(self) -> None:
+        payload = _base_payload()
+        payload["liquidity_consumption"] = True
+        sanitized = app.validate_run_spec(payload)
+        self.assertTrue(sanitized["liquidity_consumption"])
+
+    def test_liquidity_consumption_false(self) -> None:
+        payload = _base_payload()
+        payload["liquidity_consumption"] = False
+        sanitized = app.validate_run_spec(payload)
+        self.assertFalse(sanitized["liquidity_consumption"])
+
+    def test_liquidity_consumption_int_rejected(self) -> None:
+        payload = _base_payload()
+        payload["liquidity_consumption"] = 1
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_trade_execution_true(self) -> None:
+        payload = _base_payload()
+        payload["trade_execution"] = True
+        sanitized = app.validate_run_spec(payload)
+        self.assertTrue(sanitized["trade_execution"])
+
+    def test_trade_execution_string_rejected(self) -> None:
+        payload = _base_payload()
+        payload["trade_execution"] = "true"
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_fill_model_config_valid(self) -> None:
+        payload = _base_payload()
+        payload["fill_model_config"] = {
+            "fill_model_path": "quant_trade_v1.backtest.models:FillModel",
+            "config_path": "quant_trade_v1.backtest.config:FillModelConfig",
+            "config": {"prob_slippage": 0.1},
+        }
+        sanitized = app.validate_run_spec(payload)
+        self.assertEqual(
+            sanitized["fill_model_config"]["fill_model_path"],
+            "quant_trade_v1.backtest.models:FillModel",
+        )
+
+    def test_fill_model_config_missing_key_rejected(self) -> None:
+        payload = _base_payload()
+        payload["fill_model_config"] = {"fill_model_path": "quant_trade_v1.a:B"}
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_fill_model_config_unknown_key_rejected(self) -> None:
+        payload = _base_payload()
+        payload["fill_model_config"] = {
+            "fill_model_path": "quant_trade_v1.a:B",
+            "config_path": "quant_trade_v1.c:D",
+            "config": {},
+            "extra": True,
+        }
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_fill_model_config_empty_path_rejected(self) -> None:
+        payload = _base_payload()
+        payload["fill_model_config"] = {
+            "fill_model_path": "  ",
+            "config_path": "quant_trade_v1.c:D",
+            "config": {},
+        }
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_fill_model_config_bad_format_rejected(self) -> None:
+        payload = _base_payload()
+        payload["fill_model_config"] = {
+            "fill_model_path": "quant_trade_v1.no_class_name",
+            "config_path": "quant_trade_v1.backtest.config:FillModelConfig",
+            "config": {},
+        }
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_fill_model_config_non_quant_trade_rejected(self) -> None:
+        payload = _base_payload()
+        payload["fill_model_config"] = {
+            "fill_model_path": "os:system",
+            "config_path": "quant_trade_v1.backtest.config:FillModelConfig",
+            "config": {},
+        }
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_new_fields_absent_ok(self) -> None:
+        payload = _base_payload()
+        sanitized = app.validate_run_spec(payload)
+        self.assertNotIn("liquidity_consumption", sanitized)
+        self.assertNotIn("trade_execution", sanitized)
+        self.assertNotIn("fill_model_config", sanitized)
