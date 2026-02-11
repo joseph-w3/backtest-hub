@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 import secrets
 import shutil
 import sys
@@ -237,12 +238,31 @@ def _parse_starting_balances(field: str, value: object | None) -> list[str]:
     return parsed
 
 
+_FILL_MODEL_CONFIG_REQUIRED_KEYS = {"fill_model_path", "config_path", "config"}
+_IMPORT_PATH_RE = re.compile(r"^[\w]+(\.[\w]+)*:[\w]+$")
+
+
 def _validate_fill_model_config(value: object) -> None:
     if not isinstance(value, dict):
         raise ValueError("RunSpec fill_model_config must be an object.")
+    missing = _FILL_MODEL_CONFIG_REQUIRED_KEYS - set(value.keys())
+    if missing:
+        raise ValueError(f"RunSpec fill_model_config missing required keys: {sorted(missing)}")
+    unknown = set(value.keys()) - _FILL_MODEL_CONFIG_REQUIRED_KEYS
+    if unknown:
+        raise ValueError(f"RunSpec fill_model_config has unknown keys: {sorted(unknown)}")
     for key in ("fill_model_path", "config_path"):
         if not isinstance(value.get(key), str) or not value[key].strip():
             raise ValueError(f"RunSpec fill_model_config.{key} must be a non-empty string.")
+        path = value[key].strip()
+        if not _IMPORT_PATH_RE.match(path):
+            raise ValueError(
+                f"RunSpec fill_model_config.{key} must be 'module.path:ClassName' format."
+            )
+        if not path.startswith("quant_trade_v1."):
+            raise ValueError(
+                f"RunSpec fill_model_config.{key} must start with 'quant_trade_v1.'."
+            )
     if not isinstance(value.get("config"), dict):
         raise ValueError("RunSpec fill_model_config.config must be an object.")
 
