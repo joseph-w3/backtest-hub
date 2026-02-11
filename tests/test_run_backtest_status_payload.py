@@ -52,6 +52,7 @@ def _install_quant_trade_stubs() -> list[str]:
         "BacktestEngineConfig",
         "BacktestRunConfig",
         "BacktestVenueConfig",
+        "ImportableFillModelConfig",
         "ImportableLatencyModelConfig",
         "MarginModelConfig",
     ):
