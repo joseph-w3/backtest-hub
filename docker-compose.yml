@@ -26,6 +26,7 @@ services:
       CORS_MAX_AGE: ${CORS_MAX_AGE:-600}
       DATA_MOUNT_PATH: ${DATA_MOUNT_PATH:-/opt/backtest}
       RUN_STORAGE_PATH: ${RUN_STORAGE_PATH:-/opt/backtest/runs}
+      HUB_DB_PATH: ${HUB_DB_PATH:-/opt/backtest/hub.sqlite3}
       RUN_MAPPING_PATH: ${RUN_MAPPING_PATH:-/opt/backtest/run_mapping.json}
       QUEUE_PATH: ${QUEUE_PATH:-/opt/backtest/submit_queue.json}
       BACKTEST_RUNNER_PATH: ${BACKTEST_RUNNER_PATH:-/app/scripts/run_backtest.py}

@@ -34,6 +34,7 @@ from services.scheduler import (
     required_memory_gb_from_run_spec,
     select_backtest_docker,
 )
+from services.run_store_sqlite import SqliteRunStore
 
 app = FastAPI()
 report_service: "ReportService | None" = None
@@ -64,6 +65,16 @@ logger = setup_logging()
 @app.on_event("startup")
 async def on_startup() -> None:
     logger.info("app_started")
+    logger.info(
+        "run_store_startup_check db_path=%s legacy_mapping_path=%s",
+        HUB_DB_PATH,
+        RUN_MAPPING_PATH,
+    )
+    # Initialize SQLite store early (and migrate legacy JSON mapping if needed).
+    try:
+        maybe_migrate_run_mapping_json()
+    except Exception as exc:
+        logger.exception("run_store_init_or_migrate_failed error=%s", exc)
     global report_service
     report_service = ReportService(
         ReportServiceConfig(
@@ -129,7 +140,9 @@ def parse_csv(value: str) -> list[str]:
 BASE_DIR = Path(__file__).resolve().parent
 DATA_MOUNT_PATH = Path(env_or_default("DATA_MOUNT_PATH", "/opt/backtest"))
 RUN_STORAGE_PATH = Path(env_or_default("RUN_STORAGE_PATH", str(DATA_MOUNT_PATH / "runs")))
+# Legacy (migration-only). New mapping storage is SQLite at HUB_DB_PATH.
 RUN_MAPPING_PATH = Path(env_or_default("RUN_MAPPING_PATH", str(DATA_MOUNT_PATH / "run_mapping.json")))
+HUB_DB_PATH = Path(env_or_default("HUB_DB_PATH", str(DATA_MOUNT_PATH / "hub.sqlite3")))
 REPORT_CACHE_PATH = Path(env_or_default("REPORT_CACHE_PATH", str(DATA_MOUNT_PATH / "report_cache.sqlite3")))
 HOST_API_KEY = os.getenv("HOST_API_KEY", "")
 
@@ -234,7 +247,8 @@ OPTIONAL_FIELDS = {
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 
-MAPPING_LOCK = threading.Lock()
+RUN_STORE_INIT_LOCK = threading.Lock()
+RUN_STORE: SqliteRunStore | None = None
 
 # Protect queue + inflight submissions to avoid oversubmitting to backtest docker.
 QUEUE_STATE_LOCK = asyncio.Lock()
@@ -244,6 +258,61 @@ INFLIGHT_COUNTS: dict[str, int] = {}
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def get_run_store() -> SqliteRunStore:
+    global RUN_STORE
+    with RUN_STORE_INIT_LOCK:
+        if RUN_STORE is None or RUN_STORE.db_path != HUB_DB_PATH:
+            RUN_STORE = SqliteRunStore(HUB_DB_PATH)
+        return RUN_STORE
+
+
+def maybe_migrate_run_mapping_json() -> None:
+    """
+    One-time migration:
+    - If DB is empty AND legacy run_mapping.json exists, import it into SQLite.
+    - Then rename run_mapping.json to run_mapping.json.bak (or .bak.<ts> if exists).
+    """
+    logger.info(
+        "run_store_migrate_check db_path=%s legacy_mapping_path=%s",
+        HUB_DB_PATH,
+        RUN_MAPPING_PATH,
+    )
+    store = get_run_store()
+    existing_count = store.count_runs()
+    if existing_count > 0:
+        logger.info(
+            "run_store_migrate_skip_db_not_empty db_path=%s existing_rows=%s",
+            HUB_DB_PATH,
+            existing_count,
+        )
+        return
+    if not RUN_MAPPING_PATH.exists():
+        logger.info("run_store_migrate_skip_legacy_missing legacy_mapping_path=%s", RUN_MAPPING_PATH)
+        return
+    start = perf_counter()
+    imported = store.import_from_json_mapping(RUN_MAPPING_PATH)
+    duration_ms = (perf_counter() - start) * 1000
+    if imported <= 0:
+        logger.info(
+            "run_store_migrate_noop legacy_mapping_path=%s duration_ms=%.2f",
+            RUN_MAPPING_PATH,
+            duration_ms,
+        )
+        return
+
+    bak_path = RUN_MAPPING_PATH.with_name(RUN_MAPPING_PATH.name + ".bak")
+    if bak_path.exists():
+        bak_path = RUN_MAPPING_PATH.with_name(RUN_MAPPING_PATH.name + f".bak.{utc_now().replace(':', '').replace('-', '')}")
+    RUN_MAPPING_PATH.rename(bak_path)
+    logger.info(
+        "run_store_migrate_ok db_path=%s imported_rows=%s duration_ms=%.2f legacy_bak_path=%s",
+        HUB_DB_PATH,
+        imported,
+        duration_ms,
+        bak_path,
+    )
 
 
 def reserve_inflight(base_url: str, required_memory_gb: float) -> None:
@@ -465,35 +534,9 @@ def require_api_key(api_key: str | None) -> None:
     if not api_key or api_key != HOST_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-
-def read_mapping(path: Path = RUN_MAPPING_PATH) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_mapping(mapping: dict[str, Any], path: Path = RUN_MAPPING_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(mapping, handle, ensure_ascii=True, indent=2)
-
-
 def update_mapping(backtest_id: str, updates: dict[str, Any]) -> None:
-    with MAPPING_LOCK:
-        mapping = read_mapping()
-        entry = mapping.get(backtest_id)
-        if isinstance(entry, dict):
-            entry_dict: dict[str, Any] = dict(entry)
-        elif entry is None:
-            entry_dict = {}
-        else:
-            entry_dict = {"backtest_docker_run_id": entry}
-
-        entry_dict.update(updates)
-        entry_dict.setdefault("created_at", utc_now())
-        mapping[backtest_id] = entry_dict
-        write_mapping(mapping)
+    store = get_run_store()
+    store.upsert_run(backtest_id, updates)
 
 
 def normalize_join_url(base_url: str, path: str) -> str:
@@ -555,8 +598,9 @@ def get_active_base_urls() -> list[str]:
 app.include_router(
     build_report_router(
         get_report_service=get_report_service,
-        read_mapping=read_mapping,
-        mapping_lock=MAPPING_LOCK,
+        get_run_entry=lambda backtest_id: get_run_store().get_run(backtest_id),
+        get_runs_by_ids=lambda backtest_ids: get_run_store().get_runs_by_ids(backtest_ids),
+        list_submitted_ids=lambda after_dt, before_dt: get_run_store().list_submitted_ids(after_dt, before_dt),
     )
 )
 
@@ -665,10 +709,8 @@ def backtest_headers() -> dict[str, str]:
 
 def resolve_backtest_api_base(backtest_id: str | None) -> str:
     if backtest_id:
-        with MAPPING_LOCK:
-            mapping = read_mapping()
-        entry = mapping.get(backtest_id)
-        if isinstance(entry, dict):
+        entry = get_mapping_entry(backtest_id)
+        if entry:
             base_url = entry.get("backtest_api_base")
             if isinstance(base_url, str) and base_url:
                 return base_url
@@ -676,9 +718,8 @@ def resolve_backtest_api_base(backtest_id: str | None) -> str:
 
 
 def get_mapping_entry(backtest_id: str) -> dict[str, Any] | None:
-    with MAPPING_LOCK:
-        mapping = read_mapping()
-    entry = mapping.get(backtest_id)
+    store = get_run_store()
+    entry = store.get_run(backtest_id)
     if not isinstance(entry, dict):
         return None
     return entry
@@ -1289,8 +1330,8 @@ async def delete_queue(
     async with QUEUE_STATE_LOCK:
         removed = remove_from_queue_batch(backtest_ids)
 
-    with MAPPING_LOCK:
-        mapping = read_mapping()
+    store = get_run_store()
+    existing = store.existing_ids(backtest_ids)
 
     not_queued: list[str] = []
     not_found: list[str] = []
@@ -1298,7 +1339,7 @@ async def delete_queue(
         if bid in removed:
             update_mapping(bid, {"status": "cancelled", "cancelled_at": utc_now()})
             continue
-        if bid in mapping:
+        if bid in existing:
             not_queued.append(bid)
         else:
             not_found.append(bid)
@@ -1315,16 +1356,11 @@ async def delete_queue(
 @app.get("/runs/{backtest_id}")
 async def get_run(backtest_id: str) -> JSONResponse:
     logger.info("get_run_requested backtest_id=%s", backtest_id)
-    with MAPPING_LOCK:
-        mapping = read_mapping()
-    entry = mapping.get(backtest_id)
+    entry = get_mapping_entry(backtest_id)
     if not entry:
         logger.warning("get_run_not_found backtest_id=%s", backtest_id)
         raise HTTPException(status_code=404, detail="backtest_id not found")
-    if isinstance(entry, dict):
-        payload = {"backtest_id": backtest_id, **entry}
-    else:
-        payload = {"backtest_id": backtest_id, "backtest_docker_run_id": entry}
+    payload = {"backtest_id": backtest_id, **entry}
     return JSONResponse(payload)
 
 

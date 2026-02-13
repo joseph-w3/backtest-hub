@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
 import httpx
+from datetime import datetime
 
 from services.report_service import (
     ReportService,
@@ -44,13 +45,45 @@ class TestReportServiceStreaming(unittest.TestCase):
         # Given the refactor was about endpoint handling (client, response), let's mock httpx.AsyncClient.
 
     def make_client(self):
-        lock = MagicMock()
+        def get_run_entry(backtest_id: str):
+            entry = self.mapping.get(backtest_id)
+            return entry if isinstance(entry, dict) else None
+
+        def get_runs_by_ids(backtest_ids: list[str]):
+            out = {}
+            for bid in backtest_ids:
+                entry = get_run_entry(bid)
+                if entry is not None:
+                    out[bid] = entry
+            return out
+
+        def list_submitted_ids(after_dt, before_dt):
+            results = []
+            for bid, entry in self.mapping.items():
+                if not isinstance(entry, dict):
+                    continue
+                submitted_at = entry.get("submitted_at")
+                if not isinstance(submitted_at, str) or not submitted_at:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(submitted_at.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if after_dt and dt < after_dt:
+                    continue
+                if before_dt and dt >= before_dt:
+                    continue
+                results.append(bid)
+            results.sort(key=lambda x: str(self.mapping.get(x, {}).get("submitted_at", "")), reverse=True)
+            return results
+
         app = FastAPI()
         app.include_router(
             build_report_router(
                 get_report_service=lambda: self.service,
-                read_mapping=lambda: self.mapping,
-                mapping_lock=lock,
+                get_run_entry=get_run_entry,
+                get_runs_by_ids=get_runs_by_ids,
+                list_submitted_ids=list_submitted_ids,
             )
         )
         return TestClient(app)
@@ -165,4 +198,3 @@ class TestReportServiceStreaming(unittest.TestCase):
         resp = client.get("/runs/backtest/test.zip/download_code")
         self.assertEqual(resp.status_code, 400)
         self.assertIn("invalid characters", resp.json()["detail"])
-

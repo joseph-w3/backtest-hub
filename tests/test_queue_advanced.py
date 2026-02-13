@@ -26,8 +26,9 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
         # Override paths to avoid PermissionError
         app.DATA_MOUNT_PATH = self.tmp_path
         app.QUEUE_PATH = self.tmp_path / "submit_queue.json"
-        app.RUN_MAPPING_PATH = self.tmp_path / "run_mapping.json"
+        app.HUB_DB_PATH = self.tmp_path / "hub.sqlite3"
         app.RUN_STORAGE_PATH = self.tmp_path / "runs"
+        app.RUN_STORE = None
 
         app.BACKTEST_API_BASES = ["http://host1:8000"]
         app.BACKTEST_BRONZE_API_BASES = []
@@ -46,9 +47,8 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
     @patch("app.submit_to_backtest")
     @patch("app.asyncio.sleep")
     @patch("app.write_queue")
-    @patch("app.write_mapping")
     async def test_queue_scheduler_30s_delay_on_success(
-        self, mock_write_mapping, mock_write_queue, mock_sleep, mock_submit, mock_assets, mock_pick, mock_load_spec, mock_read_queue
+        self, mock_write_queue, mock_sleep, mock_submit, mock_assets, mock_pick, mock_load_spec, mock_read_queue
     ):
         """测试成功提交后调用 asyncio.sleep(30)"""
         queue_item = {"backtest_id": "bt_1", "queued_at": "2026-02-04T10:00:00Z"}
@@ -69,7 +69,7 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
         mock_selection.metrics.memory_free_gb = 100.0
         mock_pick.return_value = mock_selection
 
-        mock_assets.return_value = (b"{}", "strategy.py", b"code", b"runner")
+        mock_assets.return_value = (b"{}", "strategy.py", b"code", None, None, b"runner")
         mock_submit.return_value = "docker_run_id_1"
 
         # 第一个 sleep 是 30s 延时，第二个是循环末尾的 poll sleep
@@ -91,9 +91,8 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
     @patch("app.enqueue_backtest")
     @patch("app.update_mapping")
     @patch("app.write_queue")
-    @patch("app.write_mapping")
     async def test_queue_scheduler_requeue_on_failure(
-        self, mock_write_mapping, mock_write_queue, mock_update, mock_enqueue, mock_submit, mock_assets, mock_pick, mock_load_spec, mock_read_queue
+        self, mock_write_queue, mock_update, mock_enqueue, mock_submit, mock_assets, mock_pick, mock_load_spec, mock_read_queue
     ):
         """提交失败时，任务应放回队列并记录错误"""
         queue_item = {"backtest_id": "bt_1", "queued_at": "2026-02-04T10:00:00Z"}
@@ -109,7 +108,7 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
         mock_selection.metrics.memory_free_gb = 100.0
         mock_pick.return_value = mock_selection
 
-        mock_assets.return_value = (b"{}", "strategy.py", b"code", b"runner")
+        mock_assets.return_value = (b"{}", "strategy.py", b"code", None, None, b"runner")
         # 模拟提交失败
         mock_submit.side_effect = Exception("Submit failed")
 
@@ -141,9 +140,8 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
     @patch("app.load_run_assets")
     @patch("app.submit_to_backtest")
     @patch("app.write_queue")
-    @patch("app.write_mapping")
     async def test_queue_scheduler_double_check_uses_local_reserved(
-        self, mock_write_mapping, mock_write_queue, mock_submit, mock_assets, mock_remove, mock_pick, mock_load_spec, mock_read_queue
+        self, mock_write_queue, mock_submit, mock_assets, mock_remove, mock_pick, mock_load_spec, mock_read_queue
     ):
         """
         验证 double-check 逻辑使用 local_reserved。
@@ -168,7 +166,7 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
         mock_selection.metrics.memory_free_gb = 15.0
         mock_pick.return_value = mock_selection
 
-        mock_assets.return_value = (b"{}", "strategy.py", b"code", b"runner")
+        mock_assets.return_value = (b"{}", "strategy.py", b"code", None, None, b"runner")
 
         # 为了让循环继续而不退出，我们需要模拟 sleep
         # 第一个任务成功后会有一个 30s 延时
