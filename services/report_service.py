@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -156,8 +155,9 @@ class BatchReportsRequest(BaseModel):
 def build_report_router(
     *,
     get_report_service: Callable[[], ReportService],
-    read_mapping: Callable[[], dict[str, Any]],
-    mapping_lock: threading.Lock,
+    get_run_entry: Callable[[str], dict[str, Any] | None],
+    get_runs_by_ids: Callable[[list[str]], dict[str, dict[str, Any]]],
+    list_submitted_ids: Callable[[datetime | None, datetime | None], list[str]],
 ) -> APIRouter:
     router = APIRouter(tags=["report_service"])
 
@@ -179,31 +179,7 @@ def build_report_router(
         if after_dt and before_dt and after_dt >= before_dt:
             raise HTTPException(status_code=400, detail="submitted_after must be before submitted_before")
 
-        with mapping_lock:
-            mapping = read_mapping()
-
-        results: list[str] = []
-        for backtest_id, entry in mapping.items():
-            if not isinstance(entry, dict):
-                continue
-            submitted_at = entry.get("submitted_at")
-            if not isinstance(submitted_at, str) or not submitted_at:
-                continue
-            try:
-                dt = parse_iso8601(submitted_at)
-            except Exception:
-                continue
-            if after_dt and dt < after_dt:
-                continue
-            if before_dt and dt >= before_dt:
-                continue
-            results.append(backtest_id)
-
-        results.sort(
-            key=lambda bid: mapping[bid].get("submitted_at", ""),
-            reverse=True,
-        )
-
+        results = list_submitted_ids(after_dt, before_dt)
         return JSONResponse({"count": len(results), "backtest_ids": results})
 
     @router.post("/runs/backtest/reports")
@@ -211,16 +187,13 @@ def build_report_router(
         if not req.backtest_ids:
             raise HTTPException(status_code=400, detail="backtest_ids must be non-empty")
 
-        with mapping_lock:
-            mapping = read_mapping()
-
         # 读取每个 backtest_id 的 entry，按 backtest_api_base 分组
         groups: dict[str, list[str]] = {}
-        entries: dict[str, dict[str, Any]] = {}
         not_found: list[str] = []
 
+        found = get_runs_by_ids(req.backtest_ids)
         for bid in req.backtest_ids:
-            entry = mapping.get(bid)
+            entry = found.get(bid)
             if not isinstance(entry, dict):
                 not_found.append(bid)
                 continue
@@ -228,7 +201,6 @@ def build_report_router(
             if not isinstance(base_url, str) or not base_url:
                 not_found.append(bid)
                 continue
-            entries[bid] = entry
             groups.setdefault(base_url, []).append(bid)
 
         service = get_report_service()
@@ -267,9 +239,7 @@ def build_report_router(
     @router.get("/runs/backtest/{backtest_id}/logs/download")
     async def download_logs_endpoint(backtest_id: str) -> StreamingResponse:
         validate_backtest_id(backtest_id)
-        with mapping_lock:
-            mapping = read_mapping()
-            entry = mapping.get(backtest_id)
+        entry = get_run_entry(backtest_id)
         
         if not entry or not isinstance(entry, dict):
             raise HTTPException(status_code=404, detail="Backtest not found")
@@ -331,9 +301,7 @@ def build_report_router(
     @router.get("/runs/backtest/{backtest_id}/download_code")
     async def download_code_endpoint(backtest_id: str) -> StreamingResponse:
         validate_backtest_id(backtest_id)
-        with mapping_lock:
-            mapping = read_mapping()
-            entry = mapping.get(backtest_id)
+        entry = get_run_entry(backtest_id)
         
         if not entry or not isinstance(entry, dict):
             raise HTTPException(status_code=404, detail="Backtest not found")

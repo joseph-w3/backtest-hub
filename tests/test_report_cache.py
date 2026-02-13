@@ -1,5 +1,6 @@
 import threading
 import unittest
+from datetime import datetime
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -14,20 +15,52 @@ from services.report_service import (
 
 
 def make_app(mapping: dict[str, Any], service: ReportService | None = None) -> FastAPI:
-    lock = threading.Lock()
-
     if service is None:
         service = ReportService(
             ReportServiceConfig(report_batch_path="/v1/runs/backtest/reports/batch"),
             backtest_headers=lambda: {},
         )
 
+    def get_run_entry(backtest_id: str) -> dict[str, Any] | None:
+        entry = mapping.get(backtest_id)
+        return entry if isinstance(entry, dict) else None
+
+    def get_runs_by_ids(backtest_ids: list[str]) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for bid in backtest_ids:
+            entry = get_run_entry(bid)
+            if entry is not None:
+                out[bid] = entry
+        return out
+
+    def list_submitted_ids(after_dt, before_dt) -> list[str]:
+        results: list[str] = []
+        for bid, entry in mapping.items():
+            if not isinstance(entry, dict):
+                continue
+            submitted_at = entry.get("submitted_at")
+            if not isinstance(submitted_at, str) or not submitted_at:
+                continue
+            try:
+                dt = datetime.fromisoformat(submitted_at.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if after_dt and dt < after_dt:
+                continue
+            if before_dt and dt >= before_dt:
+                continue
+            results.append(bid)
+        # desc by submitted_at
+        results.sort(key=lambda x: str(mapping.get(x, {}).get("submitted_at", "")), reverse=True)
+        return results
+
     app = FastAPI()
     app.include_router(
         build_report_router(
             get_report_service=lambda: service,
-            read_mapping=lambda: dict(mapping),
-            mapping_lock=lock,
+            get_run_entry=get_run_entry,
+            get_runs_by_ids=get_runs_by_ids,
+            list_submitted_ids=list_submitted_ids,
         )
     )
     return app
