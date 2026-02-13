@@ -30,7 +30,7 @@ services:
       RUN_MAPPING_PATH: ${RUN_MAPPING_PATH:-/opt/backtest/run_mapping.json}
       QUEUE_PATH: ${QUEUE_PATH:-/opt/backtest/submit_queue.json}
       BACKTEST_RUNNER_PATH: ${BACKTEST_RUNNER_PATH:-/app/scripts/run_backtest.py}
-      MAX_SYMBOLS: ${MAX_SYMBOLS:-50}
+      MAX_SYMBOLS: ${MAX_SYMBOLS:-150}
       MAX_RANGE_DAYS: ${MAX_RANGE_DAYS:-90}
       MAX_RUNNING_BACKTESTS: ${MAX_RUNNING_BACKTESTS:-10}
       QUEUE_POLL_INTERVAL_SECONDS: ${QUEUE_POLL_INTERVAL_SECONDS:-3}
