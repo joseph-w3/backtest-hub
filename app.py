@@ -175,7 +175,7 @@ BACKTEST_METRICS_TIMEOUT_SECONDS = float(os.getenv("BACKTEST_METRICS_TIMEOUT_SEC
 
 RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
 
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
+MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "150"))
 MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
 MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
 QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
