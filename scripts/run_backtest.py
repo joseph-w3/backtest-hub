@@ -935,23 +935,35 @@ def main() -> int:
         _b2_key_id = os.environ.get("B2_KEY_ID")
         _b2_app_key = os.environ.get("B2_APPLICATION_KEY")
         if _b2_key_id and _b2_app_key:
+            _endpoint = os.environ.get("B2_S3_ENDPOINT", "https://s3.us-west-004.backblazeb2.com")
+            _region = os.environ.get("B2_S3_REGION", "us-west-004")
             catalog_fs_protocol = "s3"
+            # Python (s3fs) backend
             catalog_fs_storage_options = {
-                "endpoint_url": os.environ.get("B2_S3_ENDPOINT", "https://s3.us-west-004.backblazeb2.com"),
+                "endpoint_url": _endpoint,
+                "key": _b2_key_id,
+                "secret": _b2_app_key,
+                "client_kwargs": {"region_name": _region},
+            }
+            # Rust (object_store) backend
+            catalog_fs_rust_storage_options = {
+                "endpoint_url": _endpoint,
                 "access_key_id": _b2_key_id,
                 "secret_access_key": _b2_app_key,
-                "region": os.environ.get("B2_S3_REGION", "us-west-004"),
+                "region": _region,
             }
             catalog_path_str = os.environ.get("CATALOG_PATH", "trade-data/backtest/catalog")
         else:
             catalog_fs_protocol = None
             catalog_fs_storage_options = None
+            catalog_fs_rust_storage_options = None
             catalog_path_str = Path(os.environ.get("CATALOG_PATH", "/opt/catalog")).expanduser().as_posix()
 
         data_catalog = ParquetDataCatalog(
             catalog_path_str,
             fs_protocol=catalog_fs_protocol,
             fs_storage_options=catalog_fs_storage_options,
+            fs_rust_storage_options=catalog_fs_rust_storage_options,
         )
 
         spot_instruments: list[CurrencyPair] = []
@@ -1021,6 +1033,7 @@ def main() -> int:
                         catalog_path=catalog_path_str,
                         catalog_fs_protocol=catalog_fs_protocol,
                         catalog_fs_storage_options=catalog_fs_storage_options,
+                        catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                         data_cls=OrderBookDelta,
                         instrument_id=instrument.id,
                     ),
@@ -1028,6 +1041,7 @@ def main() -> int:
                         catalog_path=catalog_path_str,
                         catalog_fs_protocol=catalog_fs_protocol,
                         catalog_fs_storage_options=catalog_fs_storage_options,
+                        catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                         data_cls=TradeTick,
                         instrument_id=instrument.id,
                     ),
@@ -1040,6 +1054,7 @@ def main() -> int:
                     catalog_path=catalog_path_str,
                     catalog_fs_protocol=catalog_fs_protocol,
                     catalog_fs_storage_options=catalog_fs_storage_options,
+                    catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                     data_cls=FundingRateUpdate,
                     instrument_id=instrument.id,
                 )
@@ -1049,6 +1064,7 @@ def main() -> int:
                     catalog_path=catalog_path_str,
                     catalog_fs_protocol=catalog_fs_protocol,
                     catalog_fs_storage_options=catalog_fs_storage_options,
+                    catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                     data_cls=MarkPriceUpdate,
                     instrument_id=instrument.id,
                 )
