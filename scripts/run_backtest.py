@@ -17,6 +17,7 @@ from datetime import timezone
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 
+from scripts.catalog_config import build_catalog_config
 from quant_trade_v1.backtest.config import BacktestDataConfig
 from quant_trade_v1.backtest.config import BacktestEngineConfig
 from quant_trade_v1.backtest.config import BacktestRunConfig
@@ -932,32 +933,11 @@ def main() -> int:
         futures_maker_fee = _parse_decimal("futures_maker_fee", run_spec["futures_maker_fee"])
         futures_taker_fee = _parse_decimal("futures_taker_fee", run_spec["futures_taker_fee"])
         # S3 catalog support (B2 or compatible S3 endpoint)
-        _b2_key_id = os.environ.get("B2_KEY_ID")
-        _b2_app_key = os.environ.get("B2_APPLICATION_KEY")
-        if _b2_key_id and _b2_app_key:
-            _endpoint = os.environ.get("B2_S3_ENDPOINT", "https://s3.us-west-004.backblazeb2.com")
-            _region = os.environ.get("B2_S3_REGION", "us-west-004")
-            catalog_fs_protocol = "s3"
-            # Python (s3fs) backend
-            catalog_fs_storage_options = {
-                "endpoint_url": _endpoint,
-                "key": _b2_key_id,
-                "secret": _b2_app_key,
-                "client_kwargs": {"region_name": _region},
-            }
-            # Rust (object_store) backend
-            catalog_fs_rust_storage_options = {
-                "endpoint_url": _endpoint,
-                "access_key_id": _b2_key_id,
-                "secret_access_key": _b2_app_key,
-                "region": _region,
-            }
-            catalog_path_str = os.environ.get("CATALOG_PATH", "trade-data/backtest/catalog")
-        else:
-            catalog_fs_protocol = None
-            catalog_fs_storage_options = None
-            catalog_fs_rust_storage_options = None
-            catalog_path_str = Path(os.environ.get("CATALOG_PATH", "/opt/catalog")).expanduser().as_posix()
+        _catalog_cfg = build_catalog_config()
+        catalog_path_str = _catalog_cfg["catalog_path"]
+        catalog_fs_protocol = _catalog_cfg["catalog_fs_protocol"]
+        catalog_fs_storage_options = _catalog_cfg["catalog_fs_storage_options"]
+        catalog_fs_rust_storage_options = _catalog_cfg["catalog_fs_rust_storage_options"]
 
         data_catalog = ParquetDataCatalog(
             catalog_path_str,
