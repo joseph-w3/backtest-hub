@@ -3,6 +3,8 @@
 Reads environment variables and returns a config dict suitable for
 ``ParquetDataCatalog`` construction.  Kept in its own module so it can
 be unit-tested without pulling in the heavy *quant_trade_v1* stack.
+
+NOTE: A copy of build_catalog_config() lives in run_backtest.py — keep in sync.
 """
 
 from __future__ import annotations

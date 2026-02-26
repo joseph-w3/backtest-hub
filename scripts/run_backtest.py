@@ -17,7 +17,6 @@ from datetime import timezone
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 
-from scripts.catalog_config import build_catalog_config
 from quant_trade_v1.backtest.config import BacktestDataConfig
 from quant_trade_v1.backtest.config import BacktestEngineConfig
 from quant_trade_v1.backtest.config import BacktestRunConfig
@@ -45,6 +44,61 @@ from quant_trade_v1.model.objects import Money
 from quant_trade_v1.model.objects import Price
 from quant_trade_v1.model.objects import Quantity
 from quant_trade_v1.persistence.catalog import ParquetDataCatalog
+
+
+def build_catalog_config() -> dict:
+    """Return catalog configuration derived from environment variables.
+
+    When ``B2_KEY_ID`` **and** ``B2_APPLICATION_KEY`` are set the function
+    returns S3-backed configuration (protocol ``"s3"``).  Otherwise it
+    falls back to a local filesystem path.
+
+    NOTE: Keep in sync with scripts/catalog_config.py
+    """
+    b2_key_id = os.environ.get("B2_KEY_ID")
+    b2_app_key = os.environ.get("B2_APPLICATION_KEY")
+
+    if b2_key_id and b2_app_key:
+        endpoint = os.environ.get(
+            "B2_S3_ENDPOINT", "https://s3.us-west-004.backblazeb2.com"
+        )
+        region = os.environ.get("B2_S3_REGION", "us-west-004")
+        bucket = os.environ.get("B2_S3_BUCKET", "trade-data")
+        catalog_prefix = os.environ.get("CATALOG_PREFIX", "backtest/catalog")
+
+        catalog_fs_protocol = "s3"
+
+        catalog_fs_storage_options = {
+            "endpoint_url": endpoint,
+            "key": b2_key_id,
+            "secret": b2_app_key,
+            "client_kwargs": {"region_name": region},
+        }
+
+        catalog_fs_rust_storage_options = {
+            "endpoint_url": endpoint,
+            "access_key_id": b2_key_id,
+            "secret_access_key": b2_app_key,
+            "region": region,
+            "virtual_hosted_style_request": "false",
+        }
+
+        catalog_path = f"{bucket}/{catalog_prefix}"
+    else:
+        catalog_fs_protocol = None
+        catalog_fs_storage_options = None
+        catalog_fs_rust_storage_options = None
+        catalog_path = Path(
+            os.environ.get("CATALOG_PATH", "/opt/catalog")
+        ).expanduser().as_posix()
+
+    return {
+        "catalog_path": catalog_path,
+        "catalog_fs_protocol": catalog_fs_protocol,
+        "catalog_fs_storage_options": catalog_fs_storage_options,
+        "catalog_fs_rust_storage_options": catalog_fs_rust_storage_options,
+    }
+
 
 BINANCE_SPOT_VENUE = Venue("BINANCE_SPOT")
 BINANCE_FUTURES_VENUE = Venue("BINANCE_FUTURES")
