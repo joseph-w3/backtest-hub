@@ -17,6 +17,7 @@ from datetime import timezone
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
 
+from scripts.catalog_config import build_catalog_config
 from quant_trade_v1.backtest.config import BacktestDataConfig
 from quant_trade_v1.backtest.config import BacktestEngineConfig
 from quant_trade_v1.backtest.config import BacktestRunConfig
@@ -931,8 +932,19 @@ def main() -> int:
         spot_taker_fee = _parse_decimal("spot_taker_fee", run_spec["spot_taker_fee"])
         futures_maker_fee = _parse_decimal("futures_maker_fee", run_spec["futures_maker_fee"])
         futures_taker_fee = _parse_decimal("futures_taker_fee", run_spec["futures_taker_fee"])
-        catalog_path = Path(os.environ.get("CATALOG_PATH", "/opt/catalog")).expanduser()
-        data_catalog = ParquetDataCatalog(catalog_path.as_posix())
+        # S3 catalog support (B2 or compatible S3 endpoint)
+        _catalog_cfg = build_catalog_config()
+        catalog_path_str = _catalog_cfg["catalog_path"]
+        catalog_fs_protocol = _catalog_cfg["catalog_fs_protocol"]
+        catalog_fs_storage_options = _catalog_cfg["catalog_fs_storage_options"]
+        catalog_fs_rust_storage_options = _catalog_cfg["catalog_fs_rust_storage_options"]
+
+        data_catalog = ParquetDataCatalog(
+            catalog_path_str,
+            fs_protocol=catalog_fs_protocol,
+            fs_storage_options=catalog_fs_storage_options,
+            fs_rust_storage_options=catalog_fs_rust_storage_options,
+        )
 
         spot_instruments: list[CurrencyPair] = []
         futures_instruments: list[CryptoPerpetual] = []
@@ -987,22 +999,29 @@ def main() -> int:
             )
             futures_instruments.append(futures_instrument)
 
-        _migrate_legacy_catalog_data(
-            catalog=data_catalog,
-            instrument_ids=[instrument.id for instrument in spot_instruments + futures_instruments],
-        )
+        if catalog_fs_protocol is None:
+            _migrate_legacy_catalog_data(
+                catalog=data_catalog,
+                instrument_ids=[instrument.id for instrument in spot_instruments + futures_instruments],
+            )
 
         data_configs: list[BacktestDataConfig] = []
         for instrument in spot_instruments + futures_instruments:
             data_configs.extend(
                 [
                     BacktestDataConfig(
-                        catalog_path=catalog_path.as_posix(),
+                        catalog_path=catalog_path_str,
+                        catalog_fs_protocol=catalog_fs_protocol,
+                        catalog_fs_storage_options=catalog_fs_storage_options,
+                        catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                         data_cls=OrderBookDelta,
                         instrument_id=instrument.id,
                     ),
                     BacktestDataConfig(
-                        catalog_path=catalog_path.as_posix(),
+                        catalog_path=catalog_path_str,
+                        catalog_fs_protocol=catalog_fs_protocol,
+                        catalog_fs_storage_options=catalog_fs_storage_options,
+                        catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                         data_cls=TradeTick,
                         instrument_id=instrument.id,
                     ),
@@ -1012,14 +1031,20 @@ def main() -> int:
         for instrument in futures_instruments:
             data_configs.append(
                 BacktestDataConfig(
-                    catalog_path=catalog_path.as_posix(),
+                    catalog_path=catalog_path_str,
+                    catalog_fs_protocol=catalog_fs_protocol,
+                    catalog_fs_storage_options=catalog_fs_storage_options,
+                    catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                     data_cls=FundingRateUpdate,
                     instrument_id=instrument.id,
                 )
             )
             data_configs.append(
                 BacktestDataConfig(
-                    catalog_path=catalog_path.as_posix(),
+                    catalog_path=catalog_path_str,
+                    catalog_fs_protocol=catalog_fs_protocol,
+                    catalog_fs_storage_options=catalog_fs_storage_options,
+                    catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                     data_cls=MarkPriceUpdate,
                     instrument_id=instrument.id,
                 )
