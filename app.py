@@ -64,32 +64,47 @@ logger = setup_logging()
 
 
 async def _recover_submitted_tasks() -> None:
-    """Check workers for orphan 'submitted' tasks and update their status.
+    """Continuously poll workers for orphan 'submitted' tasks and update status.
 
-    Runs once at startup in background via asyncio.create_task so it does not
-    block the event loop even when workers are unreachable.
+    Runs as a background task via asyncio.create_task.  Each iteration checks
+    all submitted tasks against their workers, then sleeps for a configurable
+    interval (SUBMITTED_RECOVERY_INTERVAL_SECONDS, default 30s).
     """
-    try:
-        store = get_run_store()
-        submitted_runs = store.get_runs_by_status("submitted")
-        if not submitted_runs:
-            return
-        logger.info("startup_recovery_start count=%d", len(submitted_runs))
-        for run in submitted_runs:
-            base_url = run.get("backtest_api_base")
-            if not base_url:
-                continue
-            bid = run["backtest_id"]
-            try:
-                status_resp = await asyncio.to_thread(fetch_backtest_status, base_url, bid)
-                worker_status = status_resp.get("status")
-                if worker_status in ("completed", "failed"):
-                    store.upsert_run(bid, {"status": worker_status})
-                    logger.info("recovered_orphan_task id=%s status=%s", bid, worker_status)
-            except Exception:
-                logger.warning("orphan_task_unreachable id=%s worker=%s", bid, base_url)
-    except Exception as exc:
-        logger.exception("startup_recovery_failed error=%s", exc)
+    while True:
+        try:
+            store = get_run_store()
+            submitted_runs = store.get_runs_by_status("submitted")
+            if submitted_runs:
+                logger.info("startup_recovery_start count=%d", len(submitted_runs))
+                for run in submitted_runs:
+                    base_url = run.get("backtest_api_base")
+                    if not base_url:
+                        continue
+                    bid = run["backtest_id"]
+                    try:
+                        status_resp = await asyncio.to_thread(fetch_backtest_status, base_url, bid)
+                        worker_status = status_resp.get("status")
+                        if worker_status in ("completed", "failed"):
+                            store.upsert_run(bid, {"status": worker_status})
+                            logger.info("recovered_orphan_task id=%s status=%s", bid, worker_status)
+                    except HTTPException as exc:
+                        if exc.status_code == 404:
+                            store.upsert_run(bid, {
+                                "status": "failed",
+                                "last_error": "task_not_found_on_worker",
+                            })
+                            logger.warning(
+                                "orphan_task_not_found id=%s worker=%s", bid, base_url,
+                            )
+                        else:
+                            logger.warning("orphan_task_unreachable id=%s worker=%s", bid, base_url)
+                    except Exception:
+                        logger.warning("orphan_task_unreachable id=%s worker=%s", bid, base_url)
+        except Exception as exc:
+            logger.exception("startup_recovery_failed error=%s", exc)
+
+        interval = float(os.environ.get("SUBMITTED_RECOVERY_INTERVAL_SECONDS", "30"))
+        await asyncio.sleep(interval)
 
 
 @app.on_event("startup")
