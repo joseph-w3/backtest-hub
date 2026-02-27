@@ -124,6 +124,29 @@ class TestRecoverSubmittedTasks(unittest.IsolatedAsyncioTestCase):
             entry = store.get_run("bt_fail")
             self.assertEqual(entry["status"], "failed")
 
+    async def test_terminated_task_recovered_as_failed(self) -> None:
+        """A submitted task whose worker reports 'terminated' gets status=failed."""
+        with tempfile.TemporaryDirectory() as td:
+            store = self._setup_store(td)
+            store.upsert_run("bt_term", {
+                "status": "submitted",
+                "backtest_api_base": "http://worker1:10001",
+                "required_memory_gb": 4.0,
+            })
+
+            mock_status = {"status": "terminated"}
+
+            async def _cancel_sleep(seconds: float) -> None:
+                raise asyncio.CancelledError()
+
+            with patch("app.fetch_backtest_status", return_value=mock_status), \
+                 patch("asyncio.sleep", side_effect=_cancel_sleep):
+                with self.assertRaises(asyncio.CancelledError):
+                    await app._recover_submitted_tasks()
+
+            entry = store.get_run("bt_term")
+            self.assertEqual(entry["status"], "failed")
+
     async def test_running_task_not_changed(self) -> None:
         """A submitted task whose worker reports 'running' stays as submitted."""
         with tempfile.TemporaryDirectory() as td:
