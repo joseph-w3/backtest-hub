@@ -84,8 +84,14 @@ async def _recover_submitted_tasks() -> None:
                     try:
                         status_resp = await asyncio.to_thread(fetch_backtest_status, base_url, bid)
                         worker_status = status_resp.get("status")
-                        if worker_status in ("completed", "failed", "terminated", "stopped"):
-                            final_status = "failed" if worker_status in ("terminated", "stopped") else worker_status
+                        _TERMINAL_STATUSES = {"completed", "succeeded", "failed", "terminated", "stopped"}
+                        if worker_status in _TERMINAL_STATUSES:
+                            if worker_status in ("terminated", "stopped"):
+                                final_status = "failed"
+                            elif worker_status == "succeeded":
+                                final_status = "completed"
+                            else:
+                                final_status = worker_status
                             store.upsert_run(bid, {"status": final_status})
                             logger.info("recovered_orphan_task id=%s worker_status=%s final_status=%s", bid, worker_status, final_status)
                     except HTTPException as exc:
