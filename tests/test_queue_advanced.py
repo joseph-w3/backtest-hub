@@ -40,27 +40,25 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.test_dir.cleanup()
 
-    @patch("app.read_queue")
     @patch("app.load_run_spec_payload")
     @patch("app.pick_backtest_target")
     @patch("app.load_run_assets")
     @patch("app.submit_to_backtest")
     @patch("app.asyncio.sleep")
-    @patch("app.write_queue")
     async def test_queue_scheduler_30s_delay_on_success(
-        self, mock_write_queue, mock_sleep, mock_submit, mock_assets, mock_pick, mock_load_spec, mock_read_queue
+        self, mock_sleep, mock_submit, mock_assets, mock_pick, mock_load_spec
     ):
         """测试成功提交后调用 asyncio.sleep(30)"""
         queue_item = {"backtest_id": "bt_1", "queued_at": "2026-02-04T10:00:00Z"}
-        # 模拟 read_queue
-        # 1. line 790: queued = read_queue()
-        # 2. line 884: current_queue_ids = {x.get("backtest_id") for x in read_queue()} (for bt_1)
-        # 3. line 790: next iteration
-        mock_read_queue.side_effect = [
-            [queue_item], # line 790
-            [queue_item], # line 884
-            [], [], []    # next iterations
+
+        mock_store = MagicMock()
+        # read_queue called twice: once at start of loop, once during double-check
+        mock_store.read_queue.side_effect = [
+            [queue_item],  # initial read
+            [queue_item],  # double-check read
+            [], [], []     # next iterations
         ]
+        mock_store.remove_from_queue_batch.return_value = {"bt_1"}
 
         mock_load_spec.return_value = {"symbols": ["BTCUSDT"]}
 
@@ -75,32 +73,34 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
         # 第一个 sleep 是 30s 延时，第二个是循环末尾的 poll sleep
         mock_sleep.side_effect = [None, asyncio.CancelledError()]
 
-        try:
-            await app.queue_scheduler()
-        except asyncio.CancelledError:
-            pass
+        with patch("app.get_run_store", return_value=mock_store):
+            try:
+                await app.queue_scheduler()
+            except asyncio.CancelledError:
+                pass
 
         # 验证是否调用了 30s 延时 (QUEUE_DISPATCH_DELAY_SECONDS)
         mock_sleep.assert_any_call(30.0)
 
-    @patch("app.read_queue")
     @patch("app.load_run_spec_payload")
     @patch("app.pick_backtest_target")
     @patch("app.load_run_assets")
     @patch("app.submit_to_backtest")
-    @patch("app.enqueue_backtest")
     @patch("app.update_mapping")
-    @patch("app.write_queue")
     async def test_queue_scheduler_requeue_on_failure(
-        self, mock_write_queue, mock_update, mock_enqueue, mock_submit, mock_assets, mock_pick, mock_load_spec, mock_read_queue
+        self, mock_update, mock_submit, mock_assets, mock_pick, mock_load_spec
     ):
         """提交失败时，任务应放回队列并记录错误"""
         queue_item = {"backtest_id": "bt_1", "queued_at": "2026-02-04T10:00:00Z"}
-        mock_read_queue.side_effect = [
-            [queue_item], # line 790
-            [queue_item], # line 884
+
+        mock_store = MagicMock()
+        mock_store.read_queue.side_effect = [
+            [queue_item],  # initial read
+            [queue_item],  # double-check read
             [], [], []
         ]
+        mock_store.remove_from_queue_batch.return_value = {"bt_1"}
+
         mock_load_spec.return_value = {"symbols": ["BTCUSDT"]}
 
         mock_selection = MagicMock()
@@ -112,17 +112,20 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
         # 模拟提交失败
         mock_submit.side_effect = Exception("Submit failed")
 
-        with patch("app.asyncio.sleep", side_effect=[asyncio.CancelledError()]):
-            try:
-                await app.queue_scheduler()
-            except asyncio.CancelledError:
-                pass
+        with patch("app.get_run_store", return_value=mock_store):
+            with patch("app.asyncio.sleep", side_effect=[asyncio.CancelledError()]):
+                try:
+                    await app.queue_scheduler()
+                except asyncio.CancelledError:
+                    pass
 
         # 验证是否重新入队
-        mock_enqueue.assert_called_with("bt_1", queued_at="2026-02-04T10:00:00Z")
+        mock_store.enqueue.assert_called_once()
+        enqueue_args = mock_store.enqueue.call_args[0]
+        self.assertEqual(enqueue_args[0], "bt_1")
+        self.assertEqual(enqueue_args[1], "2026-02-04T10:00:00Z")
+
         # 验证更新了错误信息
-        # 第一次 update_mapping 是在 860 行（load_run_spec 失败，这里不触发）
-        # 这里应该触发 953 行的 update_mapping
         mock_update.assert_any_call("bt_1", unittest.mock.ANY)
 
         found_error = False
@@ -133,15 +136,12 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
                     break
         self.assertTrue(found_error, "Should have called update_mapping with 'Submit failed'")
 
-    @patch("app.read_queue")
     @patch("app.load_run_spec_payload")
     @patch("app.pick_backtest_target")
-    @patch("app.remove_from_queue_batch")
     @patch("app.load_run_assets")
     @patch("app.submit_to_backtest")
-    @patch("app.write_queue")
     async def test_queue_scheduler_double_check_uses_local_reserved(
-        self, mock_write_queue, mock_submit, mock_assets, mock_remove, mock_pick, mock_load_spec, mock_read_queue
+        self, mock_submit, mock_assets, mock_pick, mock_load_spec
     ):
         """
         验证 double-check 逻辑使用 local_reserved。
@@ -151,12 +151,15 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
         item1 = {"backtest_id": "bt_1", "queued_at": "2026-02-04T10:00:00Z"}
         item2 = {"backtest_id": "bt_2", "queued_at": "2026-02-04T10:00:01Z"}
 
-        mock_read_queue.side_effect = [
-            [item1, item2], # line 790 iteration 1
-            [item1, item2], # line 884 for bt_1
-            [item1, item2], # line 884 for bt_2
-            [], [], []      # next iterations
+        mock_store = MagicMock()
+        mock_store.read_queue.side_effect = [
+            [item1, item2],  # initial read
+            [item1, item2],  # double-check for bt_1
+            [item1, item2],  # double-check for bt_2
+            [], [], []       # next iterations
         ]
+        mock_store.remove_from_queue_batch.return_value = {"bt_1"}
+
         # 每个任务需要 10GB
         mock_load_spec.return_value = {"symbols": ["A"] * 10}
 
@@ -168,18 +171,18 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
 
         mock_assets.return_value = (b"{}", "strategy.py", b"code", None, None, b"runner")
 
-        # 为了让循环继续而不退出，我们需要模拟 sleep
         # 第一个任务成功后会有一个 30s 延时
-        with patch("app.asyncio.sleep", side_effect=[None, asyncio.CancelledError()]):
-            try:
-                await app.queue_scheduler()
-            except asyncio.CancelledError:
-                pass
+        with patch("app.get_run_store", return_value=mock_store):
+            with patch("app.asyncio.sleep", side_effect=[None, asyncio.CancelledError()]):
+                try:
+                    await app.queue_scheduler()
+                except asyncio.CancelledError:
+                    pass
 
         # 第一个任务 bt_1 应该成功 (15 >= 10)
         # 第二个任务 bt_2 应该在 double-check 失败
         self.assertEqual(mock_submit.call_count, 1)
-        mock_remove.assert_called_once_with(["bt_1"])
+        mock_store.remove_from_queue_batch.assert_called_once_with(["bt_1"])
 
 if __name__ == "__main__":
     unittest.main()

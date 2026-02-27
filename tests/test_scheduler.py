@@ -822,5 +822,95 @@ class TestDirectSubmitBypassesQueue(unittest.TestCase):
             scheduler.fetch_metrics = original_fetch
 
 
+class TestSortKeyMemoryRatio(unittest.TestCase):
+    """Tests that scheduler sorts by memory free RATIO, not absolute free memory."""
+
+    def _make_metrics(
+        self,
+        base_url: str,
+        cpu_percent: float | None,
+        total_gb: float,
+        used_gb: float,
+        free_gb: float,
+    ) -> DockerMetrics:
+        return DockerMetrics(
+            base_url=base_url,
+            cpu_percent=cpu_percent,
+            memory_total_gb=total_gb,
+            memory_used_gb=used_gb,
+            memory_free_gb=free_gb,
+        )
+
+    def test_ratio_sort_prefers_less_loaded_small_machine(self) -> None:
+        """
+        big_machine:   200GB total, 40GB free  -> 20% free
+        small_machine:  40GB total, 35GB free  -> 87.5% free
+
+        Old bug: absolute sort picks big_machine (40GB > 35GB).
+        Fixed:   ratio sort picks small_machine (87.5% > 20%).
+        """
+        from services import scheduler
+
+        metrics_store = {
+            "http://big:8000": self._make_metrics("http://big:8000", 50.0, 200.0, 160.0, 40.0),
+            "http://small:8000": self._make_metrics("http://small:8000", 50.0, 40.0, 5.0, 35.0),
+        }
+
+        def mock_fetch_metrics(base_url, metrics_path, headers, timeout_seconds):
+            return metrics_store[base_url]
+
+        original_fetch = scheduler.fetch_metrics
+        scheduler.fetch_metrics = mock_fetch_metrics
+        try:
+            result = select_backtest_docker(
+                base_urls=["http://big:8000", "http://small:8000"],
+                metrics_path="/metrics",
+                runs_path=None,
+                headers={},
+                required_memory_gb=10.0,
+                reserved_memory_gb=None,
+                inflight_counts=None,
+                max_running=None,
+                timeout_seconds=3.0,
+            )
+            self.assertIsNotNone(result)
+            # small_machine has higher free ratio (87.5% vs 20%) -> should be selected
+            self.assertEqual(result.base_url, "http://small:8000")
+        finally:
+            scheduler.fetch_metrics = original_fetch
+
+    def test_ratio_sort_equal_ratio_tiebreaks_on_cpu(self) -> None:
+        """When free ratios are equal, lower CPU usage should win."""
+        from services import scheduler
+
+        metrics_store = {
+            "http://host1:8000": self._make_metrics("http://host1:8000", 70.0, 64.0, 32.0, 32.0),
+            "http://host2:8000": self._make_metrics("http://host2:8000", 30.0, 128.0, 64.0, 64.0),
+        }
+
+        def mock_fetch_metrics(base_url, metrics_path, headers, timeout_seconds):
+            return metrics_store[base_url]
+
+        original_fetch = scheduler.fetch_metrics
+        scheduler.fetch_metrics = mock_fetch_metrics
+        try:
+            result = select_backtest_docker(
+                base_urls=["http://host1:8000", "http://host2:8000"],
+                metrics_path="/metrics",
+                runs_path=None,
+                headers={},
+                required_memory_gb=10.0,
+                reserved_memory_gb=None,
+                inflight_counts=None,
+                max_running=None,
+                timeout_seconds=3.0,
+            )
+            self.assertIsNotNone(result)
+            # Both have 50% free ratio, host2 has lower CPU (30 < 70)
+            self.assertEqual(result.base_url, "http://host2:8000")
+        finally:
+            scheduler.fetch_metrics = original_fetch
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -110,6 +110,86 @@ class SqliteRunStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_submitted_at ON runs(submitted_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_backtest_api_base ON runs(backtest_api_base)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS queue (
+                    backtest_id TEXT PRIMARY KEY,
+                    queued_at TEXT NOT NULL,
+                    queue_position INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_position ON queue(queue_position)")
+
+    # ---- Queue operations ------------------------------------------------
+
+    def enqueue(self, backtest_id: str, queued_at: str) -> None:
+        """Append a task to the end of the queue (idempotent on backtest_id)."""
+        with self._write_lock:
+            with self._connect() as conn:
+                # Determine the next position (max + 1, or 0 for empty queue).
+                row = conn.execute("SELECT COALESCE(MAX(queue_position), -1) AS mx FROM queue").fetchone()
+                next_pos = int(row["mx"]) + 1 if row else 0
+                conn.execute(
+                    """
+                    INSERT INTO queue (backtest_id, queued_at, queue_position)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(backtest_id) DO UPDATE SET queued_at = excluded.queued_at
+                    """,
+                    (backtest_id, queued_at, next_pos),
+                )
+
+    def dequeue(self, backtest_id: str) -> None:
+        """Remove a specific task from the queue."""
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM queue WHERE backtest_id = ?", (backtest_id,))
+
+    def read_queue(self) -> list[dict[str, str]]:
+        """Return all queued items ordered by queue_position (FIFO)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT backtest_id, queued_at FROM queue ORDER BY queue_position ASC"
+            ).fetchall()
+        return [{"backtest_id": r["backtest_id"], "queued_at": r["queued_at"]} for r in rows]
+
+    def queue_length(self) -> int:
+        """Return the number of items in the queue."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(1) AS n FROM queue").fetchone()
+        return int(row["n"]) if row else 0
+
+    def queue_position(self, backtest_id: str) -> int | None:
+        """Return the 0-based index of *backtest_id* in the queue, or None."""
+        items = self.read_queue()
+        for idx, item in enumerate(items):
+            if item["backtest_id"] == backtest_id:
+                return idx
+        return None
+
+    def remove_from_queue_batch(self, backtest_ids: list[str]) -> set[str]:
+        """Remove multiple items from the queue. Returns the set of ids that were actually removed."""
+        wanted = {bid for bid in backtest_ids if isinstance(bid, str) and bid}
+        if not wanted:
+            return set()
+        with self._write_lock:
+            with self._connect() as conn:
+                placeholders = ",".join(["?"] * len(wanted))
+                # Find which ones actually exist in the queue.
+                existing = conn.execute(
+                    f"SELECT backtest_id FROM queue WHERE backtest_id IN ({placeholders})",
+                    tuple(wanted),
+                ).fetchall()
+                removed = {r["backtest_id"] for r in existing}
+                if removed:
+                    del_ph = ",".join(["?"] * len(removed))
+                    conn.execute(
+                        f"DELETE FROM queue WHERE backtest_id IN ({del_ph})",
+                        tuple(removed),
+                    )
+        return removed
+
+    # ---- Run operations ---------------------------------------------------
 
     def count_runs(self) -> int:
         with self._connect() as conn:
@@ -168,6 +248,18 @@ class SqliteRunStore:
         with self._connect() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [str(r["backtest_id"]) for r in rows if r and r["backtest_id"]]
+
+    def get_runs_by_status(self, status: str) -> list[dict[str, Any]]:
+        """Return all runs matching *status*, each dict includes ``backtest_id``."""
+        sql = "SELECT * FROM runs WHERE status = ? ORDER BY created_at"
+        with self._connect() as conn:
+            rows = conn.execute(sql, (status,)).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            entry = self._row_to_entry(row)
+            entry["backtest_id"] = row["backtest_id"]
+            result.append(entry)
+        return result
 
     def upsert_run(self, backtest_id: str, updates: dict[str, Any]) -> None:
         if not isinstance(backtest_id, str) or not backtest_id:

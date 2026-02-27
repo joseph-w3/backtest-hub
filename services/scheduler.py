@@ -27,6 +27,24 @@ class DockerSelection:
     available_memory_gb: float
 
 
+def parse_per_worker_max_running(raw: str) -> dict[str, int]:
+    """Parse per-worker max running config string.
+
+    Format: "http://host1:port=5,http://host2:port=3"
+    Entries without '=' are silently skipped.
+    """
+    result: dict[str, int] = {}
+    if not raw.strip():
+        return result
+    for part in raw.split(","):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        url, val = part.rsplit("=", 1)
+        result[url.strip().rstrip("/")] = int(val.strip())
+    return result
+
+
 def normalize_base_url(url: str) -> str:
     return url.rstrip("/")
 
@@ -197,6 +215,7 @@ def select_backtest_docker(
     timeout_seconds: float,
     cpu_percent_lt: float | None = None,
     require_memory_gt: bool = False,
+    max_running_per_worker: dict[str, int] | None = None,
 ) -> DockerSelection | None:
     reserved_memory_gb = reserved_memory_gb or {}
     inflight_counts = inflight_counts or {}
@@ -252,7 +271,8 @@ def select_backtest_docker(
             continue
 
         running_count = None
-        if max_running is not None and runs_path:
+        effective_max = (max_running_per_worker or {}).get(base_url, max_running)
+        if effective_max is not None and runs_path:
             try:
                 runs_payload = fetch_backtest_runs(base_url, runs_path, headers, timeout_seconds)
                 running_count = count_running_from_runs_payload(runs_payload)
@@ -260,13 +280,13 @@ def select_backtest_docker(
                 LOGGER.info("scheduler_runs_failed base=%s error=%s", base_url, exc)
                 continue
             inflight = inflight_counts.get(base_url, 0)
-            if running_count + inflight >= max_running:
+            if running_count + inflight >= effective_max:
                 LOGGER.info(
-                    "scheduler_skip_running_limit base=%s running=%s inflight=%s max_running=%s",
+                    "scheduler_skip_running_limit base=%s running=%s inflight=%s effective_max=%s",
                     base_url,
                     running_count,
                     inflight,
-                    max_running,
+                    effective_max,
                 )
                 continue
 
@@ -285,7 +305,8 @@ def select_backtest_docker(
 
     def sort_key(selection: DockerSelection) -> tuple[float, float]:
         cpu_rank = selection.metrics.cpu_percent if selection.metrics.cpu_percent is not None else 1000.0
-        return (selection.available_memory_gb, -cpu_rank)
+        mem_free_ratio = selection.available_memory_gb / max(selection.metrics.memory_total_gb, 1.0)
+        return (mem_free_ratio, -cpu_rank)
 
     candidates.sort(key=sort_key, reverse=True)
     selected = candidates[0]

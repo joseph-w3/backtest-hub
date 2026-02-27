@@ -41,11 +41,11 @@ class TestKillEndpoint(unittest.TestCase):
             "queued_at": "2026-02-05T00:00:00Z",
         }
 
-        def mock_remove_empty(ids):
-            return set()  # Not found in queue
+        mock_store = MagicMock()
+        mock_store.remove_from_queue_batch.return_value = set()  # Not found in queue
 
         with patch.object(app, "get_mapping_entry", return_value=mock_entry):
-            with patch.object(app, "remove_from_queue_batch", side_effect=mock_remove_empty):
+            with patch.object(app, "get_run_store", return_value=mock_store):
                 with patch.object(app, "QUEUE_STATE_LOCK", app.asyncio.Lock()):
                     response = self.client.post("/runs/backtest/bt_queued/kill")
                     self.assertEqual(response.status_code, 409)
@@ -62,18 +62,16 @@ class TestKillEndpoint(unittest.TestCase):
             "status": "queued",
             "queued_at": "2026-02-05T00:00:00Z",
         }
-        removed_ids = set()
         updated_mappings = {}
 
-        def mock_remove_from_queue_batch(ids):
-            removed_ids.update(ids)
-            return {"bt_queued"}
+        mock_store = MagicMock()
+        mock_store.remove_from_queue_batch.return_value = {"bt_queued"}
 
         def mock_update_mapping(bid, updates):
             updated_mappings[bid] = updates
 
         with patch.object(app, "get_mapping_entry", return_value=mock_entry):
-            with patch.object(app, "remove_from_queue_batch", side_effect=mock_remove_from_queue_batch):
+            with patch.object(app, "get_run_store", return_value=mock_store):
                 with patch.object(app, "update_mapping", side_effect=mock_update_mapping):
                     with patch.object(app, "QUEUE_STATE_LOCK", app.asyncio.Lock()):
                         response = self.client.post("/runs/backtest/bt_queued/kill")
@@ -81,7 +79,7 @@ class TestKillEndpoint(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["status"], "cancelled")
-        self.assertIn("bt_queued", removed_ids)
+        mock_store.remove_from_queue_batch.assert_called_once_with(["bt_queued"])
         self.assertIn("bt_queued", updated_mappings)
         self.assertEqual(updated_mappings["bt_queued"]["status"], "cancelled")
 

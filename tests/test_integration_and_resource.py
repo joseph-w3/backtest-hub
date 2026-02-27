@@ -22,22 +22,24 @@ class TestIntegrationAndResource(unittest.IsolatedAsyncioTestCase):
         app.BACKTEST_API_BASES = ["http://main:8000"]
         app.BACKTEST_BRONZE_API_BASES = ["http://bronze:8000"]
 
-    @patch("app.enqueue_backtest")
     @patch("app.update_mapping")
-    async def test_submit_with_queue_control_returns_queued(self, mock_update, mock_enqueue):
+    async def test_submit_with_queue_control_returns_queued(self, mock_update):
         """验证 submit_with_queue_control 正确入队并返回 ("queued", None)"""
-        res_status, docker_run_id = await app.submit_with_queue_control(
-            backtest_id="bt_1",
-            run_spec_bytes=b"{}",
-            strategy_filename="s.py",
-            strategy_bytes=b"code",
-            runner_bytes=b"runner",
-            required_memory_gb=1.0,
-            symbol_count=1
-        )
+        mock_store = MagicMock()
+        with patch("app.get_run_store", return_value=mock_store):
+            res_status, docker_run_id = await app.submit_with_queue_control(
+                backtest_id="bt_1",
+                run_spec_bytes=b"{}",
+                strategy_filename="s.py",
+                strategy_bytes=b"code",
+                runner_bytes=b"runner",
+                required_memory_gb=1.0,
+                symbol_count=1
+            )
         self.assertEqual(res_status, "queued")
         self.assertIsNone(docker_run_id)
-        mock_enqueue.assert_called_once_with("bt_1")
+        mock_store.enqueue.assert_called_once()
+        self.assertEqual(mock_store.enqueue.call_args[0][0], "bt_1")
 
     @patch("app.select_backtest_docker")
     async def test_bronze_scheduling_priority(self, mock_select):
