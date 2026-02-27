@@ -31,6 +31,7 @@ from services.report_service import (
 
 from services.scheduler import (
     parse_backtest_api_bases,
+    parse_per_worker_max_running,
     required_memory_gb_from_run_spec,
     select_backtest_docker,
 )
@@ -62,6 +63,35 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 
+async def _recover_submitted_tasks() -> None:
+    """Check workers for orphan 'submitted' tasks and update their status.
+
+    Runs once at startup in background via asyncio.create_task so it does not
+    block the event loop even when workers are unreachable.
+    """
+    try:
+        store = get_run_store()
+        submitted_runs = store.get_runs_by_status("submitted")
+        if not submitted_runs:
+            return
+        logger.info("startup_recovery_start count=%d", len(submitted_runs))
+        for run in submitted_runs:
+            base_url = run.get("backtest_api_base")
+            if not base_url:
+                continue
+            bid = run["backtest_id"]
+            try:
+                status_resp = await asyncio.to_thread(fetch_backtest_status, base_url, bid)
+                worker_status = status_resp.get("status")
+                if worker_status in ("completed", "failed"):
+                    store.upsert_run(bid, {"status": worker_status})
+                    logger.info("recovered_orphan_task id=%s status=%s", bid, worker_status)
+            except Exception:
+                logger.warning("orphan_task_unreachable id=%s worker=%s", bid, base_url)
+    except Exception as exc:
+        logger.exception("startup_recovery_failed error=%s", exc)
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     logger.info("app_started")
@@ -82,6 +112,8 @@ async def on_startup() -> None:
         ),
         backtest_headers=backtest_headers,
     )
+    # Recover orphan submitted tasks in background (non-blocking).
+    asyncio.create_task(_recover_submitted_tasks())
     # Start background scheduler for queued submissions.
     asyncio.create_task(queue_scheduler())
 
@@ -178,6 +210,9 @@ RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "script
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "150"))
 MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
 MAX_RUNNING_BACKTESTS = int(os.getenv("MAX_RUNNING_BACKTESTS", "10"))
+# Per-worker max running override. Format: "http://host1:port=5,http://host2:port=3"
+# Workers not listed fall back to MAX_RUNNING_BACKTESTS.
+PER_WORKER_MAX_RUNNING = parse_per_worker_max_running(os.getenv("MAX_RUNNING_PER_WORKER", ""))
 QUEUE_POLL_INTERVAL_SECONDS = float(os.getenv("QUEUE_POLL_INTERVAL_SECONDS", "3"))
 QUEUE_DISPATCH_DELAY_SECONDS = float(os.getenv("QUEUE_DISPATCH_DELAY_SECONDS", "30"))
 # Backfilling: only backfill tasks queued within this window after head task (seconds)
@@ -611,7 +646,8 @@ def read_queue(path: Path = QUEUE_PATH) -> list[dict[str, str]]:
     try:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except Exception:
+    except Exception as exc:
+        logger.error("queue_file_read_failed path=%s error=%s", path, exc, exc_info=True)
         return []
     if not isinstance(payload, list):
         return []
@@ -778,7 +814,7 @@ def submit_to_backtest(
     headers = {"Content-Type": content_type, **backtest_headers()}
     req = urllib.request.Request(url, data=form_body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=300) as resp:
             body = resp.read()
             payload = json.loads(body.decode("utf-8"))
     except urllib.error.HTTPError as exc:
@@ -807,7 +843,7 @@ def fetch_backtest_status(base_url: str, backtest_id: str) -> dict[str, Any]:
     req = urllib.request.Request(url, headers=backtest_headers(), method="GET")
     try:
         logger.info("fetch_backtest_status start backtest_id=%s url=%s", backtest_id, url)
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             body = resp.read()
             payload = json.loads(body.decode("utf-8"))
     except urllib.error.HTTPError as exc:
@@ -892,7 +928,9 @@ async def pick_backtest_target(
             inflight_counts_snapshot = dict(INFLIGHT_COUNTS)
 
     max_running = MAX_RUNNING_BACKTESTS if MAX_RUNNING_BACKTESTS > 0 else None
-    runs_path = BACKTEST_RUNS_PATH if max_running is not None else None
+    per_worker = PER_WORKER_MAX_RUNNING or None
+    # Need runs_path if global or any per-worker limit is configured
+    runs_path = BACKTEST_RUNS_PATH if (max_running is not None or per_worker) else None
 
     if symbol_count < BRONZE_SYMBOLS_THRESHOLD and BACKTEST_BRONZE_API_BASES:
         bronze = await asyncio.to_thread(
@@ -908,6 +946,7 @@ async def pick_backtest_target(
             timeout_seconds=BACKTEST_METRICS_TIMEOUT_SECONDS,
             cpu_percent_lt=CPU_PERCENT_LT,
             require_memory_gt=True,
+            max_running_per_worker=per_worker,
         )
         if bronze is not None:
             return bronze
@@ -924,6 +963,7 @@ async def pick_backtest_target(
         max_running=max_running,
         timeout_seconds=BACKTEST_METRICS_TIMEOUT_SECONDS,
         cpu_percent_lt=CPU_PERCENT_LT,
+        max_running_per_worker=per_worker,
     )
 
 
@@ -944,7 +984,7 @@ async def submit_with_queue_control(
     # Always queue requests. Let queue_scheduler dispatch with proper delay
     # to ensure metrics update between submissions and prevent server overload.
     async with QUEUE_STATE_LOCK:
-        enqueue_backtest(backtest_id)
+        get_run_store().enqueue(backtest_id, utc_now())
         update_mapping(
             backtest_id,
             {
@@ -960,7 +1000,7 @@ async def queue_scheduler() -> None:
     while True:
         try:
             async with QUEUE_STATE_LOCK:
-                queued = read_queue()
+                queued = get_run_store().read_queue()
                 # Snapshot global state for this iteration
                 local_reserved = dict(INFLIGHT_MEMORY_GB)
                 local_counts = dict(INFLIGHT_COUNTS)
@@ -1054,7 +1094,7 @@ async def queue_scheduler() -> None:
 
                 async with QUEUE_STATE_LOCK:
                     # Re-verify queue presence (race condition check)
-                    current_queue_ids = {x.get("backtest_id") for x in read_queue()}
+                    current_queue_ids = {x.get("backtest_id") for x in get_run_store().read_queue()}
                     if backtest_id not in current_queue_ids:
                         continue  # Removed by someone else
 
@@ -1066,7 +1106,7 @@ async def queue_scheduler() -> None:
                     if real_available >= required_memory_gb:
                         # Success! Reserve and dequeue
                         reserve_inflight(selection.base_url, required_memory_gb)
-                        remove_from_queue_batch([backtest_id])
+                        get_run_store().remove_from_queue_batch([backtest_id])
                         should_run = True
 
                         # Update local state for next task in this loop
@@ -1127,7 +1167,7 @@ async def queue_scheduler() -> None:
                 except Exception as exc:
                     # If submission fails, put back in queue
                     async with QUEUE_STATE_LOCK:
-                        enqueue_backtest(backtest_id, queued_at=item.get("queued_at"))
+                        get_run_store().enqueue(backtest_id, item.get("queued_at", utc_now()))
                         release_inflight(selection.base_url, required_memory_gb)
 
                     update_mapping(
@@ -1300,15 +1340,13 @@ async def get_queue(
     if limit < 0 or offset < 0:
         raise HTTPException(status_code=400, detail="limit/offset must be >= 0")
     async with QUEUE_STATE_LOCK:
-        items = read_queue()
+        store = get_run_store()
+        items = store.read_queue()
         total = len(items)
         sliced = items[offset : offset + limit] if limit else items[offset:]
         pos = None
         if backtest_id:
-            for idx, item in enumerate(items):
-                if item.get("backtest_id") == backtest_id:
-                    pos = idx
-                    break
+            pos = store.queue_position(backtest_id)
         position_1_based = (pos + 1) if pos is not None else None
     return JSONResponse(
         {
@@ -1328,7 +1366,7 @@ async def delete_queue(
         raise HTTPException(status_code=400, detail="backtest_ids must be a non-empty list of strings")
 
     async with QUEUE_STATE_LOCK:
-        removed = remove_from_queue_batch(backtest_ids)
+        removed = get_run_store().remove_from_queue_batch(backtest_ids)
 
     store = get_run_store()
     existing = store.existing_ids(backtest_ids)
@@ -1518,7 +1556,7 @@ async def kill_backtest_run(backtest_id: str) -> JSONResponse:
     # If still queued, remove from queue and cancel
     if status == "queued" or not base_url:
         async with QUEUE_STATE_LOCK:
-            removed = remove_from_queue_batch([backtest_id])
+            removed = get_run_store().remove_from_queue_batch([backtest_id])
         if backtest_id in removed:
             update_mapping(backtest_id, {"status": "cancelled", "cancelled_at": utc_now()})
             logger.info("kill_backtest_cancelled_queued backtest_id=%s", backtest_id)

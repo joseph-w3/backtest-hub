@@ -33,6 +33,9 @@ services:
       MAX_SYMBOLS: ${MAX_SYMBOLS:-150}
       MAX_RANGE_DAYS: ${MAX_RANGE_DAYS:-90}
       MAX_RUNNING_BACKTESTS: ${MAX_RUNNING_BACKTESTS:-10}
+      # Per-worker max running override. Format: "http://host1:port=5,http://host2:port=3"
+      # Workers not listed fall back to MAX_RUNNING_BACKTESTS.
+      MAX_RUNNING_PER_WORKER: ${MAX_RUNNING_PER_WORKER:-}
       QUEUE_POLL_INTERVAL_SECONDS: ${QUEUE_POLL_INTERVAL_SECONDS:-3}
     volumes:
       - ./data:/opt/backtest
