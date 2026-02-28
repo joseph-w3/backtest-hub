@@ -37,6 +37,7 @@ services:
       # Workers not listed fall back to MAX_RUNNING_BACKTESTS.
       MAX_RUNNING_PER_WORKER: ${MAX_RUNNING_PER_WORKER:-}
       QUEUE_POLL_INTERVAL_SECONDS: ${QUEUE_POLL_INTERVAL_SECONDS:-3}
+      MEMORY_PER_SYMBOL_GB: ${MEMORY_PER_SYMBOL_GB:-1.0}
     volumes:
       - ./data:/opt/backtest
     restart: unless-stopped
