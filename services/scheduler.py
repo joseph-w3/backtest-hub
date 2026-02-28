@@ -196,11 +196,14 @@ def count_running_from_runs_payload(payload: dict[str, Any]) -> int:
     return running
 
 
-def required_memory_gb_from_run_spec(payload: dict[str, Any]) -> float:
+def required_memory_gb_from_run_spec(
+    payload: dict[str, Any],
+    memory_per_symbol_gb: float = 1.0,
+) -> float:
     symbols = payload.get("symbols")
     if not isinstance(symbols, list) or not symbols:
         raise ValueError("symbols must be a non-empty list")
-    return float(len(symbols))
+    return float(len(symbols)) * memory_per_symbol_gb
 
 
 def select_backtest_docker(

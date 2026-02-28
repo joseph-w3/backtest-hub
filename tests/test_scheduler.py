@@ -173,6 +173,16 @@ class TestRequiredMemoryGbFromRunSpec(unittest.TestCase):
         with self.assertRaises(ValueError):
             required_memory_gb_from_run_spec(payload)
 
+    def test_custom_memory_per_symbol(self) -> None:
+        payload = {"symbols": ["BTCUSDT", "ETHUSDT"]}
+        result = required_memory_gb_from_run_spec(payload, memory_per_symbol_gb=2.5)
+        self.assertEqual(result, 5.0)
+
+    def test_default_memory_per_symbol_is_one(self) -> None:
+        payload = {"symbols": ["BTCUSDT", "ETHUSDT"]}
+        result = required_memory_gb_from_run_spec(payload)
+        self.assertEqual(result, 2.0)
+
 
 class TestSelectBacktestDocker(unittest.TestCase):
     """Tests for select_backtest_docker using mocked metrics/runs fetchers."""

@@ -244,6 +244,7 @@ BACKFILL_RESERVE_THRESHOLD_SECONDS = float(os.getenv("BACKFILL_RESERVE_THRESHOLD
 QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_queue.json")))
 MAX_REPORT_PAGE_SIZE = int(os.getenv("MAX_REPORT_PAGE_SIZE", "50"))
 
+MEMORY_PER_SYMBOL_GB = float(os.getenv("MEMORY_PER_SYMBOL_GB", "1.0"))
 BRONZE_SYMBOLS_THRESHOLD = 6
 CPU_PERCENT_LT = 80.0
 
@@ -1089,7 +1090,7 @@ async def queue_scheduler() -> None:
 
                 try:
                     run_spec_payload = await asyncio.to_thread(load_run_spec_payload, backtest_id)
-                    required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload)
+                    required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload, MEMORY_PER_SYMBOL_GB)
                     symbol_count = len(run_spec_payload["symbols"])
                 except Exception as exc:
                     update_mapping(
@@ -1289,7 +1290,7 @@ async def create_run(
         logger.warning("create_run_spec_validation_failed error=%s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload)
+    required_memory_gb = required_memory_gb_from_run_spec(run_spec_payload, MEMORY_PER_SYMBOL_GB)
     symbol_count = len(run_spec_payload["symbols"])
 
     requested_by = run_spec_payload.get("requested_by")
