@@ -308,8 +308,7 @@ def select_backtest_docker(
 
     def sort_key(selection: DockerSelection) -> tuple[float, float]:
         cpu_rank = selection.metrics.cpu_percent if selection.metrics.cpu_percent is not None else 1000.0
-        mem_free_ratio = selection.available_memory_gb / max(selection.metrics.memory_total_gb, 1.0)
-        return (mem_free_ratio, -cpu_rank)
+        return (selection.available_memory_gb, -cpu_rank)
 
     candidates.sort(key=sort_key, reverse=True)
     selected = candidates[0]

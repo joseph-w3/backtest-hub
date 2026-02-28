@@ -832,8 +832,12 @@ class TestDirectSubmitBypassesQueue(unittest.TestCase):
             scheduler.fetch_metrics = original_fetch
 
 
-class TestSortKeyMemoryRatio(unittest.TestCase):
-    """Tests that scheduler sorts by memory free RATIO, not absolute free memory."""
+class TestSortKeyAbsoluteMemoryExisting(unittest.TestCase):
+    """Tests that scheduler sorts by ABSOLUTE free memory, not ratio.
+
+    Previously this class tested ratio-based sorting. Updated to reflect the new
+    requirement: absolute available memory is the primary sort key.
+    """
 
     def _make_metrics(
         self,
@@ -851,13 +855,13 @@ class TestSortKeyMemoryRatio(unittest.TestCase):
             memory_free_gb=free_gb,
         )
 
-    def test_ratio_sort_prefers_less_loaded_small_machine(self) -> None:
+    def test_absolute_sort_prefers_more_free_memory(self) -> None:
         """
-        big_machine:   200GB total, 40GB free  -> 20% free
-        small_machine:  40GB total, 35GB free  -> 87.5% free
+        big_machine:   200GB total, 40GB free  -> 20% free ratio, 40GB absolute
+        small_machine:  40GB total, 35GB free  -> 87.5% free ratio, 35GB absolute
 
-        Old bug: absolute sort picks big_machine (40GB > 35GB).
-        Fixed:   ratio sort picks small_machine (87.5% > 20%).
+        Old (ratio): picks small_machine (87.5% > 20%).
+        New (absolute): picks big_machine (40GB > 35GB).
         """
         from services import scheduler
 
@@ -884,8 +888,8 @@ class TestSortKeyMemoryRatio(unittest.TestCase):
                 timeout_seconds=3.0,
             )
             self.assertIsNotNone(result)
-            # small_machine has higher free ratio (87.5% vs 20%) -> should be selected
-            self.assertEqual(result.base_url, "http://small:8000")
+            # big_machine has more absolute free memory (40GB > 35GB) -> should be selected
+            self.assertEqual(result.base_url, "http://big:8000")
         finally:
             scheduler.fetch_metrics = original_fetch
 
@@ -918,6 +922,142 @@ class TestSortKeyMemoryRatio(unittest.TestCase):
             self.assertIsNotNone(result)
             # Both have 50% free ratio, host2 has lower CPU (30 < 70)
             self.assertEqual(result.base_url, "http://host2:8000")
+        finally:
+            scheduler.fetch_metrics = original_fetch
+
+
+class TestSortKeyAbsoluteMemory(unittest.TestCase):
+    """Tests for sorting by absolute available memory instead of memory ratio."""
+
+    def _make_metrics(
+        self,
+        base_url: str,
+        cpu_percent: float | None,
+        total_gb: float,
+        used_gb: float,
+        free_gb: float,
+    ) -> DockerMetrics:
+        return DockerMetrics(
+            base_url=base_url,
+            cpu_percent=cpu_percent,
+            memory_total_gb=total_gb,
+            memory_used_gb=used_gb,
+            memory_free_gb=free_gb,
+        )
+
+    def test_prefers_more_absolute_free_memory(self) -> None:
+        """
+        Worker A (big):   200GB total, 40GB used, 160GB free, cpu=30%
+        Worker B (small):  55GB total, 10GB used,  45GB free, cpu=10%
+
+        B has higher free ratio (45/55=81.8% vs 160/200=80%), but A has far
+        more absolute free memory (160GB vs 45GB).
+        With absolute-memory sorting, A should be selected.
+        """
+        from services import scheduler
+
+        metrics_store = {
+            "http://big:8000": self._make_metrics("http://big:8000", 30.0, 200.0, 40.0, 160.0),
+            "http://small:8000": self._make_metrics("http://small:8000", 10.0, 55.0, 10.0, 45.0),
+        }
+
+        def mock_fetch_metrics(base_url, metrics_path, headers, timeout_seconds):
+            return metrics_store[base_url]
+
+        original_fetch = scheduler.fetch_metrics
+        scheduler.fetch_metrics = mock_fetch_metrics
+        try:
+            result = select_backtest_docker(
+                base_urls=["http://big:8000", "http://small:8000"],
+                metrics_path="/metrics",
+                runs_path=None,
+                headers={},
+                required_memory_gb=28.0,
+                reserved_memory_gb=None,
+                inflight_counts=None,
+                max_running=None,
+                timeout_seconds=3.0,
+            )
+            self.assertIsNotNone(result)
+            # A has 160GB free vs B's 45GB -> absolute memory picks A
+            self.assertEqual(result.base_url, "http://big:8000")
+        finally:
+            scheduler.fetch_metrics = original_fetch
+
+    def test_cpu_tiebreak_when_same_available_memory(self) -> None:
+        """
+        Worker A: 200GB total, 100GB used, 100GB free, cpu=50%
+        Worker B: 120GB total,  20GB used, 100GB free, cpu=20%
+
+        Both have identical absolute free memory (100GB).
+        CPU should act as tiebreaker: B (20%) wins over A (50%).
+        """
+        from services import scheduler
+
+        metrics_store = {
+            "http://hostA:8000": self._make_metrics("http://hostA:8000", 50.0, 200.0, 100.0, 100.0),
+            "http://hostB:8000": self._make_metrics("http://hostB:8000", 20.0, 120.0, 20.0, 100.0),
+        }
+
+        def mock_fetch_metrics(base_url, metrics_path, headers, timeout_seconds):
+            return metrics_store[base_url]
+
+        original_fetch = scheduler.fetch_metrics
+        scheduler.fetch_metrics = mock_fetch_metrics
+        try:
+            result = select_backtest_docker(
+                base_urls=["http://hostA:8000", "http://hostB:8000"],
+                metrics_path="/metrics",
+                runs_path=None,
+                headers={},
+                required_memory_gb=10.0,
+                reserved_memory_gb=None,
+                inflight_counts=None,
+                max_running=None,
+                timeout_seconds=3.0,
+            )
+            self.assertIsNotNone(result)
+            # Same free memory (100GB each), B has lower CPU (20% < 50%)
+            self.assertEqual(result.base_url, "http://hostB:8000")
+        finally:
+            scheduler.fetch_metrics = original_fetch
+
+    def test_neo256gb_preferred_for_heavy_task(self) -> None:
+        """
+        Worker A (neo-256gb): 200GB total, 80GB used, 120GB free, cpu=45%
+        Worker B (neo-test4):  55GB total, 20GB used,  35GB free, cpu=10%
+
+        B has higher free ratio (35/55=63.6% vs 120/200=60%), and lower CPU.
+        But A has far more absolute free memory (120GB vs 35GB).
+        For a heavy 28GB task, absolute memory sorting should pick A.
+        """
+        from services import scheduler
+
+        metrics_store = {
+            "http://neo256gb:8000": self._make_metrics("http://neo256gb:8000", 45.0, 200.0, 80.0, 120.0),
+            "http://neotest4:8000": self._make_metrics("http://neotest4:8000", 10.0, 55.0, 20.0, 35.0),
+        }
+
+        def mock_fetch_metrics(base_url, metrics_path, headers, timeout_seconds):
+            return metrics_store[base_url]
+
+        original_fetch = scheduler.fetch_metrics
+        scheduler.fetch_metrics = mock_fetch_metrics
+        try:
+            result = select_backtest_docker(
+                base_urls=["http://neo256gb:8000", "http://neotest4:8000"],
+                metrics_path="/metrics",
+                runs_path=None,
+                headers={},
+                required_memory_gb=28.0,
+                reserved_memory_gb=None,
+                inflight_counts=None,
+                max_running=None,
+                timeout_seconds=3.0,
+            )
+            self.assertIsNotNone(result)
+            # A has 120GB free vs B's 35GB -> absolute memory picks A
+            self.assertEqual(result.base_url, "http://neo256gb:8000")
         finally:
             scheduler.fetch_metrics = original_fetch
 
