@@ -791,9 +791,17 @@ def ensure_backtest_routable(backtest_id: str, *, allow_running_only: bool = Tru
     base_url = entry.get("backtest_api_base")
     status = entry.get("status")
     if not isinstance(base_url, str) or not base_url:
-        raise HTTPException(status_code=409, detail="Backtest is still queued")
+        raise HTTPException(status_code=409, detail="Backtest is still queued (no worker assigned yet)")
     if allow_running_only and status not in {"submitted", "running"}:
-        raise HTTPException(status_code=409, detail="Backtest is still queued")
+        hint = (
+            "Use /runs/backtest/{id}/logs/download, "
+            "POST /runs/backtest/reports, or "
+            "GET /runs/backtest/{id}/report instead"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Backtest has {status}. This endpoint is only available while running. {hint}",
+        )
     return entry
 
 
@@ -1428,7 +1436,7 @@ async def get_run(backtest_id: str) -> JSONResponse:
 @app.get("/runs/backtest/{backtest_id}")
 async def get_backtest_status(backtest_id: str) -> JSONResponse:
     logger.info("get_backtest_status_requested backtest_id=%s", backtest_id)
-    entry = ensure_backtest_routable(backtest_id)
+    entry = ensure_backtest_routable(backtest_id, allow_running_only=False)
     base_url = entry["backtest_api_base"]
     payload = fetch_backtest_status(base_url, backtest_id)
     return JSONResponse(payload)

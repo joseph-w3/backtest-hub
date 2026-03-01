@@ -236,6 +236,31 @@ def build_report_router(
             "errors": errors,
         })
 
+    @router.get("/runs/backtest/{backtest_id}/report")
+    async def get_single_report(backtest_id: str) -> JSONResponse:
+        validate_backtest_id(backtest_id)
+        entry = get_run_entry(backtest_id)
+        if not entry or not isinstance(entry, dict):
+            raise HTTPException(status_code=404, detail="Backtest not found")
+        base_url = entry.get("backtest_api_base")
+        if not isinstance(base_url, str) or not base_url:
+            raise HTTPException(status_code=404, detail="Backtest has no worker assigned (still queued?)")
+        service = get_report_service()
+        try:
+            batch = service.fetch_reports_batch(base_url, [backtest_id])
+        except ReportHttpError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        except ReportServiceError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        report = batch.get(backtest_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="Report not available on worker")
+        return JSONResponse({
+            "backtest_id": backtest_id,
+            "backtest_api_base": base_url,
+            "report": report,
+        })
+
     @router.get("/runs/backtest/{backtest_id}/logs/download")
     async def download_logs_endpoint(backtest_id: str) -> StreamingResponse:
         validate_backtest_id(backtest_id)
