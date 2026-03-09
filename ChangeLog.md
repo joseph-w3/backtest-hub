@@ -10,6 +10,7 @@
 - Deleted redundant `services/report_service_bak.py`.
 - Added timeout configuration to `httpx.AsyncClient` for report downloads.
 - Fixed 404 error in `download_logs` and `download_code` by adding missing `/v1` prefix to upstream URLs.
+- Changed default scheduler metrics source to `v1/system/metrics` in `docker-compose.yml` so worker selection uses host-level memory instead of docker cgroup memory unless explicitly overridden.
 
 
 ## [Unreleased]

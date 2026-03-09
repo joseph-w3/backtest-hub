@@ -246,10 +246,11 @@ local_data/
   - 队列与 inflight 通过 `asyncio.Lock` 保护；run mapping/状态落到 SQLite（WAL），upsert 合并通过 store 内部 `threading.Lock` 保护避免并发覆盖。
   - 异常以 HTTP 4xx/5xx 返回并记录日志；backtest docker 请求失败统一返回 502；调度提交失败会回队并记录 `last_error`。
 - Metrics 说明:
-  - metrics 来自 backtest docker 容器内部的 cgroup 数据（`/sys/fs/cgroup/`），反映的是 **docker 容器** 的资源使用，而非整个服务器。
-  - `memory_total_gb` = docker 容器的内存限制
-  - `memory_used_gb` = docker 容器当前使用的内存
-  - `cpu_percent` = docker 容器的 CPU 使用率（归一化到核心数，0-100%）
+  - 默认 metrics 路径是 `v1/system/metrics`，调度以 **宿主机 system metrics** 为主，避免被 worker 容器自身的 cgroup 限额错误收紧。
+  - 可通过 `BACKTEST_METRICS_PATH` 显式改回其他 metrics 端点，但这属于特例配置，不是默认语义。
+  - `memory_total_gb` = 宿主机可见总内存
+  - `memory_used_gb` = 宿主机当前已用内存
+  - `cpu_percent` = worker 上报的系统级 CPU 使用率（归一化到核心数，0-100%）
 
 ### 关键配置
 - 配置文件: `docker-compose.yml`, `run_spec.json`, `pyproject.toml`。
