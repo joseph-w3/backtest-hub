@@ -21,6 +21,7 @@ class TestIntegrationAndResource(unittest.IsolatedAsyncioTestCase):
         app.INFLIGHT_COUNTS.clear()
         app.BACKTEST_API_BASES = ["http://main:8000"]
         app.BACKTEST_BRONZE_API_BASES = ["http://bronze:8000"]
+        app.BRONZE_PAIRS_THRESHOLD = 6
 
     @patch("app.update_mapping")
     async def test_submit_with_queue_control_returns_queued(self, mock_update):
@@ -43,7 +44,7 @@ class TestIntegrationAndResource(unittest.IsolatedAsyncioTestCase):
 
     @patch("app.select_backtest_docker")
     async def test_bronze_scheduling_priority(self, mock_select):
-        """测试 symbol_count < 6 时优先选择青铜节点"""
+        """测试 6 对及以内优先选择青铜节点"""
         # 模拟 select_backtest_docker，第一次调用（青铜节点）返回成功
         mock_bronze_selection = MagicMock(spec=DockerSelection)
         mock_bronze_selection.base_url = "http://bronze:8000"
@@ -53,7 +54,7 @@ class TestIntegrationAndResource(unittest.IsolatedAsyncioTestCase):
 
         selection = await app.pick_backtest_target(
             required_memory_gb=2.0,
-            symbol_count=3  # < BRONZE_SYMBOLS_THRESHOLD (6)
+            symbol_count=12  # 6 pairs
         )
 
         self.assertEqual(selection.base_url, "http://bronze:8000")
@@ -73,7 +74,7 @@ class TestIntegrationAndResource(unittest.IsolatedAsyncioTestCase):
 
         selection = await app.pick_backtest_target(
             required_memory_gb=2.0,
-            symbol_count=3
+            symbol_count=12
         )
 
         self.assertEqual(selection.base_url, "http://main:8000")
@@ -81,6 +82,23 @@ class TestIntegrationAndResource(unittest.IsolatedAsyncioTestCase):
 
         # 检查第二次调用的参数是否为主节点
         args, kwargs = mock_select.call_args_list[1]
+        self.assertEqual(kwargs["base_urls"], app.BACKTEST_API_BASES)
+
+    @patch("app.select_backtest_docker")
+    async def test_seven_pairs_skip_bronze_priority(self, mock_select):
+        """测试超过 6 对后不走青铜优先分流。"""
+        mock_main_selection = MagicMock(spec=DockerSelection)
+        mock_main_selection.base_url = "http://main:8000"
+        mock_select.return_value = mock_main_selection
+
+        selection = await app.pick_backtest_target(
+            required_memory_gb=2.0,
+            symbol_count=14,  # 7 pairs
+        )
+
+        self.assertEqual(selection.base_url, "http://main:8000")
+        mock_select.assert_called_once()
+        _, kwargs = mock_select.call_args
         self.assertEqual(kwargs["base_urls"], app.BACKTEST_API_BASES)
 
     def test_inflight_resource_tracking(self):

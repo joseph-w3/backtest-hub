@@ -245,7 +245,7 @@ QUEUE_PATH = Path(env_or_default("QUEUE_PATH", str(DATA_MOUNT_PATH / "submit_que
 MAX_REPORT_PAGE_SIZE = int(os.getenv("MAX_REPORT_PAGE_SIZE", "50"))
 
 MEMORY_PER_SYMBOL_GB = float(os.getenv("MEMORY_PER_SYMBOL_GB", "1.0"))
-BRONZE_SYMBOLS_THRESHOLD = 6
+BRONZE_PAIRS_THRESHOLD = int(os.getenv("BRONZE_PAIRS_THRESHOLD", "6"))
 CPU_PERCENT_LT = 80.0
 
 CORS_ALLOW_ORIGINS = parse_csv(env_or_default("CORS_ALLOW_ORIGINS", "*"))
@@ -960,10 +960,13 @@ async def pick_backtest_target(
 
     max_running = MAX_RUNNING_BACKTESTS if MAX_RUNNING_BACKTESTS > 0 else None
     per_worker = PER_WORKER_MAX_RUNNING or None
+    # Spread-arb style runs submit spot+perp instruments together. Use pair-equivalent
+    # count so bronze routing is configured in human-facing "pairs" rather than raw symbols.
+    pair_equivalent_count = max(1, (symbol_count + 1) // 2)
     # Need runs_path if global or any per-worker limit is configured
     runs_path = BACKTEST_RUNS_PATH if (max_running is not None or per_worker) else None
 
-    if symbol_count < BRONZE_SYMBOLS_THRESHOLD and BACKTEST_BRONZE_API_BASES:
+    if pair_equivalent_count <= BRONZE_PAIRS_THRESHOLD and BACKTEST_BRONZE_API_BASES:
         bronze = await asyncio.to_thread(
             select_backtest_docker,
             base_urls=BACKTEST_BRONZE_API_BASES,

@@ -241,7 +241,7 @@ local_data/
   - `backtest-hub-cli submit --follow-logs`（或 `scripts/submit_run.py --follow-logs`）通过 WebSocket 拉取日志并落盘到 `./live_logs/{backtest_id}.log`。
 - 控制/调度流程:
   - 调度要求 CPU < 80%；按内存优先：每个 symbol 估算 1GB，依据 metrics 计算可用内存（`free_gb - local_reserved`）决定是否可提交；满足内存后再检查 running 上限（按 docker 维度）。
-  - 若 symbols 数量 < 6 且青铜分组 docker 的 CPU < 80% 且可用内存大于估算内存（1 symbol ≈ 1GB），则优先调度到青铜分组。
+  - 若 pair-equivalent 数量 `<= 6` 且青铜分组 docker 的 CPU < 80% 且可用内存大于估算内存，则优先调度到青铜分组。`pair-equivalent = ceil(symbol_count / 2)`，用于匹配 spot+perp 这类按“币对”思考的任务规模。
   - **所有请求统一入队**，由 `queue_scheduler` 统一调度，确保 30s 延时保护。
   - 队列与 inflight 通过 `asyncio.Lock` 保护；run mapping/状态落到 SQLite（WAL），upsert 合并通过 store 内部 `threading.Lock` 保护避免并发覆盖。
   - 异常以 HTTP 4xx/5xx 返回并记录日志；backtest docker 请求失败统一返回 502；调度提交失败会回队并记录 `last_error`。
@@ -259,6 +259,7 @@ local_data/
     `BACKTEST_REPORT_BATCH_PATH`, `BACKTEST_API_KEY`, `BACKTEST_WS_LOGS_PATH`, `BACKTEST_RUNS_PATH`, `BACKTEST_METRICS_PATH`,
     `BACKTEST_METRICS_TIMEOUT_SECONDS`, `DATA_MOUNT_PATH`, `RUN_STORAGE_PATH`, `HUB_DB_PATH`, `RUN_MAPPING_PATH`（仅迁移用）, `QUEUE_PATH`,
     `BACKTEST_RUNNER_PATH`, `MAX_SYMBOLS`, `MAX_RANGE_DAYS`, `MAX_RUNNING_BACKTESTS`, `MAX_REPORT_PAGE_SIZE`,
+    `MEMORY_PER_SYMBOL_GB`, `BRONZE_PAIRS_THRESHOLD`,
     `QUEUE_POLL_INTERVAL_SECONDS`, `QUEUE_DISPATCH_DELAY_SECONDS`, `BACKFILL_WINDOW_SECONDS`, `BACKFILL_RESERVE_THRESHOLD_SECONDS`。
   - 预留/当前未使用: `BACKTEST_REPORT_PATH`, `BACKTEST_DATA_DOWNLOAD_PATH`, `REPORT_CACHE_PATH`。
   - CORS: `CORS_ALLOW_ORIGINS`（默认 `*`）、`CORS_ALLOW_METHODS`（默认 `*`）、`CORS_ALLOW_HEADERS`（默认 `*`）、`CORS_ALLOW_CREDENTIALS`（默认 `false`）、`CORS_ALLOW_ORIGIN_REGEX`、`CORS_MAX_AGE`（默认 600s）。

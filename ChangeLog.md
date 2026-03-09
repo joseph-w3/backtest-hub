@@ -11,6 +11,7 @@
 - Added timeout configuration to `httpx.AsyncClient` for report downloads.
 - Fixed 404 error in `download_logs` and `download_code` by adding missing `/v1` prefix to upstream URLs.
 - Changed default scheduler metrics source to `v1/system/metrics` in `docker-compose.yml` so worker selection uses host-level memory instead of docker cgroup memory unless explicitly overridden.
+- Changed bronze routing to use `BRONZE_PAIRS_THRESHOLD` (default `6`) based on pair-equivalent count, so runs up to 6 pairs prefer the bronze worker when both workers satisfy memory.
 
 
 ## [Unreleased]
