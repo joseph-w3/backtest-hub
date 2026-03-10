@@ -184,5 +184,113 @@ class TestQueueSchedulerAdvanced(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_submit.call_count, 1)
         mock_store.remove_from_queue_batch.assert_called_once_with(["bt_1"])
 
+    @patch("app.select_backtest_docker")
+    @patch("app.load_run_assets")
+    @patch("app.submit_to_backtest")
+    @patch("app.asyncio.sleep")
+    async def test_queue_scheduler_blocks_second_large_run_when_existing_submitted_reservation_present(
+        self, mock_sleep, mock_submit, mock_assets, mock_select
+    ):
+        """已 submitted 的大任务要继续占用 reservation，避免再次 dispatch 同级大任务。"""
+        queue_item = {"backtest_id": "bt_new", "queued_at": "2026-03-10T11:00:00Z"}
+        submitted_run = {
+            "backtest_id": "bt_existing",
+            "backtest_api_base": "http://host1:8000",
+            "required_memory_gb": 190.0,
+        }
+
+        mock_store = MagicMock()
+        mock_store.read_queue.side_effect = [
+            [queue_item],
+            [queue_item],
+            [queue_item],
+        ]
+
+        def _get_runs_by_status(status: str):
+            if status == "submitted":
+                return [submitted_run]
+            if status == "running":
+                return []
+            return []
+
+        mock_store.get_runs_by_status.side_effect = _get_runs_by_status
+
+        def _select_backtest_docker(**kwargs):
+            reserved = kwargs["reserved_memory_gb"]
+            self.assertEqual(reserved.get("http://host1:8000"), 190.0)
+            return None
+
+        mock_select.side_effect = _select_backtest_docker
+        mock_sleep.side_effect = asyncio.CancelledError()
+
+        with patch("app.get_run_store", return_value=mock_store), \
+             patch.object(app, "MEMORY_PER_SYMBOL_GB", 2.5):
+            with patch("app.load_run_spec_payload", return_value={"symbols": ["A"] * 76}):
+                try:
+                    await app.queue_scheduler()
+                except asyncio.CancelledError:
+                    pass
+
+        mock_select.assert_called_once()
+        mock_assets.assert_not_called()
+        mock_submit.assert_not_called()
+        mock_store.remove_from_queue_batch.assert_not_called()
+
+    @patch("app.select_backtest_docker")
+    @patch("app.load_run_assets")
+    @patch("app.submit_to_backtest")
+    @patch("app.asyncio.sleep")
+    async def test_queue_scheduler_allows_small_run_when_combined_reservation_still_fits(
+        self, mock_sleep, mock_submit, mock_assets, mock_select
+    ):
+        """已有中等任务时，只要总内存仍然 fit，小任务应继续 dispatch。"""
+        queue_item = {"backtest_id": "bt_small", "queued_at": "2026-03-10T11:00:00Z"}
+        submitted_run = {
+            "backtest_id": "bt_existing",
+            "backtest_api_base": "http://host1:8000",
+            "required_memory_gb": 50.0,
+        }
+
+        mock_store = MagicMock()
+        mock_store.read_queue.side_effect = [
+            [queue_item],
+            [queue_item],
+            [],
+        ]
+        mock_store.remove_from_queue_batch.return_value = {"bt_small"}
+
+        def _get_runs_by_status(status: str):
+            if status == "submitted":
+                return [submitted_run]
+            if status == "running":
+                return []
+            return []
+
+        mock_store.get_runs_by_status.side_effect = _get_runs_by_status
+
+        def _select_backtest_docker(**kwargs):
+            reserved = kwargs["reserved_memory_gb"]
+            self.assertEqual(reserved.get("http://host1:8000"), 50.0)
+            selection = MagicMock()
+            selection.base_url = "http://host1:8000"
+            selection.metrics.memory_free_gb = 120.0
+            return selection
+
+        mock_select.side_effect = _select_backtest_docker
+        mock_assets.return_value = (b"{}", "strategy.py", b"code", None, None, b"runner")
+        mock_submit.return_value = "docker_run_small"
+        mock_sleep.side_effect = [None, asyncio.CancelledError()]
+
+        with patch("app.get_run_store", return_value=mock_store), \
+             patch.object(app, "MEMORY_PER_SYMBOL_GB", 2.5):
+            with patch("app.load_run_spec_payload", return_value={"symbols": ["A"] * 10}):
+                try:
+                    await app.queue_scheduler()
+                except asyncio.CancelledError:
+                    pass
+
+        mock_submit.assert_called_once()
+        mock_store.remove_from_queue_batch.assert_called_once_with(["bt_small"])
+
 if __name__ == "__main__":
     unittest.main()

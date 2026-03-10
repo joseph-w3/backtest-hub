@@ -312,6 +312,7 @@ RUN_STORE: SqliteRunStore | None = None
 QUEUE_STATE_LOCK = asyncio.Lock()
 INFLIGHT_MEMORY_GB: dict[str, float] = {}
 INFLIGHT_COUNTS: dict[str, int] = {}
+ACTIVE_RUN_STATUSES = ("submitted", "running")
 
 
 def utc_now() -> str:
@@ -387,6 +388,61 @@ def release_inflight(base_url: str, required_memory_gb: float) -> None:
         INFLIGHT_COUNTS[base_url] = max(0, INFLIGHT_COUNTS[base_url] - 1)
         if INFLIGHT_COUNTS[base_url] == 0:
             INFLIGHT_COUNTS.pop(base_url, None)
+
+
+def _sum_overlay_floats(*overlays: dict[str, float]) -> dict[str, float]:
+    merged: dict[str, float] = {}
+    for overlay in overlays:
+        for base_url, value in overlay.items():
+            merged[base_url] = merged.get(base_url, 0.0) + value
+    return merged
+
+
+def _sum_overlay_counts(*overlays: dict[str, int]) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for overlay in overlays:
+        for base_url, value in overlay.items():
+            merged[base_url] = merged.get(base_url, 0) + value
+    return merged
+
+
+def snapshot_active_worker_reservations(
+    store: SqliteRunStore | None = None,
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Return memory/count reservations for already-submitted work.
+
+    Queue dispatch must account for tasks that are already bound to a worker but
+    whose actual RSS has not yet fully materialized in host metrics.
+    """
+    active_store = store or get_run_store()
+    reserved_memory: dict[str, float] = {}
+    active_counts: dict[str, int] = {}
+
+    for status in ACTIVE_RUN_STATUSES:
+        try:
+            runs = active_store.get_runs_by_status(status)
+        except Exception:
+            continue
+        if not isinstance(runs, list):
+            continue
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            base_url = run.get("backtest_api_base")
+            if not isinstance(base_url, str) or not base_url:
+                continue
+            required_memory_gb = run.get("required_memory_gb")
+            try:
+                required_memory = float(required_memory_gb)
+            except Exception:
+                continue
+            if required_memory <= 0:
+                continue
+            normalized_base = base_url.rstrip("/")
+            reserved_memory[normalized_base] = reserved_memory.get(normalized_base, 0.0) + required_memory
+            active_counts[normalized_base] = active_counts.get(normalized_base, 0) + 1
+
+    return reserved_memory, active_counts
 
 
 def parse_iso8601(value: str) -> datetime:
@@ -1035,9 +1091,11 @@ async def queue_scheduler() -> None:
         try:
             async with QUEUE_STATE_LOCK:
                 queued = get_run_store().read_queue()
-                # Snapshot global state for this iteration
-                local_reserved = dict(INFLIGHT_MEMORY_GB)
-                local_counts = dict(INFLIGHT_COUNTS)
+                # Snapshot worker reservations for this iteration. Persisted submitted/running
+                # runs keep reserving capacity until workers report terminal status.
+                persisted_reserved, persisted_counts = snapshot_active_worker_reservations(get_run_store())
+                local_reserved = _sum_overlay_floats(persisted_reserved, INFLIGHT_MEMORY_GB)
+                local_counts = _sum_overlay_counts(persisted_counts, INFLIGHT_COUNTS)
 
             if not queued:
                 await asyncio.sleep(QUEUE_POLL_INTERVAL_SECONDS)
