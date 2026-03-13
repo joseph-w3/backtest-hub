@@ -10,6 +10,8 @@ import re
 import secrets
 import shutil
 import sys
+import threading
+import time
 import traceback
 import zipfile
 from datetime import datetime
@@ -122,6 +124,13 @@ LATENCY_CONFIG_KEYS = set(DEFAULT_LATENCY_CONFIG.keys())
 
 # CSV report outputs live alongside status.json under BACKTEST_LOGS_PATH/{backtest_id}/.
 REPORTS_OUTPUT_ROOT = os.environ.get("BACKTEST_LOGS_PATH", "/opt/backtest_logs")
+PROGRESS_UPDATE_SECONDS = max(
+    1.0,
+    float(os.environ.get("BACKTEST_PROGRESS_UPDATE_SECONDS", "15")),
+)
+SIMULATED_TIME_PATTERN = re.compile(
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)"
+)
 
 REQUIRED_FIELDS = {
     "backtest_id",
@@ -761,9 +770,13 @@ def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
         "strategy_file": run_spec.get("strategy_file"),
         "strategy_bundle": run_spec.get("strategy_bundle"),
         "symbols": run_spec["symbols"],
+        "symbol_count": len(run_spec["symbols"]),
         "start": run_spec["start"],
         "end": run_spec["end"],
         "tags": run_spec["tags"],
+        "phase": "initializing",
+        "last_progress_at": datetime.now(timezone.utc).isoformat(),
+        "simulated_time": None,
     }
 
 
@@ -771,6 +784,58 @@ def _write_status(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=True, indent=2)
+
+
+def _extract_latest_simulated_time(stdout_path: Path) -> str | None:
+    if not stdout_path.exists():
+        return None
+
+    try:
+        size = stdout_path.stat().st_size
+    except OSError:
+        return None
+
+    try:
+        with stdout_path.open("rb") as handle:
+            if size > 1024 * 1024:
+                handle.seek(size - 1024 * 1024)
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    matches = list(SIMULATED_TIME_PATTERN.finditer(text))
+    if not matches:
+        return None
+    return matches[-1].group(1)
+
+
+def _start_progress_heartbeat(
+    *,
+    status_path: Path,
+    status: dict,
+    status_lock: threading.Lock,
+    stdout_path: Path | None,
+) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+
+    def _tick() -> None:
+        while not stop_event.wait(PROGRESS_UPDATE_SECONDS):
+            with status_lock:
+                status["last_progress_at"] = datetime.now(timezone.utc).isoformat()
+                if stdout_path is not None:
+                    simulated_time = _extract_latest_simulated_time(stdout_path)
+                    if simulated_time:
+                        status["simulated_time"] = simulated_time
+                snapshot = dict(status)
+            _write_status(status_path, snapshot)
+
+    thread = threading.Thread(
+        target=_tick,
+        name="backtest-progress-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return stop_event, thread
 
 
 def _export_csv_reports(
@@ -963,6 +1028,9 @@ def main() -> int:
     status = _build_status_payload(backtest_id, run_spec)
     status.update({"status": "running", "started_at": started_at})
     _write_status(status_path, status)
+    status_lock = threading.Lock()
+    heartbeat_stop: threading.Event | None = None
+    heartbeat_thread: threading.Thread | None = None
 
     try:
         random.seed(run_spec["seed"])
@@ -1202,11 +1270,40 @@ def main() -> int:
             configs=[run_config],
             instruments=spot_instruments + futures_instruments,
         )
+        stdout_path_raw = os.environ.get("BACKTEST_STDOUT_PATH")
+        stdout_path = Path(stdout_path_raw).expanduser() if stdout_path_raw else None
+        with status_lock:
+            status["phase"] = "engine_running"
+            status["last_progress_at"] = datetime.now(timezone.utc).isoformat()
+            if stdout_path is not None:
+                simulated_time = _extract_latest_simulated_time(stdout_path)
+                if simulated_time:
+                    status["simulated_time"] = simulated_time
+            _write_status(status_path, dict(status))
+        heartbeat_stop, heartbeat_thread = _start_progress_heartbeat(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+        )
         node.run()
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1.0)
 
         engine = node.get_engine(run_config.id)
         if engine is None:
             raise RuntimeError("Backtest engine not found for run config.")
+
+        with status_lock:
+            status["phase"] = "exporting_reports"
+            status["last_progress_at"] = datetime.now(timezone.utc).isoformat()
+            if stdout_path is not None:
+                simulated_time = _extract_latest_simulated_time(stdout_path)
+                if simulated_time:
+                    status["simulated_time"] = simulated_time
+            _write_status(status_path, dict(status))
 
         reports, report_errors = _export_csv_reports(
             engine,
@@ -1228,17 +1325,25 @@ def main() -> int:
         status.update(
             {
                 "status": "success",
+                "phase": "completed",
                 "finished_at": datetime.now(timezone.utc).isoformat(),
+                "last_progress_at": datetime.now(timezone.utc).isoformat(),
             }
         )
         _write_status(status_path, status)
         return 0
     except Exception as exc:
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1.0)
         tb = traceback.format_exc()
         status.update(
             {
                 "status": "failed",
+                "phase": "failed",
                 "finished_at": datetime.now(timezone.utc).isoformat(),
+                "last_progress_at": datetime.now(timezone.utc).isoformat(),
                 "error": str(exc),
                 "traceback": tb,
             }

@@ -112,6 +112,38 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
             self.assertEqual(payload["strategy_bundle"], "bundle.zip")
             self.assertIn("strategy_file", payload)
             self.assertIsNone(payload["strategy_file"])
+            self.assertEqual(payload["symbol_count"], 1)
+            self.assertEqual(payload["phase"], "initializing")
+            self.assertIn("last_progress_at", payload)
+            self.assertIsNone(payload["simulated_time"])
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_extract_latest_simulated_time_from_stdout_tail(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            with unittest.mock.patch("pathlib.Path.stat") as _:
+                pass
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory() as td:
+                stdout_path = Path(td) / "stdout.log"
+                stdout_path.write_text(
+                    "\n".join(
+                        [
+                            "2026-03-13T21:06:51.000000000Z [INFO] bootstrap",
+                            "2026-03-13T21:06:53.925544242Z [INFO] BACKTESTER-001.DataEngine: Registered BACKTEST",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    run_backtest._extract_latest_simulated_time(stdout_path),
+                    "2026-03-13T21:06:53.925544242Z",
+                )
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:

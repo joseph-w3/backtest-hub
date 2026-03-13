@@ -346,6 +346,39 @@ class TestRunSpecEndpoint(unittest.TestCase):
         resp = client.get("/runs/backtest/bt1/report")
         self.assertEqual(resp.status_code, 502)
 
+
+class TestProgressEndpoint(unittest.TestCase):
+    def test_returns_worker_progress_for_existing_backtest(self) -> None:
+        mapping = {
+            "bt1": {"backtest_api_base": "http://worker-a", "run_id": "run-1", "requested_by": "tester"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/batch"),
+            backtest_headers=lambda: {},
+        )
+        service.fetch_progress = lambda base_url, backtest_id: {  # type: ignore[attr-defined,method-assign]
+            "backtest_id": backtest_id,
+            "run_id": "run-1",
+            "progress": {
+                "phase": "engine_running",
+                "simulated_time": "2026-01-17T03:42:00Z",
+                "symbol_count": 4,
+            },
+        }
+
+        client = TestClient(make_report_app(mapping, service))
+        resp = client.get("/runs/backtest/bt1/progress")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["backtest_id"], "bt1")
+        self.assertEqual(data["run_id"], "run-1")
+        self.assertEqual(data["progress"]["phase"], "engine_running")
+
+    def test_progress_not_found_backtest_returns_404(self) -> None:
+        client = TestClient(make_report_app({}))
+        resp = client.get("/runs/backtest/nonexistent/progress")
+        self.assertEqual(resp.status_code, 404)
+
     def test_invalid_id_returns_400(self) -> None:
         client = TestClient(make_report_app({}))
         resp = client.get("/runs/backtest/test.id/report")
