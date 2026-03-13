@@ -291,6 +291,7 @@ def build_report_router(
         validate_backtest_id(backtest_id)
         entry = get_run_entry(backtest_id)
         service = get_report_service()
+        upstream_error: HTTPException | None = None
 
         if entry and isinstance(entry, dict):
             base_url = entry.get("backtest_api_base")
@@ -298,12 +299,15 @@ def build_report_router(
                 try:
                     payload = service.fetch_run_spec(base_url, backtest_id)
                 except ReportHttpError as exc:
-                    raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+                    upstream_error = HTTPException(status_code=exc.status_code, detail=exc.detail)
                 except ReportServiceError as exc:
-                    raise HTTPException(status_code=502, detail=str(exc)) from exc
-                return JSONResponse(payload)
+                    upstream_error = HTTPException(status_code=502, detail=str(exc))
+                else:
+                    return JSONResponse(payload)
 
         if load_run_spec is None:
+            if upstream_error is not None:
+                raise upstream_error
             raise HTTPException(status_code=404, detail="Run spec not available")
 
         try:
@@ -313,6 +317,8 @@ def build_report_router(
         except ValueError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         except Exception as exc:
+            if upstream_error is not None:
+                raise upstream_error
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         requested_by = entry.get("requested_by") if isinstance(entry, dict) else None

@@ -296,6 +296,38 @@ class TestRunSpecEndpoint(unittest.TestCase):
         data = resp.json()
         self.assertEqual(data["source"], "hub_local")
         self.assertEqual(data["run_spec"]["symbols"], ["ETHUSDT", "ETHUSDT-PERP"])
+
+    def test_falls_back_to_local_run_spec_when_worker_lacks_endpoint(self) -> None:
+        mapping = {
+            "bt1": {"backtest_api_base": "http://worker-a", "run_id": "run-1", "requested_by": "tester"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/batch"),
+            backtest_headers=lambda: {},
+        )
+
+        def missing_endpoint(base_url: str, backtest_id: str) -> dict[str, Any]:
+            raise ReportHttpError(404, "Not Found")
+
+        service.fetch_run_spec = missing_endpoint  # type: ignore[method-assign]
+
+        app = FastAPI()
+        app.include_router(
+            build_report_router(
+                get_report_service=lambda: service,
+                get_run_entry=lambda backtest_id: mapping.get(backtest_id),
+                get_runs_by_ids=lambda backtest_ids: {bid: mapping[bid] for bid in backtest_ids if bid in mapping},
+                list_submitted_ids=lambda a, b: [],
+                load_run_spec=lambda backtest_id: {"symbols": ["SOLUSDT", "SOLUSDT-PERP"]},
+            )
+        )
+        client = TestClient(app)
+        resp = client.get("/runs/backtest/bt1/run_spec")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["source"], "hub_local")
+        self.assertEqual(data["run_spec"]["symbols"], ["SOLUSDT", "SOLUSDT-PERP"])
+
     def test_worker_invalid_payload_returns_502(self) -> None:
         mapping = {"bt1": {"backtest_api_base": "http://worker-a"}}
         service = ReportService(
