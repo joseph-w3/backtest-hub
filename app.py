@@ -715,6 +715,7 @@ app.include_router(
         get_run_entry=lambda backtest_id: get_run_store().get_run(backtest_id),
         get_runs_by_ids=lambda backtest_ids: get_run_store().get_runs_by_ids(backtest_ids),
         list_submitted_ids=lambda after_dt, before_dt: get_run_store().list_submitted_ids(after_dt, before_dt),
+        load_run_spec=lambda backtest_id: load_run_spec_payload(backtest_id),
     )
 )
 

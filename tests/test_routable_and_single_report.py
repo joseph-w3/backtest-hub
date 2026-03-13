@@ -246,6 +246,56 @@ class TestSingleReportEndpoint(unittest.TestCase):
         resp = client.get("/runs/backtest/bt1/report")
         self.assertEqual(resp.status_code, 502)
 
+
+class TestRunSpecEndpoint(unittest.TestCase):
+    def test_returns_worker_run_spec_for_existing_backtest(self) -> None:
+        mapping = {
+            "bt1": {"backtest_api_base": "http://worker-a", "run_id": "run-1", "requested_by": "tester"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/batch"),
+            backtest_headers=lambda: {},
+        )
+        service.fetch_run_spec = lambda base_url, backtest_id: {  # type: ignore[method-assign]
+            "backtest_id": backtest_id,
+            "run_id": "run-1",
+            "requested_by": "tester",
+            "run_spec": {"symbols": ["BTCUSDT", "BTCUSDT-PERP"]},
+        }
+
+        client = TestClient(make_report_app(mapping, service))
+        resp = client.get("/runs/backtest/bt1/run_spec")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["run_id"], "run-1")
+        self.assertEqual(data["requested_by"], "tester")
+        self.assertEqual(data["run_spec"]["symbols"], ["BTCUSDT", "BTCUSDT-PERP"])
+
+    def test_falls_back_to_local_run_spec_when_worker_missing(self) -> None:
+        mapping = {
+            "bt1": {"status": "queued", "run_id": "run-1", "requested_by": "tester"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/batch"),
+            backtest_headers=lambda: {},
+        )
+
+        app = FastAPI()
+        app.include_router(
+            build_report_router(
+                get_report_service=lambda: service,
+                get_run_entry=lambda backtest_id: mapping.get(backtest_id),
+                get_runs_by_ids=lambda backtest_ids: {bid: mapping[bid] for bid in backtest_ids if bid in mapping},
+                list_submitted_ids=lambda a, b: [],
+                load_run_spec=lambda backtest_id: {"symbols": ["ETHUSDT", "ETHUSDT-PERP"]},
+            )
+        )
+        client = TestClient(app)
+        resp = client.get("/runs/backtest/bt1/run_spec")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["source"], "hub_local")
+        self.assertEqual(data["run_spec"]["symbols"], ["ETHUSDT", "ETHUSDT-PERP"])
     def test_worker_invalid_payload_returns_502(self) -> None:
         mapping = {"bt1": {"backtest_api_base": "http://worker-a"}}
         service = ReportService(

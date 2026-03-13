@@ -119,6 +119,30 @@ class ReportService:
         )
         return results
 
+    def fetch_run_spec(self, base_url: str, backtest_id: str) -> dict[str, Any]:
+        url = normalize_join_url(base_url, f"/v1/runs/backtest/{backtest_id}/run_spec")
+        headers = dict(self._backtest_headers())
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        LOGGER.info("run_spec_fetch_start base=%s backtest_id=%s", base_url, backtest_id)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                payload_bytes = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8")
+            LOGGER.info("run_spec_fetch_http_error base=%s status=%s", base_url, exc.code)
+            raise ReportHttpError(exc.code, detail or "backtest error") from exc
+        except Exception as exc:
+            LOGGER.info("run_spec_fetch_error base=%s error=%s", base_url, exc)
+            raise ReportFetchError(str(exc)) from exc
+
+        try:
+            payload = json.loads(payload_bytes.decode("utf-8"))
+        except Exception as exc:
+            raise ReportInvalidPayload("invalid json response") from exc
+        if not isinstance(payload, dict):
+            raise ReportInvalidPayload("invalid response")
+        return payload
+
     async def _create_download_request(self, base_url: str, path: str) -> tuple[httpx.AsyncClient, httpx.Response]:
         url = normalize_join_url(base_url, path)
         headers = dict(self._backtest_headers())
@@ -158,6 +182,7 @@ def build_report_router(
     get_run_entry: Callable[[str], dict[str, Any] | None],
     get_runs_by_ids: Callable[[list[str]], dict[str, dict[str, Any]]],
     list_submitted_ids: Callable[[datetime | None, datetime | None], list[str]],
+    load_run_spec: Callable[[str], dict[str, Any]] | None = None,
 ) -> APIRouter:
     router = APIRouter(tags=["report_service"])
 
@@ -259,6 +284,45 @@ def build_report_router(
             "backtest_id": backtest_id,
             "backtest_api_base": base_url,
             "report": report,
+        })
+
+    @router.get("/runs/backtest/{backtest_id}/run_spec")
+    async def get_run_spec(backtest_id: str) -> JSONResponse:
+        validate_backtest_id(backtest_id)
+        entry = get_run_entry(backtest_id)
+        service = get_report_service()
+
+        if entry and isinstance(entry, dict):
+            base_url = entry.get("backtest_api_base")
+            if isinstance(base_url, str) and base_url:
+                try:
+                    payload = service.fetch_run_spec(base_url, backtest_id)
+                except ReportHttpError as exc:
+                    raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+                except ReportServiceError as exc:
+                    raise HTTPException(status_code=502, detail=str(exc)) from exc
+                return JSONResponse(payload)
+
+        if load_run_spec is None:
+            raise HTTPException(status_code=404, detail="Run spec not available")
+
+        try:
+            run_spec = load_run_spec(backtest_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Run spec not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        requested_by = entry.get("requested_by") if isinstance(entry, dict) else None
+        run_id = entry.get("run_id") if isinstance(entry, dict) else None
+        return JSONResponse({
+            "backtest_id": backtest_id,
+            "run_id": run_id,
+            "requested_by": requested_by,
+            "run_spec": run_spec,
+            "source": "hub_local",
         })
 
     @router.get("/runs/backtest/{backtest_id}/logs/download")
