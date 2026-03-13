@@ -273,7 +273,7 @@ class TestRunSpecEndpoint(unittest.TestCase):
 
     def test_falls_back_to_local_run_spec_when_worker_missing(self) -> None:
         mapping = {
-            "bt1": {"status": "queued", "run_id": "run-1", "requested_by": "tester"},
+            "bt1": {"status": "queued", "backtest_docker_run_id": "run-1", "requested_by": "tester"},
         }
         service = ReportService(
             ReportServiceConfig(report_batch_path="/batch"),
@@ -294,12 +294,13 @@ class TestRunSpecEndpoint(unittest.TestCase):
         resp = client.get("/runs/backtest/bt1/run_spec")
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
+        self.assertEqual(data["run_id"], "run-1")
         self.assertEqual(data["source"], "hub_local")
         self.assertEqual(data["run_spec"]["symbols"], ["ETHUSDT", "ETHUSDT-PERP"])
 
     def test_falls_back_to_local_run_spec_when_worker_lacks_endpoint(self) -> None:
         mapping = {
-            "bt1": {"backtest_api_base": "http://worker-a", "run_id": "run-1", "requested_by": "tester"},
+            "bt1": {"backtest_api_base": "http://worker-a", "backtest_docker_run_id": "run-1", "requested_by": "tester"},
         }
         service = ReportService(
             ReportServiceConfig(report_batch_path="/batch"),
@@ -325,6 +326,7 @@ class TestRunSpecEndpoint(unittest.TestCase):
         resp = client.get("/runs/backtest/bt1/run_spec")
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
+        self.assertEqual(data["run_id"], "run-1")
         self.assertEqual(data["source"], "hub_local")
         self.assertEqual(data["run_spec"]["symbols"], ["SOLUSDT", "SOLUSDT-PERP"])
 

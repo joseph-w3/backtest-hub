@@ -322,7 +322,11 @@ def build_report_router(
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         requested_by = entry.get("requested_by") if isinstance(entry, dict) else None
-        run_id = entry.get("run_id") if isinstance(entry, dict) else None
+        run_id = None
+        if isinstance(entry, dict):
+            raw_run_id = entry.get("run_id") or entry.get("backtest_docker_run_id")
+            if isinstance(raw_run_id, str) and raw_run_id:
+                run_id = raw_run_id
         return JSONResponse({
             "backtest_id": backtest_id,
             "run_id": run_id,
