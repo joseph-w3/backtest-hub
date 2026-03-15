@@ -167,6 +167,41 @@ class ReportService:
             raise ReportInvalidPayload("invalid response")
         return payload
 
+    def fetch_ledger(
+        self,
+        base_url: str,
+        backtest_id: str,
+        *,
+        limit: int,
+        tail: bool,
+    ) -> dict[str, Any]:
+        tail_flag = "true" if tail else "false"
+        url = normalize_join_url(
+            base_url,
+            f"/v1/runs/backtest/{backtest_id}/ledger?limit={int(limit)}&tail={tail_flag}",
+        )
+        headers = dict(self._backtest_headers())
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        LOGGER.info("ledger_fetch_start base=%s backtest_id=%s", base_url, backtest_id)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                payload_bytes = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8")
+            LOGGER.info("ledger_fetch_http_error base=%s status=%s", base_url, exc.code)
+            raise ReportHttpError(exc.code, detail or "backtest error") from exc
+        except Exception as exc:
+            LOGGER.info("ledger_fetch_error base=%s error=%s", base_url, exc)
+            raise ReportFetchError(str(exc)) from exc
+
+        try:
+            payload = json.loads(payload_bytes.decode("utf-8"))
+        except Exception as exc:
+            raise ReportInvalidPayload("invalid json response") from exc
+        if not isinstance(payload, dict):
+            raise ReportInvalidPayload("invalid response")
+        return payload
+
     async def _create_download_request(self, base_url: str, path: str) -> tuple[httpx.AsyncClient, httpx.Response]:
         url = normalize_join_url(base_url, path)
         headers = dict(self._backtest_headers())
@@ -207,8 +242,24 @@ def build_report_router(
     get_runs_by_ids: Callable[[list[str]], dict[str, dict[str, Any]]],
     list_submitted_ids: Callable[[datetime | None, datetime | None], list[str]],
     load_run_spec: Callable[[str], dict[str, Any]] | None = None,
+    list_candidate_base_urls: Callable[[str], list[str]] | None = None,
 ) -> APIRouter:
     router = APIRouter(tags=["report_service"])
+
+    def iter_candidate_base_urls(backtest_id: str, entry: dict[str, Any] | None) -> list[str]:
+        candidates: list[str] = []
+
+        if isinstance(entry, dict):
+            base_url = entry.get("backtest_api_base")
+            if isinstance(base_url, str) and base_url:
+                candidates.append(base_url)
+
+        if candidates and list_candidate_base_urls is not None:
+            for base_url in list_candidate_base_urls(backtest_id):
+                if isinstance(base_url, str) and base_url and base_url not in candidates:
+                    candidates.append(base_url)
+
+        return candidates
 
     @router.get("/runs/backtest/ids")
     async def list_backtest_ids(
@@ -237,21 +288,78 @@ def build_report_router(
         entry = get_run_entry(backtest_id)
         if not isinstance(entry, dict):
             raise HTTPException(status_code=404, detail="backtest_id not found")
-        base_url = entry.get("backtest_api_base")
-        if not isinstance(base_url, str) or not base_url:
+        candidate_base_urls = iter_candidate_base_urls(backtest_id, entry)
+        if not candidate_base_urls:
             raise HTTPException(status_code=404, detail="backtest worker not assigned")
 
         service = get_report_service()
-        try:
-            payload = service.fetch_progress(base_url, backtest_id)
-        except ReportHttpError as exc:
-            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-        except ReportInvalidPayload as exc:
-            raise HTTPException(status_code=502, detail=exc.detail) from exc
-        except ReportFetchError as exc:
-            raise HTTPException(status_code=502, detail=exc.detail) from exc
+        last_error: HTTPException | None = None
+        for base_url in candidate_base_urls:
+            try:
+                payload = service.fetch_progress(base_url, backtest_id)
+            except ReportHttpError as exc:
+                last_error = HTTPException(status_code=exc.status_code, detail=exc.detail)
+                LOGGER.info("progress_fetch_retry backtest_id=%s base=%s status=%s", backtest_id, base_url, exc.status_code)
+                continue
+            except ReportInvalidPayload as exc:
+                last_error = HTTPException(status_code=502, detail=exc.detail)
+                LOGGER.info("progress_fetch_retry backtest_id=%s base=%s invalid_payload=%s", backtest_id, base_url, exc.detail)
+                continue
+            except ReportFetchError as exc:
+                last_error = HTTPException(status_code=502, detail=exc.detail)
+                LOGGER.info("progress_fetch_retry backtest_id=%s base=%s fetch_error=%s", backtest_id, base_url, exc.detail)
+                continue
 
-        return JSONResponse(payload)
+            return JSONResponse(payload)
+
+        if last_error is not None:
+            raise last_error
+        raise HTTPException(status_code=404, detail="backtest worker not assigned")
+
+    @router.get("/runs/backtest/{backtest_id}/ledger")
+    async def get_backtest_ledger(
+        backtest_id: str,
+        limit: int = 200,
+        tail: bool = True,
+    ) -> JSONResponse:
+        validate_backtest_id(backtest_id)
+        entry = get_run_entry(backtest_id)
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=404, detail="backtest_id not found")
+        candidate_base_urls = iter_candidate_base_urls(backtest_id, entry)
+        if not candidate_base_urls:
+            raise HTTPException(status_code=404, detail="backtest worker not assigned")
+
+        service = get_report_service()
+        normalized_limit = max(1, min(int(limit), 5000))
+        normalized_tail = bool(tail)
+        last_error: HTTPException | None = None
+        for base_url in candidate_base_urls:
+            try:
+                payload = service.fetch_ledger(
+                    base_url,
+                    backtest_id,
+                    limit=normalized_limit,
+                    tail=normalized_tail,
+                )
+            except ReportHttpError as exc:
+                last_error = HTTPException(status_code=exc.status_code, detail=exc.detail)
+                LOGGER.info("ledger_fetch_retry backtest_id=%s base=%s status=%s", backtest_id, base_url, exc.status_code)
+                continue
+            except ReportInvalidPayload as exc:
+                last_error = HTTPException(status_code=502, detail=exc.detail)
+                LOGGER.info("ledger_fetch_retry backtest_id=%s base=%s invalid_payload=%s", backtest_id, base_url, exc.detail)
+                continue
+            except ReportFetchError as exc:
+                last_error = HTTPException(status_code=502, detail=exc.detail)
+                LOGGER.info("ledger_fetch_retry backtest_id=%s base=%s fetch_error=%s", backtest_id, base_url, exc.detail)
+                continue
+
+            return JSONResponse(payload)
+
+        if last_error is not None:
+            raise last_error
+        raise HTTPException(status_code=404, detail="backtest worker not assigned")
 
     @router.post("/runs/backtest/reports")
     async def batch_get_reports(req: BatchReportsRequest) -> JSONResponse:
@@ -340,14 +448,15 @@ def build_report_router(
         upstream_error: HTTPException | None = None
 
         if entry and isinstance(entry, dict):
-            base_url = entry.get("backtest_api_base")
-            if isinstance(base_url, str) and base_url:
+            for base_url in iter_candidate_base_urls(backtest_id, entry):
                 try:
                     payload = service.fetch_run_spec(base_url, backtest_id)
                 except ReportHttpError as exc:
                     upstream_error = HTTPException(status_code=exc.status_code, detail=exc.detail)
+                    LOGGER.info("run_spec_fetch_retry backtest_id=%s base=%s status=%s", backtest_id, base_url, exc.status_code)
                 except ReportServiceError as exc:
                     upstream_error = HTTPException(status_code=502, detail=str(exc))
+                    LOGGER.info("run_spec_fetch_retry backtest_id=%s base=%s error=%s", backtest_id, base_url, exc)
                 else:
                     return JSONResponse(payload)
 

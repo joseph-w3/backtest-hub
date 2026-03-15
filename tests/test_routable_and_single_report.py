@@ -29,7 +29,11 @@ from services.report_service import (
 # ---------------------------------------------------------------------------
 # Helper: build a report-router test app (same pattern as test_report_cache)
 # ---------------------------------------------------------------------------
-def make_report_app(mapping: dict[str, Any], service: ReportService | None = None) -> FastAPI:
+def make_report_app(
+    mapping: dict[str, Any],
+    service: ReportService | None = None,
+    candidate_base_urls: list[str] | None = None,
+) -> FastAPI:
     if service is None:
         service = ReportService(
             ReportServiceConfig(report_batch_path="/v1/runs/backtest/reports/batch"),
@@ -55,6 +59,7 @@ def make_report_app(mapping: dict[str, Any], service: ReportService | None = Non
             get_run_entry=get_run_entry,
             get_runs_by_ids=get_runs_by_ids,
             list_submitted_ids=lambda a, b: [],
+            list_candidate_base_urls=lambda backtest_id: list(candidate_base_urls or []),
         )
     )
     return test_app
@@ -330,6 +335,33 @@ class TestRunSpecEndpoint(unittest.TestCase):
         self.assertEqual(data["source"], "hub_local")
         self.assertEqual(data["run_spec"]["symbols"], ["SOLUSDT", "SOLUSDT-PERP"])
 
+    def test_retries_alternate_worker_base_when_mapping_base_is_stale(self) -> None:
+        mapping = {
+            "bt1": {"backtest_api_base": "http://stale-worker", "backtest_docker_run_id": "run-1", "requested_by": "tester"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/batch"),
+            backtest_headers=lambda: {},
+        )
+
+        def fetch_run_spec(base_url: str, backtest_id: str) -> dict[str, Any]:
+            if base_url == "http://stale-worker":
+                raise ReportFetchError("connection refused")
+            return {
+                "backtest_id": backtest_id,
+                "run_id": "run-1",
+                "requested_by": "tester",
+                "run_spec": {"symbols": ["BTCUSDT", "ETHUSDT"]},
+            }
+
+        service.fetch_run_spec = fetch_run_spec  # type: ignore[method-assign]
+
+        client = TestClient(make_report_app(mapping, service, candidate_base_urls=["http://worker-b"]))
+        resp = client.get("/runs/backtest/bt1/run_spec")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["run_spec"]["symbols"], ["BTCUSDT", "ETHUSDT"])
+
     def test_worker_invalid_payload_returns_502(self) -> None:
         mapping = {"bt1": {"backtest_api_base": "http://worker-a"}}
         service = ReportService(
@@ -379,8 +411,92 @@ class TestProgressEndpoint(unittest.TestCase):
         resp = client.get("/runs/backtest/nonexistent/progress")
         self.assertEqual(resp.status_code, 404)
 
+    def test_retries_alternate_worker_base_when_mapping_base_is_stale(self) -> None:
+        mapping = {
+            "bt1": {"backtest_api_base": "http://stale-worker", "run_id": "run-1"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/batch"),
+            backtest_headers=lambda: {},
+        )
+
+        def fetch_progress(base_url: str, backtest_id: str) -> dict[str, Any]:
+            if base_url == "http://stale-worker":
+                raise ReportFetchError("connect timeout")
+            return {
+                "backtest_id": backtest_id,
+                "run_id": "run-1",
+                "progress": {"phase": "engine_running"},
+            }
+
+        service.fetch_progress = fetch_progress  # type: ignore[method-assign]
+
+        client = TestClient(make_report_app(mapping, service, candidate_base_urls=["http://worker-b"]))
+        resp = client.get("/runs/backtest/bt1/progress")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["progress"]["phase"], "engine_running")
+
     def test_invalid_id_returns_400(self) -> None:
         client = TestClient(make_report_app({}))
         resp = client.get("/runs/backtest/test.id/report")
         self.assertEqual(resp.status_code, 400)
         self.assertIn("invalid characters", resp.json()["detail"])
+
+
+class TestLedgerEndpoint(unittest.TestCase):
+    def test_returns_worker_ledger_for_existing_backtest(self) -> None:
+        mapping = {
+            "bt1": {"backtest_api_base": "http://worker-a", "run_id": "run-1"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/batch"),
+            backtest_headers=lambda: {},
+        )
+        service.fetch_ledger = lambda base_url, backtest_id, limit, tail: {  # type: ignore[attr-defined,method-assign]
+            "backtest_id": backtest_id,
+            "source": "ledger_file",
+            "events": [{"event_type": "open_intent", "trade_id": "BTC-1"}],
+            "trades": [{"trade_id": "BTC-1", "state": "active"}],
+            "summary": {"trade_count": 1},
+        }
+
+        client = TestClient(make_report_app(mapping, service))
+        resp = client.get("/runs/backtest/bt1/ledger?limit=50&tail=true")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["backtest_id"], "bt1")
+        self.assertEqual(data["summary"]["trade_count"], 1)
+        self.assertEqual(data["events"][0]["trade_id"], "BTC-1")
+
+    def test_ledger_no_worker_assigned_returns_404(self) -> None:
+        mapping = {"bt1": {"status": "queued"}}
+        client = TestClient(make_report_app(mapping))
+        resp = client.get("/runs/backtest/bt1/ledger")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("worker", resp.json()["detail"].lower())
+
+    def test_retries_alternate_worker_base_when_mapping_base_is_stale(self) -> None:
+        mapping = {
+            "bt1": {"backtest_api_base": "http://stale-worker", "run_id": "run-1"},
+        }
+        service = ReportService(
+            ReportServiceConfig(report_batch_path="/batch"),
+            backtest_headers=lambda: {},
+        )
+
+        def fetch_ledger(base_url: str, backtest_id: str, limit: int, tail: bool) -> dict[str, Any]:
+            if base_url == "http://stale-worker":
+                raise ReportFetchError("connect timeout")
+            return {
+                "backtest_id": backtest_id,
+                "summary": {"trade_count": 2},
+                "events": [{"event_type": "trade_closed", "trade_id": "BTC-1"}],
+                "trades": [{"trade_id": "BTC-1", "state": "closed"}],
+            }
+
+        service.fetch_ledger = fetch_ledger  # type: ignore[method-assign]
+
+        client = TestClient(make_report_app(mapping, service, candidate_base_urls=["http://worker-b"]))
+        resp = client.get("/runs/backtest/bt1/ledger")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["summary"]["trade_count"], 2)
