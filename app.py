@@ -301,6 +301,7 @@ OPTIONAL_FIELDS = {
     "liquidity_consumption",
     "trade_execution",
     "load_trade_ticks",
+    "optimize_file_loading",
     "fill_model_config",
 }
 
@@ -539,6 +540,9 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
     if "load_trade_ticks" in payload:
         if not isinstance(payload["load_trade_ticks"], bool):
             raise ValueError("load_trade_ticks must be a boolean")
+    if "optimize_file_loading" in payload:
+        if not isinstance(payload["optimize_file_loading"], bool):
+            raise ValueError("optimize_file_loading must be a boolean")
     if "fill_model_config" in payload:
         payload["fill_model_config"] = parse_fill_model_config(payload["fill_model_config"])
 
@@ -591,6 +595,8 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
         sanitized["trade_execution"] = payload["trade_execution"]
     if "load_trade_ticks" in payload:
         sanitized["load_trade_ticks"] = payload["load_trade_ticks"]
+    if "optimize_file_loading" in payload:
+        sanitized["optimize_file_loading"] = payload["optimize_file_loading"]
     if "fill_model_config" in payload:
         sanitized["fill_model_config"] = payload["fill_model_config"]
     return sanitized

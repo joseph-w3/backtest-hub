@@ -129,9 +129,21 @@ class TestRunSpecFillModelConfig(unittest.TestCase):
         sanitized = app.validate_run_spec(payload)
         self.assertTrue(sanitized["load_trade_ticks"])
 
+    def test_optimize_file_loading_true(self) -> None:
+        payload = _base_payload()
+        payload["optimize_file_loading"] = True
+        sanitized = app.validate_run_spec(payload)
+        self.assertTrue(sanitized["optimize_file_loading"])
+
     def test_load_trade_ticks_string_rejected(self) -> None:
         payload = _base_payload()
         payload["load_trade_ticks"] = "false"
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
+    def test_optimize_file_loading_string_rejected(self) -> None:
+        payload = _base_payload()
+        payload["optimize_file_loading"] = "true"
         with self.assertRaises(ValueError):
             app.validate_run_spec(payload)
 
@@ -201,4 +213,5 @@ class TestRunSpecFillModelConfig(unittest.TestCase):
         self.assertNotIn("liquidity_consumption", sanitized)
         self.assertNotIn("trade_execution", sanitized)
         self.assertNotIn("load_trade_ticks", sanitized)
+        self.assertNotIn("optimize_file_loading", sanitized)
         self.assertNotIn("fill_model_config", sanitized)

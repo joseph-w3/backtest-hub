@@ -164,6 +164,7 @@ OPTIONAL_FIELDS = {
     "liquidity_consumption",
     "trade_execution",
     "load_trade_ticks",
+    "optimize_file_loading",
     "fill_model_config",
 }
 
@@ -220,6 +221,9 @@ def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> tuple[Path | None
     if "load_trade_ticks" in run_spec:
         if not isinstance(run_spec["load_trade_ticks"], bool):
             raise ValueError("RunSpec load_trade_ticks must be a boolean.")
+    if "optimize_file_loading" in run_spec:
+        if not isinstance(run_spec["optimize_file_loading"], bool):
+            raise ValueError("RunSpec optimize_file_loading must be a boolean.")
     if "fill_model_config" in run_spec:
         _validate_fill_model_config(run_spec["fill_model_config"])
 
@@ -1030,6 +1034,13 @@ def _load_trade_ticks_enabled(run_spec: dict) -> bool:
     return bool(value)
 
 
+def _optimize_file_loading_enabled(run_spec: dict) -> bool:
+    value = run_spec.get("optimize_file_loading")
+    if value is None:
+        return False
+    return bool(value)
+
+
 def _market_data_classes(
     *,
     include_futures_extras: bool,
@@ -1633,6 +1644,7 @@ def main() -> int:
             futures_instruments.append(futures_instrument)
 
         load_trade_ticks = _load_trade_ticks_enabled(run_spec)
+        optimize_file_loading = _optimize_file_loading_enabled(run_spec)
 
         if catalog_fs_protocol is None:
             catalog_root = Path(catalog_path_str)
@@ -1672,6 +1684,7 @@ def main() -> int:
                         catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                         data_cls=data_cls,
                         instrument_id=instrument.id,
+                        optimize_file_loading=optimize_file_loading,
                     )
                 )
 
@@ -1688,6 +1701,7 @@ def main() -> int:
                         catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                         data_cls=data_cls,
                         instrument_id=instrument.id,
+                        optimize_file_loading=optimize_file_loading,
                     )
                 )
 

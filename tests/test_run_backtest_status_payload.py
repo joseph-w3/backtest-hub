@@ -180,6 +180,10 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             run_backtest = _load_run_backtest()
             self.assertTrue(run_backtest._load_trade_ticks_enabled({}))
             self.assertFalse(run_backtest._load_trade_ticks_enabled({"load_trade_ticks": False}))
+            self.assertFalse(run_backtest._optimize_file_loading_enabled({}))
+            self.assertTrue(
+                run_backtest._optimize_file_loading_enabled({"optimize_file_loading": True})
+            )
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
