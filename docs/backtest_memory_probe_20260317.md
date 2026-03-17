@@ -356,6 +356,29 @@ Measured reference points:
   - observed stabilized level around `46.5 GB`
   - roughly `0.61 GB / symbol`
 
+Tiered scheduling cheat sheet for the currently validated V5 spread-arb
+templates:
+
+| Tier | Template shape | Runtime path | Observed RAM | Observed ratio | Scheduler reserve |
+| --- | --- | --- | --- | --- | --- |
+| quick | `3d`, `5 pairs`, `10 symbols` | validated completed run | peak `2.7-2.8 GB` | `0.27-0.28 GB / symbol` | `6.5 GB` (`0.65 GB / symbol`) |
+| medium | `13d`, `7 pairs`, `14 symbols` | representative in-flight checkpoint, not terminal peak | optimized: `3.47 GB`; no-opt: `8.90 GB` | optimized: `0.25 GB / symbol`; no-opt: `0.64 GB / symbol` | `9.1 GB` (`0.65 GB / symbol`) |
+| full | `51d`, `38 pairs`, `76 symbols` | validated long live measurement | stabilized `46.5 GB` | `0.61 GB / symbol` | `60.8 GB` (`0.8 GB / symbol`) |
+
+Interpretation for the table above:
+
+- quick has a real completed-run peak and remains comfortably below the current
+  `0.65 GB / symbol` reserve
+- medium does not yet have a captured completed-run peak, so the table uses the
+  best available checkpoint numbers and keeps the scheduler on the same
+  conservative small/medium reserve
+- full now has a real long-run stabilized measurement, which is why it can use
+  a tighter but still buffered reserve than the legacy `2.5 GB / symbol`
+  heuristic
+- for small quick/medium validations, optimized loading is not currently
+  auto-enabled by default; on the measured quick template it preserved
+  correctness but increased wall-clock time by about `20%`
+
 Deployed scheduler change:
 
 - keep the old generic `memory_per_symbol_gb` fallback for non-V5 strategies
