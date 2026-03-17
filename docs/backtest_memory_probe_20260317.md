@@ -263,6 +263,76 @@ Quick parity result:
   universal steady-state RSS win; the main benefit remains avoiding pre-chunk
   session explosion on larger runs
 
+Quick wall-clock comparison:
+
+- optimized quick:
+  - started `2026-03-17T10:01:39Z`
+  - finished `2026-03-17T10:16:49Z`
+  - elapsed about `15m10s`
+- no-opt quick:
+  - started `2026-03-17T10:17:52Z`
+  - finished `2026-03-17T10:30:33Z`
+  - elapsed about `12m41s`
+
+Interpretation:
+
+- on the small quick template, optimized loading preserved correctness but was
+  slower by about `20%`
+- this reinforced the decision to keep auto-enable scoped to large long V5
+  runs, rather than enabling it for every backtest by default
+
+## Full 38-Pair Run Measurement
+
+To get a real post-fix RAM number instead of probe-only snapshots, a live
+51-day / 38-pair validation run was launched:
+
+- backtest: `20260317T181440Z_022a964a66f6480685d258c11642c332`
+- template source: `configs/live/v5_runtime_universe_backtest_38pairs.yaml`
+- effective universe: `38 pairs / 76 symbols`
+
+Observed behavior:
+
+- optimized loading auto-enabled because the run matched the large-V5 guard
+- the known corrupt parquet directory still triggered fallback:
+  - `MUBARAKUSDT-PERP.BINANCE_FUTURES`
+  - reason: `Invalid Parquet file. Corrupt footer`
+- stderr stayed empty
+- the run advanced into normal chunk streaming after the prepare-query stage
+
+Observed memory profile:
+
+- earlier pre-fix baseline for the same scale was roughly:
+  - `~200 GB` user-observed end-to-end pressure
+  - `~52-77 GB` already during `before_prepare_queries`
+- post-fix on this live run:
+  - `before_prepare_queries` still grew materially, but did not explode into
+    the old range immediately
+  - after entering chunk streaming, RSS stabilized around `46.5 GB`
+
+Representative stabilized samples from the live run:
+
+- `chunks_seen = 83`, `events_seen = 16,600,000`, `rss_mb = 46,479.38`
+- `chunks_seen = 87`, `events_seen = 17,400,000`, `rss_mb = 46,483.71`
+- `chunks_seen = 103`, `events_seen = 20,600,000`, `rss_mb = 46,512.37`
+
+Current takeaway:
+
+- this is not a low-memory run yet
+- but it is a major reduction from the prior `~200 GB` class of pressure
+- the currently observed stabilized level is roughly `46.5 GB`, which is low
+  enough to make several long runs on a 256 GB host plausible
+
+Trade activity confirmation from the same live measurement run:
+
+- real strategy activity appeared immediately after streaming began
+- sample closed-trade logs:
+  - `EIGEN` closed with `PnL=1.1534 USDT`
+  - `FIL` closed with `PnL=2.8995 USDT`
+
+This matters because the run is not merely surviving mechanically; it is
+executing the strategy path and producing real open/close behavior while the
+reduced-memory loading path is active.
+
 ## Recommended Next Steps
 
 1. Keep selective optimized loading behind a guarded default for large V5
