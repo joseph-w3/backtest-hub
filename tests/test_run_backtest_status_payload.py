@@ -119,6 +119,8 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
             self.assertEqual(payload["init_step"], "bootstrap")
             self.assertIn("last_progress_at", payload)
             self.assertIsNone(payload["simulated_time"])
+            self.assertIsNone(payload["streaming_probe"])
+            self.assertEqual(payload["streaming_summary"], {"chunks_seen": 0, "events_seen": 0})
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
@@ -162,6 +164,7 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
                 self.assertEqual(payload["init_step"], "open_catalog")
                 self.assertEqual(payload["simulated_time"], "2026-03-13T21:06:53.925544242Z")
                 self.assertEqual(payload["phase"], "initializing")
+                self.assertEqual(payload["streaming_summary"], {"chunks_seen": 0, "events_seen": 0})
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
@@ -271,6 +274,62 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
                     run_backtest._extract_latest_simulated_time(stdout_path),
                     "2026-03-13T21:06:53.925544242Z",
                 )
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_summarize_chunk_type_counts_orders_top_types(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            class OrderBookDelta:
+                pass
+
+            class TradeTick:
+                pass
+
+            events = [
+                OrderBookDelta(),
+                TradeTick(),
+                OrderBookDelta(),
+                OrderBookDelta(),
+                TradeTick(),
+            ]
+            self.assertEqual(
+                run_backtest._summarize_chunk_type_counts(events),
+                {"OrderBookDelta": 3, "TradeTick": 2},
+            )
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_build_streaming_probe_payload_reports_deltas(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            payload = run_backtest._build_streaming_probe_payload(
+                chunk_index=7,
+                stage="after_clear",
+                event_count=50000,
+                event_type_counts={"OrderBookDelta": 40000, "TradeTick": 10000},
+                rss_before_add_mb=100.0,
+                rss_after_add_mb=130.5,
+                rss_after_run_mb=140.25,
+                rss_after_clear_mb=125.0,
+            )
+
+            self.assertEqual(payload["chunk_index"], 7)
+            self.assertEqual(payload["stage"], "after_clear")
+            self.assertEqual(payload["event_count"], 50000)
+            self.assertEqual(payload["rss_delta_add_mb"], 30.5)
+            self.assertEqual(payload["rss_delta_run_mb"], 9.75)
+            self.assertEqual(payload["rss_delta_clear_mb"], -15.25)
+            self.assertEqual(payload["rss_delta_chunk_mb"], 25.0)
+            self.assertIn("updated_at", payload)
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:

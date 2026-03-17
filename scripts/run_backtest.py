@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from collections.abc import Callable
 import importlib
 import importlib.util
 import json
@@ -618,11 +620,14 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         self,
         configs: list[BacktestRunConfig],
         instruments: list[CurrencyPair | CryptoPerpetual],
+        *,
+        streaming_probe_callback: Callable[..., None] | None = None,
     ) -> None:
         super().__init__(configs)
         self.__class__._instrument_overrides = {
             instrument.id.value: instrument for instrument in instruments
         }
+        self._streaming_probe_callback = streaming_probe_callback
 
     @classmethod
     def load_catalog(cls, config: BacktestDataConfig) -> ParquetDataCatalog:
@@ -633,6 +638,150 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             fs_rust_storage_options=config.catalog_fs_rust_storage_options,
         )
         return _InstrumentOverrideCatalog(base_catalog, cls._instrument_overrides)
+
+    def _emit_streaming_probe(
+        self,
+        *,
+        chunk_index: int,
+        stage: str,
+        event_count: int | None = None,
+        event_type_counts: dict[str, int] | None = None,
+        rss_before_add_mb: float | None = None,
+        rss_after_add_mb: float | None = None,
+        rss_after_run_mb: float | None = None,
+        rss_after_clear_mb: float | None = None,
+    ) -> None:
+        if self._streaming_probe_callback is None:
+            return
+        self._streaming_probe_callback(
+            chunk_index=chunk_index,
+            stage=stage,
+            event_count=event_count,
+            event_type_counts=event_type_counts,
+            rss_before_add_mb=rss_before_add_mb,
+            rss_after_add_mb=rss_after_add_mb,
+            rss_after_run_mb=rss_after_run_mb,
+            rss_after_clear_mb=rss_after_clear_mb,
+        )
+
+    def _run_streaming(
+        self,
+        run_config_id: str,
+        engine: object,
+        data_configs: list[BacktestDataConfig],
+        chunk_size: int,
+        start: str | int | None = None,
+        end: str | int | None = None,
+    ) -> None:
+        from quant_trade_v1.backtest.node import Bar
+        from quant_trade_v1.backtest.node import DataBackendSession
+        from quant_trade_v1.backtest.node import capsule_to_list
+        from quant_trade_v1.backtest.node import get_instrument_ids
+        from quant_trade_v1.backtest.node import max_date
+        from quant_trade_v1.backtest.node import min_date
+
+        session = DataBackendSession(chunk_size=chunk_size)
+        cached_file_lists: dict[tuple[str, str | None, type], list[str]] = {}
+
+        for config in data_configs:
+            catalog = self.load_catalog(config)
+            used_start = config.start_time
+            used_end = config.end_time
+
+            if used_start is not None or start is not None:
+                result = max_date(used_start, start)
+                used_start = result.isoformat() if result else None
+
+            if used_end is not None or end is not None:
+                result = min_date(used_end, end)
+                used_end = result.isoformat() if result else None
+
+            used_instrument_ids = get_instrument_ids(config)
+            used_bar_types = []
+
+            if config.data_type == Bar:
+                if config.bar_types is None and config.instrument_ids is None:
+                    assert config.instrument_id, "No `instrument_id` for Bar data config"
+                    assert config.bar_spec, "No `bar_spec` for Bar data config"
+
+                if config.instrument_id is not None and config.bar_spec is not None:
+                    bar_type = f"{config.instrument_id}-{config.bar_spec}-EXTERNAL"
+                    used_bar_types = [bar_type]
+                elif config.bar_types is not None:
+                    used_bar_types = config.bar_types
+                elif config.instrument_ids is not None and config.bar_spec is not None:
+                    for instrument_id in config.instrument_ids:
+                        used_bar_types.append(f"{instrument_id}-{config.bar_spec}-EXTERNAL")
+
+            cache_key = (config.catalog_path, config.catalog_fs_protocol, config.data_type)
+            if cache_key not in cached_file_lists:
+                cached_file_lists[cache_key] = catalog.get_file_list_from_data_cls(config.data_type)
+
+            filter_files = catalog.filter_files(
+                data_cls=config.data_type,
+                file_paths=cached_file_lists[cache_key],
+                identifiers=(used_bar_types or used_instrument_ids),
+                start=used_start,
+                end=used_end,
+            )
+
+            session = catalog.backend_session(
+                data_cls=config.data_type,
+                identifiers=(used_bar_types or used_instrument_ids),
+                start=used_start,
+                end=used_end,
+                session=session,
+                files=filter_files,
+                optimize_file_loading=config.optimize_file_loading,
+            )
+
+        for chunk_index, chunk in enumerate(session.to_query_result()):
+            events = capsule_to_list(chunk)
+            event_count = len(events)
+            event_type_counts = _summarize_chunk_type_counts(events)
+            rss_before_add_mb = _read_current_rss_mb()
+            self._emit_streaming_probe(
+                chunk_index=chunk_index,
+                stage="after_materialize",
+                event_count=event_count,
+                event_type_counts=event_type_counts,
+                rss_before_add_mb=rss_before_add_mb,
+            )
+            engine.add_data(
+                data=events,
+                validate=False,
+                sort=True,
+            )
+            rss_after_add_mb = _read_current_rss_mb()
+            self._emit_streaming_probe(
+                chunk_index=chunk_index,
+                stage="after_add",
+                event_count=event_count,
+                event_type_counts=event_type_counts,
+                rss_before_add_mb=rss_before_add_mb,
+                rss_after_add_mb=rss_after_add_mb,
+            )
+            engine.run(
+                start=start,
+                end=end,
+                run_config_id=run_config_id,
+                streaming=True,
+            )
+            rss_after_run_mb = _read_current_rss_mb()
+            engine.clear_data()
+            rss_after_clear_mb = _read_current_rss_mb()
+            self._emit_streaming_probe(
+                chunk_index=chunk_index,
+                stage="after_clear",
+                event_count=event_count,
+                event_type_counts=event_type_counts,
+                rss_before_add_mb=rss_before_add_mb,
+                rss_after_add_mb=rss_after_add_mb,
+                rss_after_run_mb=rss_after_run_mb,
+                rss_after_clear_mb=rss_after_clear_mb,
+            )
+
+        engine.end()
 
 
 def _load_or_create_instrument(
@@ -842,6 +991,11 @@ def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
         "init_step": "bootstrap",
         "last_progress_at": datetime.now(timezone.utc).isoformat(),
         "simulated_time": None,
+        "streaming_probe": None,
+        "streaming_summary": {
+            "chunks_seen": 0,
+            "events_seen": 0,
+        },
     }
 
 
@@ -895,6 +1049,62 @@ def _write_status_snapshot(
                 status["simulated_time"] = simulated_time
         snapshot = dict(status)
     _write_status(status_path, snapshot)
+
+
+def _read_current_rss_mb() -> float | None:
+    status_path = Path(f"/proc/{os.getpid()}/status")
+    try:
+        for line in status_path.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("VmRSS:"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                return None
+            return round(int(parts[1]) / 1024.0, 2)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _summarize_chunk_type_counts(events: list[object], limit: int = 8) -> dict[str, int]:
+    counts = Counter(type(event).__name__ for event in events)
+    items = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return dict(items[:limit])
+
+
+def _rss_delta_mb(after_mb: float | None, before_mb: float | None) -> float | None:
+    if after_mb is None or before_mb is None:
+        return None
+    return round(after_mb - before_mb, 2)
+
+
+def _build_streaming_probe_payload(
+    *,
+    chunk_index: int,
+    stage: str,
+    event_count: int | None,
+    event_type_counts: dict[str, int] | None,
+    rss_before_add_mb: float | None,
+    rss_after_add_mb: float | None,
+    rss_after_run_mb: float | None,
+    rss_after_clear_mb: float | None,
+) -> dict:
+    payload = {
+        "chunk_index": chunk_index,
+        "stage": stage,
+        "event_count": event_count,
+        "event_type_counts": event_type_counts,
+        "rss_before_add_mb": rss_before_add_mb,
+        "rss_after_add_mb": rss_after_add_mb,
+        "rss_after_run_mb": rss_after_run_mb,
+        "rss_after_clear_mb": rss_after_clear_mb,
+        "rss_delta_add_mb": _rss_delta_mb(rss_after_add_mb, rss_before_add_mb),
+        "rss_delta_run_mb": _rss_delta_mb(rss_after_run_mb, rss_after_add_mb),
+        "rss_delta_clear_mb": _rss_delta_mb(rss_after_clear_mb, rss_after_run_mb),
+        "rss_delta_chunk_mb": _rss_delta_mb(rss_after_clear_mb, rss_before_add_mb),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return payload
 
 
 def _start_progress_heartbeat(
@@ -1116,6 +1326,42 @@ def main() -> int:
     status_lock = threading.Lock()
     stdout_path_raw = os.environ.get("BACKTEST_STDOUT_PATH")
     stdout_path = Path(stdout_path_raw).expanduser() if stdout_path_raw else None
+    streaming_summary = {"chunks_seen": 0, "events_seen": 0}
+
+    def _on_streaming_probe(
+        *,
+        chunk_index: int,
+        stage: str,
+        event_count: int | None = None,
+        event_type_counts: dict[str, int] | None = None,
+        rss_before_add_mb: float | None = None,
+        rss_after_add_mb: float | None = None,
+        rss_after_run_mb: float | None = None,
+        rss_after_clear_mb: float | None = None,
+    ) -> None:
+        if stage == "after_materialize" and event_count is not None:
+            streaming_summary["chunks_seen"] = chunk_index + 1
+            streaming_summary["events_seen"] += event_count
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={
+                "streaming_probe": _build_streaming_probe_payload(
+                    chunk_index=chunk_index,
+                    stage=stage,
+                    event_count=event_count,
+                    event_type_counts=event_type_counts,
+                    rss_before_add_mb=rss_before_add_mb,
+                    rss_after_add_mb=rss_after_add_mb,
+                    rss_after_run_mb=rss_after_run_mb,
+                    rss_after_clear_mb=rss_after_clear_mb,
+                ),
+                "streaming_summary": dict(streaming_summary),
+            },
+        )
+
     _write_status_snapshot(
         status_path=status_path,
         status=status,
@@ -1440,6 +1686,7 @@ def main() -> int:
         node = _InstrumentOverrideBacktestNode(
             configs=[run_config],
             instruments=spot_instruments + futures_instruments,
+            streaming_probe_callback=_on_streaming_probe,
         )
         _write_status_snapshot(
             status_path=status_path,
