@@ -621,12 +621,14 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         configs: list[BacktestRunConfig],
         instruments: list[CurrencyPair | CryptoPerpetual],
         *,
+        node_probe_callback: Callable[..., None] | None = None,
         streaming_probe_callback: Callable[..., None] | None = None,
     ) -> None:
         super().__init__(configs)
         self.__class__._instrument_overrides = {
             instrument.id.value: instrument for instrument in instruments
         }
+        self._node_probe_callback = node_probe_callback
         self._streaming_probe_callback = streaming_probe_callback
 
     @classmethod
@@ -663,6 +665,66 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             rss_after_run_mb=rss_after_run_mb,
             rss_after_clear_mb=rss_after_clear_mb,
         )
+
+    def _emit_node_probe(
+        self,
+        *,
+        stage: str,
+        run_config_id: str | None = None,
+        chunk_size: int | None = None,
+        rss_mb: float | None = None,
+    ) -> None:
+        if self._node_probe_callback is None:
+            return
+        self._node_probe_callback(
+            stage=stage,
+            run_config_id=run_config_id,
+            chunk_size=chunk_size,
+            rss_mb=rss_mb,
+        )
+
+    def run(self) -> list[object]:
+        self._emit_node_probe(stage="before_build", rss_mb=_read_current_rss_mb())
+        self.build()
+        self._emit_node_probe(stage="after_build", rss_mb=_read_current_rss_mb())
+        results: list[object] = []
+
+        for config in self._configs.values():
+            try:
+                self._emit_node_probe(
+                    stage="before_run_config",
+                    run_config_id=config.id,
+                    chunk_size=config.chunk_size,
+                    rss_mb=_read_current_rss_mb(),
+                )
+                result = self._run(
+                    run_config_id=config.id,
+                    data_configs=config.data,
+                    chunk_size=config.chunk_size,
+                    dispose_on_completion=config.dispose_on_completion,
+                    start=config.start,
+                    end=config.end,
+                )
+                results.append(result)
+                self._emit_node_probe(
+                    stage="after_run_config",
+                    run_config_id=config.id,
+                    chunk_size=config.chunk_size,
+                    rss_mb=_read_current_rss_mb(),
+                )
+            except Exception as exc:
+                self._emit_node_probe(
+                    stage="run_config_exception",
+                    run_config_id=config.id,
+                    chunk_size=config.chunk_size,
+                    rss_mb=_read_current_rss_mb(),
+                )
+                if config.raise_exception:
+                    raise exc
+
+                self.log_backtest_exception(exc, config)
+
+        return results
 
     def _run_streaming(
         self,
@@ -991,6 +1053,7 @@ def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
         "init_step": "bootstrap",
         "last_progress_at": datetime.now(timezone.utc).isoformat(),
         "simulated_time": None,
+        "node_probe": None,
         "streaming_probe": None,
         "streaming_summary": {
             "chunks_seen": 0,
@@ -1105,6 +1168,22 @@ def _build_streaming_probe_payload(
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     return payload
+
+
+def _build_node_probe_payload(
+    *,
+    stage: str,
+    run_config_id: str | None,
+    chunk_size: int | None,
+    rss_mb: float | None,
+) -> dict:
+    return {
+        "stage": stage,
+        "run_config_id": run_config_id,
+        "chunk_size": chunk_size,
+        "rss_mb": rss_mb,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _start_progress_heartbeat(
@@ -1359,6 +1438,28 @@ def main() -> int:
                     rss_after_clear_mb=rss_after_clear_mb,
                 ),
                 "streaming_summary": dict(streaming_summary),
+            },
+        )
+
+    def _on_node_probe(
+        *,
+        stage: str,
+        run_config_id: str | None = None,
+        chunk_size: int | None = None,
+        rss_mb: float | None = None,
+    ) -> None:
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={
+                "node_probe": _build_node_probe_payload(
+                    stage=stage,
+                    run_config_id=run_config_id,
+                    chunk_size=chunk_size,
+                    rss_mb=rss_mb,
+                ),
             },
         )
 
@@ -1686,6 +1787,7 @@ def main() -> int:
         node = _InstrumentOverrideBacktestNode(
             configs=[run_config],
             instruments=spot_instruments + futures_instruments,
+            node_probe_callback=_on_node_probe,
             streaming_probe_callback=_on_streaming_probe,
         )
         _write_status_snapshot(

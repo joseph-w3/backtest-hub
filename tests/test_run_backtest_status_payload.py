@@ -119,6 +119,7 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
             self.assertEqual(payload["init_step"], "bootstrap")
             self.assertIn("last_progress_at", payload)
             self.assertIsNone(payload["simulated_time"])
+            self.assertIsNone(payload["node_probe"])
             self.assertIsNone(payload["streaming_probe"])
             self.assertEqual(payload["streaming_summary"], {"chunks_seen": 0, "events_seen": 0})
         finally:
@@ -164,6 +165,7 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
                 self.assertEqual(payload["init_step"], "open_catalog")
                 self.assertEqual(payload["simulated_time"], "2026-03-13T21:06:53.925544242Z")
                 self.assertEqual(payload["phase"], "initializing")
+                self.assertIsNone(payload["node_probe"])
                 self.assertEqual(payload["streaming_summary"], {"chunks_seen": 0, "events_seen": 0})
         finally:
             sys.modules.pop("run_backtest_under_test", None)
@@ -329,6 +331,28 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             self.assertEqual(payload["rss_delta_run_mb"], 9.75)
             self.assertEqual(payload["rss_delta_clear_mb"], -15.25)
             self.assertEqual(payload["rss_delta_chunk_mb"], 25.0)
+            self.assertIn("updated_at", payload)
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_build_node_probe_payload(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            payload = run_backtest._build_node_probe_payload(
+                stage="after_build",
+                run_config_id="rc-1",
+                chunk_size=50000,
+                rss_mb=1234.56,
+            )
+
+            self.assertEqual(payload["stage"], "after_build")
+            self.assertEqual(payload["run_config_id"], "rc-1")
+            self.assertEqual(payload["chunk_size"], 50000)
+            self.assertEqual(payload["rss_mb"], 1234.56)
             self.assertIn("updated_at", payload)
         finally:
             sys.modules.pop("run_backtest_under_test", None)
