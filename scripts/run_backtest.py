@@ -1041,6 +1041,15 @@ def _optimize_file_loading_enabled(run_spec: dict) -> bool:
     return bool(value)
 
 
+def _optimize_file_loading_for_data_cls(run_spec: dict, data_cls: type) -> bool:
+    if not _optimize_file_loading_enabled(run_spec):
+        return False
+    # Funding/mark-price parquet directories currently contain schema drift in the
+    # production catalog. Keep directory registration limited to the stable high-volume
+    # classes where it materially reduces DataFusion table explosion.
+    return data_cls in (OrderBookDelta, TradeTick)
+
+
 def _market_data_classes(
     *,
     include_futures_extras: bool,
@@ -1644,8 +1653,6 @@ def main() -> int:
             futures_instruments.append(futures_instrument)
 
         load_trade_ticks = _load_trade_ticks_enabled(run_spec)
-        optimize_file_loading = _optimize_file_loading_enabled(run_spec)
-
         if catalog_fs_protocol is None:
             catalog_root = Path(catalog_path_str)
             _write_status_snapshot(
@@ -1676,6 +1683,10 @@ def main() -> int:
                 include_futures_extras=False,
                 load_trade_ticks=load_trade_ticks,
             ):
+                optimize_file_loading_for_cls = _optimize_file_loading_for_data_cls(
+                    run_spec,
+                    data_cls,
+                )
                 data_configs.append(
                     BacktestDataConfig(
                         catalog_path=catalog_path_str,
@@ -1684,7 +1695,7 @@ def main() -> int:
                         catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                         data_cls=data_cls,
                         instrument_id=instrument.id,
-                        optimize_file_loading=optimize_file_loading,
+                        optimize_file_loading=optimize_file_loading_for_cls,
                     )
                 )
 
@@ -1693,6 +1704,10 @@ def main() -> int:
                 include_futures_extras=True,
                 load_trade_ticks=load_trade_ticks,
             ):
+                optimize_file_loading_for_cls = _optimize_file_loading_for_data_cls(
+                    run_spec,
+                    data_cls,
+                )
                 data_configs.append(
                     BacktestDataConfig(
                         catalog_path=catalog_path_str,
@@ -1701,7 +1716,7 @@ def main() -> int:
                         catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
                         data_cls=data_cls,
                         instrument_id=instrument.id,
-                        optimize_file_loading=optimize_file_loading,
+                        optimize_file_loading=optimize_file_loading_for_cls,
                     )
                 )
 

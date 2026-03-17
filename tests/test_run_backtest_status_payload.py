@@ -184,6 +184,27 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             self.assertTrue(
                 run_backtest._optimize_file_loading_enabled({"optimize_file_loading": True})
             )
+            run_backtest.OrderBookDelta = type("OrderBookDelta", (), {})
+            run_backtest.TradeTick = type("TradeTick", (), {})
+            run_backtest.FundingRateUpdate = type("FundingRateUpdate", (), {})
+            self.assertTrue(
+                run_backtest._optimize_file_loading_for_data_cls(
+                    {"optimize_file_loading": True},
+                    run_backtest.OrderBookDelta,
+                )
+            )
+            self.assertTrue(
+                run_backtest._optimize_file_loading_for_data_cls(
+                    {"optimize_file_loading": True},
+                    run_backtest.TradeTick,
+                )
+            )
+            self.assertFalse(
+                run_backtest._optimize_file_loading_for_data_cls(
+                    {"optimize_file_loading": True},
+                    run_backtest.FundingRateUpdate,
+                )
+            )
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
