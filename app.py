@@ -1504,6 +1504,43 @@ async def delete_queue(
     )
 
 
+@app.get("/runs/list")
+async def list_runs(
+    page: int = 1,
+    pageSize: int = 20,
+    search: str | None = None,
+    status: str | None = None,
+    sortBy: str = "created_at",
+    sortOrder: str = "DESC",
+) -> JSONResponse:
+    if page < 1 or pageSize < 1:
+        raise HTTPException(status_code=400, detail="page/pageSize must be >= 1")
+
+    normalized_page_size = min(pageSize, 500)
+    offset = (page - 1) * normalized_page_size
+    total, items = get_run_store().list_runs(
+        search=search,
+        status=status,
+        offset=offset,
+        limit=normalized_page_size,
+        sort_by=sortBy,
+        sort_order=sortOrder,
+    )
+
+    return JSONResponse(
+        {
+            "total": total,
+            "items": [
+                {
+                    "backtest_id": item.backtest_id,
+                    **item.entry,
+                }
+                for item in items
+            ],
+        }
+    )
+
+
 @app.get("/runs/{backtest_id}")
 async def get_run(backtest_id: str) -> JSONResponse:
     logger.info("get_run_requested backtest_id=%s", backtest_id)

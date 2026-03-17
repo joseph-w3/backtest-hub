@@ -64,6 +64,25 @@ class TestSqliteRunStore(unittest.TestCase):
             ids = store.list_submitted_ids(after_dt, before_dt)
             self.assertEqual(ids, ["b"])
 
+    def test_list_runs_supports_search_sort_and_pagination(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = SqliteRunStore(Path(td) / "hub.sqlite3")
+            store.upsert_run("bt_a", {"status": "queued", "requested_by": "alice", "created_at": "2026-02-01T00:00:00Z"})
+            store.upsert_run("bt_b", {"status": "failed", "requested_by": "bob", "created_at": "2026-02-03T00:00:00Z"})
+            store.upsert_run("bt_c", {"status": "running", "requested_by": "alice", "created_at": "2026-02-02T00:00:00Z"})
+
+            total, items = store.list_runs(
+                search="alice",
+                offset=0,
+                limit=1,
+                sort_by="created_at",
+                sort_order="DESC",
+            )
+
+            self.assertEqual(total, 2)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].backtest_id, "bt_c")
+
 
 class TestMigrationFromLegacyJson(unittest.TestCase):
     def test_app_migrates_json_to_db_and_renames(self) -> None:
@@ -104,4 +123,3 @@ class TestMigrationFromLegacyJson(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

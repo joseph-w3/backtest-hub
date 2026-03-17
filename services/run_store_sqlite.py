@@ -261,6 +261,71 @@ class SqliteRunStore:
             result.append(entry)
         return result
 
+    def list_runs(
+        self,
+        *,
+        search: str | None = None,
+        status: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+        sort_by: str = "created_at",
+        sort_order: str = "DESC",
+    ) -> tuple[int, list[RunRow]]:
+        where: list[str] = []
+        params: list[Any] = []
+
+        if status:
+            where.append("status = ?")
+            params.append(status)
+
+        if search:
+            pattern = f"%{search}%"
+            where.append(
+                "("
+                "backtest_id LIKE ? OR "
+                "COALESCE(status, '') LIKE ? OR "
+                "COALESCE(requested_by, '') LIKE ? OR "
+                "COALESCE(backtest_api_base, '') LIKE ? OR "
+                "COALESCE(last_error, '') LIKE ?"
+                ")"
+            )
+            params.extend([pattern, pattern, pattern, pattern, pattern])
+
+        sort_column_map = {
+            "backtest_id": "backtest_id",
+            "status": "status",
+            "created_at": "created_at",
+            "queued_at": "queued_at",
+            "submitted_at": "submitted_at",
+            "requested_by": "requested_by",
+            "required_memory_gb": "required_memory_gb",
+        }
+        sort_column = sort_column_map.get(sort_by, "created_at")
+        sort_dir = "ASC" if sort_order.upper() == "ASC" else "DESC"
+
+        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+        count_sql = f"SELECT COUNT(1) AS n FROM runs{where_sql}"
+        query_sql = (
+            f"SELECT * FROM runs{where_sql} "
+            f"ORDER BY {sort_column} {sort_dir}, backtest_id DESC "
+            f"LIMIT ? OFFSET ?"
+        )
+
+        with self._connect() as conn:
+            count_row = conn.execute(count_sql, tuple(params)).fetchone()
+            rows = conn.execute(query_sql, tuple(params + [limit, offset])).fetchall()
+
+        total = int(count_row["n"]) if count_row else 0
+        items = [
+            RunRow(
+                backtest_id=str(row["backtest_id"]),
+                entry=self._row_to_entry(row),
+            )
+            for row in rows
+            if row and row["backtest_id"]
+        ]
+        return total, items
+
     def upsert_run(self, backtest_id: str, updates: dict[str, Any]) -> None:
         if not isinstance(backtest_id, str) or not backtest_id:
             raise ValueError("backtest_id must be a non-empty string")
