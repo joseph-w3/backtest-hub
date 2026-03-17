@@ -104,6 +104,58 @@ def build_catalog_config() -> dict:
     }
 
 
+def _backend_session_with_optimize_fallback(
+    *,
+    catalog: ParquetDataCatalog,
+    data_cls: type,
+    identifiers: list[str] | None,
+    start: str | None,
+    end: str | None,
+    session: object,
+    files: list[str],
+    optimize_file_loading: bool,
+) -> object:
+    if not optimize_file_loading:
+        return catalog.backend_session(
+            data_cls=data_cls,
+            identifiers=identifiers,
+            start=start,
+            end=end,
+            session=session,
+            files=files,
+            optimize_file_loading=False,
+        )
+
+    try:
+        return catalog.backend_session(
+            data_cls=data_cls,
+            identifiers=identifiers,
+            start=start,
+            end=end,
+            session=session,
+            files=files,
+            optimize_file_loading=True,
+        )
+    except Exception as exc:
+        print(
+            "[OPTIMIZE_FALLBACK] backend_session optimize_file_loading=true failed; "
+            "retrying with file-level registration "
+            f"data_cls={getattr(data_cls, '__name__', data_cls)} "
+            f"identifiers={identifiers or []} "
+            f"reason={exc!r}",
+            flush=True,
+        )
+        return catalog.backend_session(
+            data_cls=data_cls,
+            identifiers=identifiers,
+            start=start,
+            end=end,
+            session=session,
+            files=files,
+            optimize_file_loading=False,
+        )
+
+
 BINANCE_SPOT_VENUE = Venue("BINANCE_SPOT")
 BINANCE_FUTURES_VENUE = Venue("BINANCE_FUTURES")
 BINANCE_LEGACY_VENUE = Venue("BINANCE")
@@ -796,7 +848,8 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
                 end=used_end,
             )
 
-            session = catalog.backend_session(
+            session = _backend_session_with_optimize_fallback(
+                catalog=catalog,
                 data_cls=config.data_type,
                 identifiers=(used_bar_types or used_instrument_ids),
                 start=used_start,

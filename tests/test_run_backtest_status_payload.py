@@ -241,6 +241,76 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             for name in added_modules:
                 sys.modules.pop(name, None)
 
+    def test_backend_session_with_optimize_fallback_retries_file_mode(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            class Catalog:
+                def __init__(self) -> None:
+                    self.calls: list[dict] = []
+
+                def backend_session(self, **kwargs):
+                    self.calls.append(kwargs)
+                    if kwargs["optimize_file_loading"]:
+                        raise RuntimeError("Parquet error: Invalid Parquet file. Corrupt footer")
+                    return "fallback-session"
+
+            catalog = Catalog()
+            session = run_backtest._backend_session_with_optimize_fallback(
+                catalog=catalog,
+                data_cls=type("OrderBookDelta", (), {}),
+                identifiers=["TIAUSDT-PERP.BINANCE_FUTURES"],
+                start="2025-12-01T00:00:00.000Z",
+                end="2025-12-14T00:00:00.000Z",
+                session="seed-session",
+                files=["/tmp/one.parquet"],
+                optimize_file_loading=True,
+            )
+
+            self.assertEqual(session, "fallback-session")
+            self.assertEqual(len(catalog.calls), 2)
+            self.assertTrue(catalog.calls[0]["optimize_file_loading"])
+            self.assertFalse(catalog.calls[1]["optimize_file_loading"])
+            self.assertEqual(catalog.calls[1]["files"], ["/tmp/one.parquet"])
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_backend_session_with_optimize_fallback_skips_retry_when_disabled(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            class Catalog:
+                def __init__(self) -> None:
+                    self.calls: list[dict] = []
+
+                def backend_session(self, **kwargs):
+                    self.calls.append(kwargs)
+                    return "direct-session"
+
+            catalog = Catalog()
+            session = run_backtest._backend_session_with_optimize_fallback(
+                catalog=catalog,
+                data_cls=type("OrderBookDelta", (), {}),
+                identifiers=["TIAUSDT-PERP.BINANCE_FUTURES"],
+                start="2025-12-01T00:00:00.000Z",
+                end="2025-12-14T00:00:00.000Z",
+                session="seed-session",
+                files=["/tmp/one.parquet"],
+                optimize_file_loading=False,
+            )
+
+            self.assertEqual(session, "direct-session")
+            self.assertEqual(len(catalog.calls), 1)
+            self.assertFalse(catalog.calls[0]["optimize_file_loading"])
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
     def test_migrate_instrument_data_skips_missing_legacy_directory(self) -> None:
         added_modules = _install_quant_trade_stubs()
         try:
