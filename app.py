@@ -85,7 +85,10 @@ async def _recover_submitted_tasks() -> None:
                         status_resp = await asyncio.to_thread(fetch_backtest_status, base_url, bid)
                         worker_status = status_resp.get("status")
                         _TERMINAL_STATUSES = {"completed", "succeeded", "failed", "terminated", "stopped"}
-                        if worker_status in _TERMINAL_STATUSES:
+                        if worker_status == "running":
+                            store.upsert_run(bid, {"status": "running"})
+                            logger.info("recovered_orphan_task_running id=%s worker_status=%s", bid, worker_status)
+                        elif worker_status in _TERMINAL_STATUSES:
                             if worker_status in ("terminated", "stopped"):
                                 final_status = "failed"
                             elif worker_status == "succeeded":
@@ -314,7 +317,11 @@ RUN_STORE: SqliteRunStore | None = None
 QUEUE_STATE_LOCK = asyncio.Lock()
 INFLIGHT_MEMORY_GB: dict[str, float] = {}
 INFLIGHT_COUNTS: dict[str, int] = {}
-ACTIVE_RUN_STATUSES = ("submitted", "running")
+# Persisted reservations are only needed for work that has been assigned but
+# has not yet surfaced in host metrics. Once a worker reports `running`,
+# scheduler decisions should rely on host memory_used/free and not double count
+# the same run from SQLite.
+ACTIVE_RUN_STATUSES = ("submitted",)
 
 
 def utc_now() -> str:

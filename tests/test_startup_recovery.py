@@ -170,8 +170,8 @@ class TestRecoverSubmittedTasks(unittest.IsolatedAsyncioTestCase):
             entry = store.get_run("bt_succ")
             self.assertEqual(entry["status"], "completed")
 
-    async def test_running_task_not_changed(self) -> None:
-        """A submitted task whose worker reports 'running' stays as submitted."""
+    async def test_running_task_promoted_to_running(self) -> None:
+        """A submitted task whose worker reports 'running' must be promoted."""
         with tempfile.TemporaryDirectory() as td:
             store = self._setup_store(td)
             store.upsert_run("bt_run", {
@@ -191,7 +191,7 @@ class TestRecoverSubmittedTasks(unittest.IsolatedAsyncioTestCase):
                     await app._recover_submitted_tasks()
 
             entry = store.get_run("bt_run")
-            self.assertEqual(entry["status"], "submitted")
+            self.assertEqual(entry["status"], "running")
 
     async def test_unreachable_worker_logs_warning(self) -> None:
         """When a worker is unreachable, task stays unchanged."""
@@ -231,6 +231,34 @@ class TestRecoverSubmittedTasks(unittest.IsolatedAsyncioTestCase):
                     await app._recover_submitted_tasks()
 
             mock_fetch.assert_not_called()
+
+
+class TestSnapshotActiveWorkerReservations(unittest.TestCase):
+    def _setup_store(self, td: str) -> SqliteRunStore:
+        db_path = Path(td) / "hub.sqlite3"
+        store = SqliteRunStore(db_path)
+        app.HUB_DB_PATH = db_path
+        app.RUN_STORE = None
+        return store
+
+    def test_only_submitted_runs_reserve_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = self._setup_store(td)
+            store.upsert_run("bt_submitted", {
+                "status": "submitted",
+                "backtest_api_base": "http://worker1:10001",
+                "required_memory_gb": 60.8,
+            })
+            store.upsert_run("bt_running", {
+                "status": "running",
+                "backtest_api_base": "http://worker1:10001",
+                "required_memory_gb": 190.0,
+            })
+
+            reserved, counts = app.snapshot_active_worker_reservations(store)
+
+            self.assertEqual(reserved, {"http://worker1:10001": 60.8})
+            self.assertEqual(counts, {"http://worker1:10001": 1})
 
 
 class TestSubmittedStatusPoller(unittest.IsolatedAsyncioTestCase):
