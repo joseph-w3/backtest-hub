@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import urllib.request
 from dataclasses import dataclass
@@ -8,6 +9,15 @@ from typing import Any
 
 BYTES_PER_GB = 1024 * 1024 * 1024
 LOGGER = logging.getLogger("backtest_hub.scheduler")
+
+V5_RUNTIME_UNIVERSE_STRATEGY_ENTRY = (
+    "strategies.spread_arb.v5_runtime_universe:SpreadArbV5RuntimeUniverse"
+)
+V5_SMALL_RUN_MEMORY_PER_SYMBOL_GB = 0.65
+V5_LARGE_OPTIMIZED_MEMORY_PER_SYMBOL_GB = 0.8
+V5_LARGE_RUN_SYMBOL_THRESHOLD = 40
+V5_LARGE_RUN_MIN_SYMBOLS = 20
+V5_LARGE_RUN_DURATION_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -196,6 +206,48 @@ def count_running_from_runs_payload(payload: dict[str, Any]) -> int:
     return running
 
 
+def _parse_iso_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _run_duration_days(payload: dict[str, Any]) -> float | None:
+    start_dt = _parse_iso_time(payload.get("start"))
+    end_dt = _parse_iso_time(payload.get("end"))
+    if start_dt is None or end_dt is None:
+        return None
+    return (end_dt - start_dt).total_seconds() / 86_400
+
+
+def _is_v5_runtime_universe(payload: dict[str, Any]) -> bool:
+    return payload.get("strategy_entry") == V5_RUNTIME_UNIVERSE_STRATEGY_ENTRY
+
+
+def _is_large_v5_runtime_universe_run(payload: dict[str, Any], symbol_count: int) -> bool:
+    if not _is_v5_runtime_universe(payload):
+        return False
+    if symbol_count >= V5_LARGE_RUN_SYMBOL_THRESHOLD:
+        return True
+    duration_days = _run_duration_days(payload)
+    if duration_days is None:
+        return False
+    return symbol_count >= V5_LARGE_RUN_MIN_SYMBOLS and duration_days >= V5_LARGE_RUN_DURATION_DAYS
+
+
+def _v5_runtime_universe_optimized_loading_enabled(
+    payload: dict[str, Any],
+    symbol_count: int,
+) -> bool:
+    value = payload.get("optimize_file_loading")
+    if isinstance(value, bool):
+        return value
+    return _is_large_v5_runtime_universe_run(payload, symbol_count)
+
+
 def required_memory_gb_from_run_spec(
     payload: dict[str, Any],
     memory_per_symbol_gb: float = 1.0,
@@ -203,7 +255,16 @@ def required_memory_gb_from_run_spec(
     symbols = payload.get("symbols")
     if not isinstance(symbols, list) or not symbols:
         raise ValueError("symbols must be a non-empty list")
-    return float(len(symbols)) * memory_per_symbol_gb
+    symbol_count = len(symbols)
+
+    if _is_v5_runtime_universe(payload):
+        if _is_large_v5_runtime_universe_run(payload, symbol_count):
+            if _v5_runtime_universe_optimized_loading_enabled(payload, symbol_count):
+                return float(symbol_count) * V5_LARGE_OPTIMIZED_MEMORY_PER_SYMBOL_GB
+            return float(symbol_count) * memory_per_symbol_gb
+        return float(symbol_count) * V5_SMALL_RUN_MEMORY_PER_SYMBOL_GB
+
+    return float(symbol_count) * memory_per_symbol_gb
 
 
 def select_backtest_docker(

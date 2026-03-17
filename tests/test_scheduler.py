@@ -183,6 +183,48 @@ class TestRequiredMemoryGbFromRunSpec(unittest.TestCase):
         result = required_memory_gb_from_run_spec(payload)
         self.assertEqual(result, 2.0)
 
+    def test_v5_small_run_uses_small_profile(self) -> None:
+        payload = {
+            "strategy_entry": "strategies.spread_arb.v5_runtime_universe:SpreadArbV5RuntimeUniverse",
+            "symbols": [f"SYM{i}" for i in range(10)],
+            "start": "2025-12-01T00:00:00.000Z",
+            "end": "2025-12-04T00:00:00.000Z",
+        }
+        result = required_memory_gb_from_run_spec(payload, memory_per_symbol_gb=2.5)
+        self.assertEqual(result, 6.5)
+
+    def test_v5_large_run_auto_uses_optimized_profile(self) -> None:
+        payload = {
+            "strategy_entry": "strategies.spread_arb.v5_runtime_universe:SpreadArbV5RuntimeUniverse",
+            "symbols": [f"SYM{i}" for i in range(76)],
+            "start": "2025-11-10T00:00:00.000Z",
+            "end": "2025-12-31T00:00:00.000Z",
+        }
+        result = required_memory_gb_from_run_spec(payload, memory_per_symbol_gb=2.5)
+        self.assertAlmostEqual(result, 60.8)
+
+    def test_v5_large_run_explicit_optimize_false_uses_fallback_profile(self) -> None:
+        payload = {
+            "strategy_entry": "strategies.spread_arb.v5_runtime_universe:SpreadArbV5RuntimeUniverse",
+            "symbols": [f"SYM{i}" for i in range(76)],
+            "start": "2025-11-10T00:00:00.000Z",
+            "end": "2025-12-31T00:00:00.000Z",
+            "optimize_file_loading": False,
+        }
+        result = required_memory_gb_from_run_spec(payload, memory_per_symbol_gb=2.5)
+        self.assertEqual(result, 190.0)
+
+    def test_v5_large_run_explicit_optimize_true_uses_optimized_profile(self) -> None:
+        payload = {
+            "strategy_entry": "strategies.spread_arb.v5_runtime_universe:SpreadArbV5RuntimeUniverse",
+            "symbols": [f"SYM{i}" for i in range(76)],
+            "start": "2025-11-10T00:00:00.000Z",
+            "end": "2025-12-31T00:00:00.000Z",
+            "optimize_file_loading": True,
+        }
+        result = required_memory_gb_from_run_spec(payload, memory_per_symbol_gb=2.5)
+        self.assertAlmostEqual(result, 60.8)
+
 
 class TestSelectBacktestDocker(unittest.TestCase):
     """Tests for select_backtest_docker using mocked metrics/runs fetchers."""

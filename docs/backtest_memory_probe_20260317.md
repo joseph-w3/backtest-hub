@@ -333,6 +333,43 @@ This matters because the run is not merely surviving mechanically; it is
 executing the strategy path and producing real open/close behavior while the
 reduced-memory loading path is active.
 
+## Scheduling Follow-Up
+
+The old scheduler model treated required RAM as:
+
+- `required_memory_gb = len(symbols) * MEMORY_PER_SYMBOL_GB`
+
+With the deployed environment using `MEMORY_PER_SYMBOL_GB=2.5`, this meant:
+
+- quick 5-pair run (`10` symbols) reserved `25 GB`
+- full 38-pair run (`76` symbols) reserved `190 GB`
+
+That is no longer defensible for V5 runtime-universe spread-arb after the new
+measurements.
+
+Measured reference points:
+
+- quick 5-pair runs:
+  - observed peak around `2.7-2.8 GB`
+  - roughly `0.27-0.28 GB / symbol`
+- full 38-pair run:
+  - observed stabilized level around `46.5 GB`
+  - roughly `0.61 GB / symbol`
+
+Deployed scheduler change:
+
+- keep the old generic `memory_per_symbol_gb` fallback for non-V5 strategies
+- for `SpreadArbV5RuntimeUniverse` only:
+  - small / medium runs reserve `0.65 GB / symbol`
+  - large long runs reserve `0.8 GB / symbol` when optimized loading is enabled
+  - if a large long V5 run explicitly disables optimized loading, fall back to
+    the old generic multiplier instead of under-reserving
+
+This intentionally favors:
+
+- reducing severe over-reservation for validated V5 spread-arb backtests
+- avoiding aggressive extrapolation to unrelated strategy families
+
 ## Recommended Next Steps
 
 1. Keep selective optimized loading behind a guarded default for large V5
