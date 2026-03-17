@@ -235,16 +235,49 @@ Completed quick optimized validation:
 This closes the earlier blocker that produced empty reports under optimized
 loading.
 
+Completed quick no-opt control:
+
+- backtest: `20260317T101741Z_85b52852fdf14a5abf5c3678c7275bb2`
+- template: `run_spec_spread_arb_v5_quick.json`
+- duration: `3d`
+- universe: `5 pairs`
+- status: `success`
+- report stats via `check_backtest_status.py --fast`:
+  - `PnL = -4.71`
+  - `Profit Factor = 2.64`
+  - `Win Rate = 54%`
+  - `Sharpe = 52.8`
+  - `Trades = 26`
+- final progress snapshot:
+  - `chunks_seen = 223`
+  - `events_seen = 44,444,585`
+  - `reports = fills.csv, account_spot.csv, account_futures.csv, order_fills.csv, positions.csv`
+
+Quick parity result:
+
+- optimized quick and no-opt quick matched exactly on the report-level metrics
+  checked here
+- optimized loading therefore preserved correctness on the validated quick
+  template
+- however, the quick template also showed that optimized loading is not a
+  universal steady-state RSS win; the main benefit remains avoiding pre-chunk
+  session explosion on larger runs
+
 ## Recommended Next Steps
 
-1. Compare the completed quick optimized run against a quick no-opt control on
-   the same template and confirm report-level metrics stay within expected
-   parity.
-2. If correctness parity holds, promote selective optimized loading behind a guarded
-   default for long spread-arb backtests, not as a blanket default for every
-   run
+1. Keep selective optimized loading behind a guarded default for large V5
+   spread-arb backtests only. Current auto-enable rule:
+   - explicit `optimize_file_loading` in the run spec always wins
+   - otherwise auto-enable only when:
+     - strategy is `SpreadArbV5RuntimeUniverse`
+     - and either:
+       - `symbol_count >= 40`, or
+       - `symbol_count >= 20` and duration `>= 30 days`
+2. Do not auto-enable it for small quick/medium validations where the memory
+   bottleneck is not the limiting factor and steady-state RSS is already fine.
 3. Separately clean catalog corruption / schema drift in:
    - `OrderBookDelta` directories that contain corrupt parquet footers
    - `FundingRateUpdate`
    - `MarkPriceUpdate`
- so full directory-based loading can be reconsidered later
+4. Once catalog cleanup is done, reconsider whether the fallback path is still
+   needed or whether directory registration can be widened safely.

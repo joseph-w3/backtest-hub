@@ -1087,11 +1087,48 @@ def _load_trade_ticks_enabled(run_spec: dict) -> bool:
     return bool(value)
 
 
+def _spread_arb_v5_runtime_universe_run(run_spec: dict) -> bool:
+    strategy_entry = run_spec.get("strategy_entry")
+    if not isinstance(strategy_entry, str):
+        return False
+    return strategy_entry == "strategies.spread_arb.v5_runtime_universe:SpreadArbV5RuntimeUniverse"
+
+
+def _run_duration_days(run_spec: dict) -> float | None:
+    start = run_spec.get("start")
+    end = run_spec.get("end")
+    if start is None or end is None:
+        return None
+    try:
+        start_dt = _parse_time(start)
+        end_dt = _parse_time(end)
+    except Exception:
+        return None
+    if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
+        return None
+    return (end_dt - start_dt).total_seconds() / 86_400
+
+
+def _should_default_optimize_file_loading(run_spec: dict) -> bool:
+    if not _spread_arb_v5_runtime_universe_run(run_spec):
+        return False
+    symbols = run_spec.get("symbols")
+    if not isinstance(symbols, list):
+        return False
+    symbol_count = sum(1 for symbol in symbols if isinstance(symbol, str) and symbol.strip())
+    if symbol_count >= 40:
+        return True
+    duration_days = _run_duration_days(run_spec)
+    if duration_days is None:
+        return False
+    return symbol_count >= 20 and duration_days >= 30
+
+
 def _optimize_file_loading_enabled(run_spec: dict) -> bool:
     value = run_spec.get("optimize_file_loading")
-    if value is None:
-        return False
-    return bool(value)
+    if value is not None:
+        return bool(value)
+    return _should_default_optimize_file_loading(run_spec)
 
 
 def _optimize_file_loading_for_data_cls(run_spec: dict, data_cls: type) -> bool:

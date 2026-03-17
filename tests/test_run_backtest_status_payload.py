@@ -184,6 +184,9 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             self.assertTrue(
                 run_backtest._optimize_file_loading_enabled({"optimize_file_loading": True})
             )
+            self.assertFalse(
+                run_backtest._optimize_file_loading_enabled({"optimize_file_loading": False})
+            )
             run_backtest.OrderBookDelta = type("OrderBookDelta", (), {})
             run_backtest.TradeTick = type("TradeTick", (), {})
             run_backtest.FundingRateUpdate = type("FundingRateUpdate", (), {})
@@ -205,6 +208,57 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
                     run_backtest.FundingRateUpdate,
                 )
             )
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_optimize_file_loading_auto_enabled_for_large_long_v5_spread_arb(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            run_spec = {
+                "strategy_entry": "strategies.spread_arb.v5_runtime_universe:SpreadArbV5RuntimeUniverse",
+                "symbols": [f"SYM{i}" for i in range(40)],
+                "start": "2025-12-01T00:00:00.000Z",
+                "end": "2026-01-05T00:00:00.000Z",
+            }
+            self.assertTrue(run_backtest._should_default_optimize_file_loading(run_spec))
+            self.assertTrue(run_backtest._optimize_file_loading_enabled(run_spec))
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_optimize_file_loading_auto_disabled_for_small_v5_spread_arb(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            run_spec = {
+                "strategy_entry": "strategies.spread_arb.v5_runtime_universe:SpreadArbV5RuntimeUniverse",
+                "symbols": [f"SYM{i}" for i in range(10)],
+                "start": "2025-12-01T00:00:00.000Z",
+                "end": "2025-12-04T00:00:00.000Z",
+            }
+            self.assertFalse(run_backtest._should_default_optimize_file_loading(run_spec))
+            self.assertFalse(run_backtest._optimize_file_loading_enabled(run_spec))
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_optimize_file_loading_auto_disabled_for_non_v5_strategy(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            run_spec = {
+                "strategy_entry": "strategies.alpha.foo:AlphaStrategy",
+                "symbols": [f"SYM{i}" for i in range(80)],
+                "start": "2025-12-01T00:00:00.000Z",
+                "end": "2026-02-01T00:00:00.000Z",
+            }
+            self.assertFalse(run_backtest._should_default_optimize_file_loading(run_spec))
+            self.assertFalse(run_backtest._optimize_file_loading_enabled(run_spec))
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
