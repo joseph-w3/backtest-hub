@@ -160,20 +160,91 @@ The repo now supports:
 - progress probes for node/build/streaming stages
 - optional run-spec field `optimize_file_loading`
 - selective optimized loading for `OrderBookDelta` / `TradeTick`
+- automatic fallback to file-level registration when optimized directory
+  registration fails for a specific data config
 
 This is currently recorded as an investigation and probe capability, not yet a
 fully validated production default.
 
+## Correctness Validation Update
+
+Two follow-up validation runs were launched against the same 13-day / 7-pair
+medium V5 spread-arb template:
+
+- no-opt control:
+  `20260317T095432Z_275e83f5c8fd488589b64bda81b0bf27`
+- optimized selective loading with fallback:
+  `20260317T095930Z_8c29c0103e37454eac0ecd12b7e68d1c`
+
+Control run status:
+
+- stderr remained empty
+- run progressed normally through chunk processing
+
+Optimized run status after the fallback fix:
+
+- stderr remained empty
+- the run no longer died in `run_config_exception`
+- stdout showed a targeted fallback on one futures order-book directory:
+  - `MUBARAKUSDT-PERP.BINANCE_FUTURES`
+  - reason: `Invalid Parquet file. Corrupt footer`
+- after that fallback, the run continued in `engine_running`
+
+Representative live progress snapshot for the optimized run:
+
+- `phase = engine_running`
+- `simulated_time = 2025-12-01T07:47:29.192000000Z`
+- `chunks_seen = 65`
+- `events_seen = 13,000,000`
+- `process.rss_mb = 3470.71`
+
+Representative live progress snapshot for the no-opt control at roughly the
+same wall-clock checkpoint:
+
+- `phase = engine_running`
+- `simulated_time = 2025-12-02T04:01:54.862000000Z`
+- `chunks_seen = 181`
+- `events_seen = 36,200,000`
+- `process.rss_mb = 8903.79`
+
+Interpretation:
+
+- the optimized path is now recovering correctly from bad directory reads
+- correctness validation is no longer blocked by the previous early exception
+- the memory benefit remains material enough to justify further guarded rollout
+  work once a completed non-empty report is captured
+
+Completed quick optimized validation:
+
+- backtest: `20260317T100124Z_745c8aae6ae54c5193225d8e4026960d`
+- template: `run_spec_spread_arb_v5_quick.json`
+- duration: `3d`
+- universe: `5 pairs`
+- status: `success`
+- report stats via `check_backtest_status.py --fast`:
+  - `PnL = -4.71`
+  - `Profit Factor = 2.64`
+  - `Win Rate = 54%`
+  - `Sharpe = 52.8`
+  - `Trades = 26`
+- final progress snapshot:
+  - `chunks_seen = 223`
+  - `events_seen = 44,444,585`
+  - `reports = fills.csv, account_spot.csv, account_futures.csv, order_fills.csv, positions.csv`
+
+This closes the earlier blocker that produced empty reports under optimized
+loading.
+
 ## Recommended Next Steps
 
-1. Run a smaller end-to-end correctness backtest with selective optimized
-   loading enabled and verify:
-   - non-empty fills
-   - non-empty venue reports
-   - expected trade counts / pnl
-2. If correctness holds, promote selective optimized loading to the default for
-   long spread-arb backtests
-3. Separately normalize schema drift in:
+1. Compare the completed quick optimized run against a quick no-opt control on
+   the same template and confirm report-level metrics stay within expected
+   parity.
+2. If correctness parity holds, promote selective optimized loading behind a guarded
+   default for long spread-arb backtests, not as a blanket default for every
+   run
+3. Separately clean catalog corruption / schema drift in:
+   - `OrderBookDelta` directories that contain corrupt parquet footers
    - `FundingRateUpdate`
    - `MarkPriceUpdate`
-   so full directory-based loading can be reconsidered later
+ so full directory-based loading can be reconsidered later
