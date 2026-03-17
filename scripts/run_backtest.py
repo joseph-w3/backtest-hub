@@ -744,6 +744,11 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
 
         session = DataBackendSession(chunk_size=chunk_size)
         cached_file_lists: dict[tuple[str, str | None, type], list[str]] = {}
+        self._emit_streaming_probe(
+            chunk_index=-1,
+            stage="before_prepare_queries",
+            rss_before_add_mb=_read_current_rss_mb(),
+        )
 
         for config in data_configs:
             catalog = self.load_catalog(config)
@@ -797,6 +802,16 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
                 optimize_file_loading=config.optimize_file_loading,
             )
 
+        self._emit_streaming_probe(
+            chunk_index=-1,
+            stage="after_prepare_queries",
+            rss_before_add_mb=_read_current_rss_mb(),
+        )
+        self._emit_streaming_probe(
+            chunk_index=-1,
+            stage="before_query_result",
+            rss_before_add_mb=_read_current_rss_mb(),
+        )
         for chunk_index, chunk in enumerate(session.to_query_result()):
             events = capsule_to_list(chunk)
             event_count = len(events)
