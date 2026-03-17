@@ -133,6 +133,12 @@ local_data/
 }
 ```
 
+补充:
+
+- `load_trade_ticks` 是可选布尔字段。默认不传时保持旧行为: worker 会加载 `TradeTick`。
+- 对 `SpreadArbV5RuntimeUniverse` 这类本身不消费 trade ticks、且 `trade_execution=false` 的回测，建议在 run spec 里显式设 `load_trade_ticks=false`，可以明显降低长区间大 universe 回测内存。
+- 如果策略本身订阅 trade ticks，或者你需要依赖 trade-tick 驱动的引擎语义，就不要关闭它。
+
 ### queue_scheduler 调度流程
 
 ```

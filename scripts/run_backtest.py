@@ -161,6 +161,7 @@ OPTIONAL_FIELDS = {
     "strategy_bundle",
     "liquidity_consumption",
     "trade_execution",
+    "load_trade_ticks",
     "fill_model_config",
 }
 
@@ -214,6 +215,9 @@ def _validate_run_spec(run_spec: dict, run_spec_path: Path) -> tuple[Path | None
     if "trade_execution" in run_spec:
         if not isinstance(run_spec["trade_execution"], bool):
             raise ValueError("RunSpec trade_execution must be a boolean.")
+    if "load_trade_ticks" in run_spec:
+        if not isinstance(run_spec["load_trade_ticks"], bool):
+            raise ValueError("RunSpec load_trade_ticks must be a boolean.")
     if "fill_model_config" in run_spec:
         _validate_fill_model_config(run_spec["fill_model_config"])
 
@@ -728,10 +732,16 @@ def _load_or_create_instrument(
 
 def _migrate_instrument_data(
     catalog: ParquetDataCatalog,
+    catalog_root: Path,
     source_id: InstrumentId,
     target_id: InstrumentId,
     data_cls: type,
 ) -> int:
+    data_dir = _local_catalog_data_dir(data_cls)
+    if data_dir is not None:
+        source_path = catalog_root / "data" / data_dir / source_id.value
+        if not source_path.exists():
+            return 0
     data = catalog.query(data_cls, identifiers=[source_id.value])
     if not data:
         return 0
@@ -741,16 +751,23 @@ def _migrate_instrument_data(
 
 def _migrate_legacy_catalog_data(
     catalog: ParquetDataCatalog,
-    instrument_ids: list[InstrumentId],
+    catalog_root: Path,
+    spot_instrument_ids: list[InstrumentId],
+    futures_instrument_ids: list[InstrumentId],
+    *,
+    load_trade_ticks: bool,
 ) -> None:
-    if not instrument_ids:
+    if not spot_instrument_ids and not futures_instrument_ids:
         return
-    data_classes = (OrderBookDelta, TradeTick, FundingRateUpdate, MarkPriceUpdate)
-    for instrument_id in instrument_ids:
+    for instrument_id in spot_instrument_ids:
         legacy_id = InstrumentId(instrument_id.symbol, BINANCE_LEGACY_VENUE)
-        for data_cls in data_classes:
+        for data_cls in _market_data_classes(
+            include_futures_extras=False,
+            load_trade_ticks=load_trade_ticks,
+        ):
             migrated = _migrate_instrument_data(
                 catalog=catalog,
+                catalog_root=catalog_root,
                 source_id=legacy_id,
                 target_id=instrument_id,
                 data_cls=data_cls,
@@ -760,6 +777,53 @@ def _migrate_legacy_catalog_data(
                     f"[MIGRATE] {data_cls.__name__} "
                     f"{legacy_id.value} -> {instrument_id.value} ({migrated} rows)"
                 )
+    for instrument_id in futures_instrument_ids:
+        legacy_id = InstrumentId(instrument_id.symbol, BINANCE_LEGACY_VENUE)
+        for data_cls in _market_data_classes(
+            include_futures_extras=True,
+            load_trade_ticks=load_trade_ticks,
+        ):
+            migrated = _migrate_instrument_data(
+                catalog=catalog,
+                catalog_root=catalog_root,
+                source_id=legacy_id,
+                target_id=instrument_id,
+                data_cls=data_cls,
+            )
+            if migrated:
+                print(
+                    f"[MIGRATE] {data_cls.__name__} "
+                    f"{legacy_id.value} -> {instrument_id.value} ({migrated} rows)"
+                )
+
+
+def _load_trade_ticks_enabled(run_spec: dict) -> bool:
+    value = run_spec.get("load_trade_ticks")
+    if value is None:
+        return True
+    return bool(value)
+
+
+def _market_data_classes(
+    *,
+    include_futures_extras: bool,
+    load_trade_ticks: bool,
+) -> tuple[type, ...]:
+    data_classes: list[type] = [OrderBookDelta]
+    if load_trade_ticks:
+        data_classes.append(TradeTick)
+    if include_futures_extras:
+        data_classes.extend([FundingRateUpdate, MarkPriceUpdate])
+    return tuple(data_classes)
+
+
+def _local_catalog_data_dir(data_cls: type) -> str | None:
+    return {
+        OrderBookDelta: "order_book_deltas",
+        TradeTick: "trade_ticks",
+        FundingRateUpdate: "funding_rate_updates",
+        MarkPriceUpdate: "mark_price_updates",
+    }.get(data_cls)
 
 
 def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
@@ -775,6 +839,7 @@ def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
         "end": run_spec["end"],
         "tags": run_spec["tags"],
         "phase": "initializing",
+        "init_step": "bootstrap",
         "last_progress_at": datetime.now(timezone.utc).isoformat(),
         "simulated_time": None,
     }
@@ -809,6 +874,29 @@ def _extract_latest_simulated_time(stdout_path: Path) -> str | None:
     return matches[-1].group(1)
 
 
+def _write_status_snapshot(
+    *,
+    status_path: Path,
+    status: dict,
+    status_lock: threading.Lock,
+    stdout_path: Path | None,
+    updates: dict | None = None,
+    clear_keys: tuple[str, ...] = (),
+) -> None:
+    with status_lock:
+        if updates:
+            status.update(updates)
+        for key in clear_keys:
+            status.pop(key, None)
+        status["last_progress_at"] = datetime.now(timezone.utc).isoformat()
+        if stdout_path is not None:
+            simulated_time = _extract_latest_simulated_time(stdout_path)
+            if simulated_time:
+                status["simulated_time"] = simulated_time
+        snapshot = dict(status)
+    _write_status(status_path, snapshot)
+
+
 def _start_progress_heartbeat(
     *,
     status_path: Path,
@@ -820,14 +908,12 @@ def _start_progress_heartbeat(
 
     def _tick() -> None:
         while not stop_event.wait(PROGRESS_UPDATE_SECONDS):
-            with status_lock:
-                status["last_progress_at"] = datetime.now(timezone.utc).isoformat()
-                if stdout_path is not None:
-                    simulated_time = _extract_latest_simulated_time(stdout_path)
-                    if simulated_time:
-                        status["simulated_time"] = simulated_time
-                snapshot = dict(status)
-            _write_status(status_path, snapshot)
+            _write_status_snapshot(
+                status_path=status_path,
+                status=status,
+                status_lock=status_lock,
+                stdout_path=stdout_path,
+            )
 
     thread = threading.Thread(
         target=_tick,
@@ -1027,14 +1113,42 @@ def main() -> int:
     started_at = datetime.now(timezone.utc).isoformat()
     status = _build_status_payload(backtest_id, run_spec)
     status.update({"status": "running", "started_at": started_at})
-    _write_status(status_path, status)
     status_lock = threading.Lock()
+    stdout_path_raw = os.environ.get("BACKTEST_STDOUT_PATH")
+    stdout_path = Path(stdout_path_raw).expanduser() if stdout_path_raw else None
+    _write_status_snapshot(
+        status_path=status_path,
+        status=status,
+        status_lock=status_lock,
+        stdout_path=stdout_path,
+    )
     heartbeat_stop: threading.Event | None = None
     heartbeat_thread: threading.Thread | None = None
 
     try:
+        heartbeat_stop, heartbeat_thread = _start_progress_heartbeat(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+        )
+
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"init_step": "seed_rng"},
+        )
         random.seed(run_spec["seed"])
         if bundle_path is not None:
+            _write_status_snapshot(
+                status_path=status_path,
+                status=status,
+                status_lock=status_lock,
+                stdout_path=stdout_path,
+                updates={"init_step": "prepare_strategy_bundle"},
+            )
             bundle_root = _extract_strategy_bundle(bundle_path, run_spec_path.parent / "strategy_bundle")
             _prepare_bundle_import(bundle_root)
             _ensure_strategy_importable(run_spec["strategy_entry"])
@@ -1043,10 +1157,24 @@ def main() -> int:
             strategy_config_path = run_spec["strategy_config_path"]
         else:
             assert strategy_file_path is not None
+            _write_status_snapshot(
+                status_path=status_path,
+                status=status,
+                status_lock=status_lock,
+                stdout_path=stdout_path,
+                updates={"init_step": "load_strategy_module"},
+            )
             module_name = _load_strategy_module(strategy_file_path)
             strategy_entry = _rewrite_import_path(run_spec["strategy_entry"], module_name)
             strategy_config_path = _rewrite_import_path(run_spec["strategy_config_path"], module_name)
 
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"init_step": "parse_run_spec_fields"},
+        )
         spot_symbols, futures_symbols = _parse_symbols(run_spec["symbols"])
         margin_init = _parse_decimal("margin_init", run_spec["margin_init"])
         margin_maint = _parse_decimal("margin_maint", run_spec["margin_maint"])
@@ -1061,6 +1189,13 @@ def main() -> int:
         catalog_fs_storage_options = _catalog_cfg["catalog_fs_storage_options"]
         catalog_fs_rust_storage_options = _catalog_cfg["catalog_fs_rust_storage_options"]
 
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"init_step": "open_catalog"},
+        )
         data_catalog = ParquetDataCatalog(
             catalog_path_str,
             fs_protocol=catalog_fs_protocol,
@@ -1072,6 +1207,13 @@ def main() -> int:
         futures_instruments: list[CryptoPerpetual] = []
         quote_code: str | None = None
 
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"init_step": "load_spot_instruments"},
+        )
         for data_symbol in spot_symbols:
             base_code, symbol_quote_code = _resolve_base_quote(data_symbol)
             if quote_code is None:
@@ -1095,6 +1237,13 @@ def main() -> int:
             )
             spot_instruments.append(spot_instrument)
 
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"init_step": "load_futures_instruments"},
+        )
         for base_symbol in futures_symbols:
             base_code, symbol_quote_code = _resolve_base_quote(base_symbol)
             if quote_code is None:
@@ -1121,57 +1270,72 @@ def main() -> int:
             )
             futures_instruments.append(futures_instrument)
 
+        load_trade_ticks = _load_trade_ticks_enabled(run_spec)
+
         if catalog_fs_protocol is None:
+            catalog_root = Path(catalog_path_str)
+            _write_status_snapshot(
+                status_path=status_path,
+                status=status,
+                status_lock=status_lock,
+                stdout_path=stdout_path,
+                updates={"init_step": "migrate_legacy_catalog"},
+            )
             _migrate_legacy_catalog_data(
                 catalog=data_catalog,
-                instrument_ids=[instrument.id for instrument in spot_instruments + futures_instruments],
+                catalog_root=catalog_root,
+                spot_instrument_ids=[instrument.id for instrument in spot_instruments],
+                futures_instrument_ids=[instrument.id for instrument in futures_instruments],
+                load_trade_ticks=load_trade_ticks,
             )
 
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"init_step": "build_data_configs"},
+        )
         data_configs: list[BacktestDataConfig] = []
-        for instrument in spot_instruments + futures_instruments:
-            data_configs.extend(
-                [
+        for instrument in spot_instruments:
+            for data_cls in _market_data_classes(
+                include_futures_extras=False,
+                load_trade_ticks=load_trade_ticks,
+            ):
+                data_configs.append(
                     BacktestDataConfig(
                         catalog_path=catalog_path_str,
                         catalog_fs_protocol=catalog_fs_protocol,
                         catalog_fs_storage_options=catalog_fs_storage_options,
                         catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
-                        data_cls=OrderBookDelta,
+                        data_cls=data_cls,
                         instrument_id=instrument.id,
-                    ),
-                    BacktestDataConfig(
-                        catalog_path=catalog_path_str,
-                        catalog_fs_protocol=catalog_fs_protocol,
-                        catalog_fs_storage_options=catalog_fs_storage_options,
-                        catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
-                        data_cls=TradeTick,
-                        instrument_id=instrument.id,
-                    ),
-                ]
-            )
+                    )
+                )
 
         for instrument in futures_instruments:
-            data_configs.append(
-                BacktestDataConfig(
-                    catalog_path=catalog_path_str,
-                    catalog_fs_protocol=catalog_fs_protocol,
-                    catalog_fs_storage_options=catalog_fs_storage_options,
-                    catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
-                    data_cls=FundingRateUpdate,
-                    instrument_id=instrument.id,
+            for data_cls in _market_data_classes(
+                include_futures_extras=True,
+                load_trade_ticks=load_trade_ticks,
+            ):
+                data_configs.append(
+                    BacktestDataConfig(
+                        catalog_path=catalog_path_str,
+                        catalog_fs_protocol=catalog_fs_protocol,
+                        catalog_fs_storage_options=catalog_fs_storage_options,
+                        catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
+                        data_cls=data_cls,
+                        instrument_id=instrument.id,
+                    )
                 )
-            )
-            data_configs.append(
-                BacktestDataConfig(
-                    catalog_path=catalog_path_str,
-                    catalog_fs_protocol=catalog_fs_protocol,
-                    catalog_fs_storage_options=catalog_fs_storage_options,
-                    catalog_fs_rust_storage_options=catalog_fs_rust_storage_options,
-                    data_cls=MarkPriceUpdate,
-                    instrument_id=instrument.id,
-                )
-            )
 
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"init_step": "build_engine_config"},
+        )
         latency_model_config = ImportableLatencyModelConfig(
             latency_model_path="quant_trade_v1.backtest.models:LatencyModel",
             config_path="quant_trade_v1.backtest.config:LatencyModelConfig",
@@ -1266,25 +1430,24 @@ def main() -> int:
             end=run_spec["end"],
         )
 
-        node = _InstrumentOverrideBacktestNode(
-            configs=[run_config],
-            instruments=spot_instruments + futures_instruments,
-        )
-        stdout_path_raw = os.environ.get("BACKTEST_STDOUT_PATH")
-        stdout_path = Path(stdout_path_raw).expanduser() if stdout_path_raw else None
-        with status_lock:
-            status["phase"] = "engine_running"
-            status["last_progress_at"] = datetime.now(timezone.utc).isoformat()
-            if stdout_path is not None:
-                simulated_time = _extract_latest_simulated_time(stdout_path)
-                if simulated_time:
-                    status["simulated_time"] = simulated_time
-            _write_status(status_path, dict(status))
-        heartbeat_stop, heartbeat_thread = _start_progress_heartbeat(
+        _write_status_snapshot(
             status_path=status_path,
             status=status,
             status_lock=status_lock,
             stdout_path=stdout_path,
+            updates={"init_step": "create_backtest_node"},
+        )
+        node = _InstrumentOverrideBacktestNode(
+            configs=[run_config],
+            instruments=spot_instruments + futures_instruments,
+        )
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"phase": "engine_running"},
+            clear_keys=("init_step",),
         )
         node.run()
         if heartbeat_stop is not None:
@@ -1296,14 +1459,13 @@ def main() -> int:
         if engine is None:
             raise RuntimeError("Backtest engine not found for run config.")
 
-        with status_lock:
-            status["phase"] = "exporting_reports"
-            status["last_progress_at"] = datetime.now(timezone.utc).isoformat()
-            if stdout_path is not None:
-                simulated_time = _extract_latest_simulated_time(stdout_path)
-                if simulated_time:
-                    status["simulated_time"] = simulated_time
-            _write_status(status_path, dict(status))
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={"phase": "exporting_reports"},
+        )
 
         reports, report_errors = _export_csv_reports(
             engine,
@@ -1327,10 +1489,15 @@ def main() -> int:
                 "status": "success",
                 "phase": "completed",
                 "finished_at": datetime.now(timezone.utc).isoformat(),
-                "last_progress_at": datetime.now(timezone.utc).isoformat(),
             }
         )
-        _write_status(status_path, status)
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            clear_keys=("init_step",),
+        )
         return 0
     except Exception as exc:
         if heartbeat_stop is not None:
@@ -1343,12 +1510,17 @@ def main() -> int:
                 "status": "failed",
                 "phase": "failed",
                 "finished_at": datetime.now(timezone.utc).isoformat(),
-                "last_progress_at": datetime.now(timezone.utc).isoformat(),
                 "error": str(exc),
                 "traceback": tb,
             }
         )
-        _write_status(status_path, status)
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            clear_keys=("init_step",),
+        )
         print("\n" + "=" * 70, file=sys.stderr)
         print("[ERROR] Backtest failed", file=sys.stderr)
         print(f"Error: {exc}", file=sys.stderr)

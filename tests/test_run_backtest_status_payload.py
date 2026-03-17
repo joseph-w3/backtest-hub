@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -114,8 +116,135 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
             self.assertIsNone(payload["strategy_file"])
             self.assertEqual(payload["symbol_count"], 1)
             self.assertEqual(payload["phase"], "initializing")
+            self.assertEqual(payload["init_step"], "bootstrap")
             self.assertIn("last_progress_at", payload)
             self.assertIsNone(payload["simulated_time"])
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_write_status_snapshot_updates_init_step_and_simulated_time(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory() as td:
+                status_path = Path(td) / "status.json"
+                stdout_path = Path(td) / "stdout.log"
+                stdout_path.write_text(
+                    "2026-03-13T21:06:53.925544242Z [INFO] BACKTESTER-001.DataEngine: Registered BACKTEST\n",
+                    encoding="utf-8",
+                )
+                status = run_backtest._build_status_payload(
+                    "bt-1",
+                    {
+                        "requested_by": "tester",
+                        "strategy_entry": "strategies.s:Strategy",
+                        "strategy_bundle": "bundle.zip",
+                        "symbols": ["ACTUSDT"],
+                        "start": "2025-11-10T00:00:00.000Z",
+                        "end": "2025-11-11T00:00:00.000Z",
+                        "tags": {"purpose": "test"},
+                    },
+                )
+
+                run_backtest._write_status_snapshot(
+                    status_path=status_path,
+                    status=status,
+                    status_lock=threading.Lock(),
+                    stdout_path=stdout_path,
+                    updates={"init_step": "open_catalog"},
+                )
+
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["init_step"], "open_catalog")
+                self.assertEqual(payload["simulated_time"], "2026-03-13T21:06:53.925544242Z")
+                self.assertEqual(payload["phase"], "initializing")
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+
+class TestRunBacktestMarketDataProfile(unittest.TestCase):
+    def test_load_trade_ticks_defaults_true(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            self.assertTrue(run_backtest._load_trade_ticks_enabled({}))
+            self.assertFalse(run_backtest._load_trade_ticks_enabled({"load_trade_ticks": False}))
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_market_data_classes_skip_trade_ticks_when_disabled(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            run_backtest.OrderBookDelta = type("OrderBookDelta", (), {})
+            run_backtest.TradeTick = type("TradeTick", (), {})
+            run_backtest.FundingRateUpdate = type("FundingRateUpdate", (), {})
+            run_backtest.MarkPriceUpdate = type("MarkPriceUpdate", (), {})
+
+            spot_classes = run_backtest._market_data_classes(
+                include_futures_extras=False,
+                load_trade_ticks=False,
+            )
+            futures_classes = run_backtest._market_data_classes(
+                include_futures_extras=True,
+                load_trade_ticks=False,
+            )
+
+            self.assertEqual(
+                [cls.__name__ for cls in spot_classes],
+                ["OrderBookDelta"],
+            )
+            self.assertEqual(
+                [cls.__name__ for cls in futures_classes],
+                ["OrderBookDelta", "FundingRateUpdate", "MarkPriceUpdate"],
+            )
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_migrate_instrument_data_skips_missing_legacy_directory(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            class Catalog:
+                def __init__(self) -> None:
+                    self.query_calls = 0
+
+                def query(self, *_args, **_kwargs):
+                    self.query_calls += 1
+                    return []
+
+                def write(self, *_args, **_kwargs) -> None:
+                    raise AssertionError("write should not be called when source path is missing")
+
+            class InstrumentId:
+                def __init__(self, value: str) -> None:
+                    self.value = value
+
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory() as td:
+                catalog = Catalog()
+                migrated = run_backtest._migrate_instrument_data(
+                    catalog=catalog,
+                    catalog_root=Path(td),
+                    source_id=InstrumentId("CRVUSDT.BINANCE"),
+                    target_id=InstrumentId("CRVUSDT.BINANCE_SPOT"),
+                    data_cls=run_backtest.OrderBookDelta,
+                )
+
+            self.assertEqual(migrated, 0)
+            self.assertEqual(catalog.query_calls, 0)
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
@@ -125,8 +254,6 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
         added_modules = _install_quant_trade_stubs()
         try:
             run_backtest = _load_run_backtest()
-            with unittest.mock.patch("pathlib.Path.stat") as _:
-                pass
             from tempfile import TemporaryDirectory
 
             with TemporaryDirectory() as td:

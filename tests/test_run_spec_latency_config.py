@@ -123,6 +123,18 @@ class TestRunSpecFillModelConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             app.validate_run_spec(payload)
 
+    def test_load_trade_ticks_true(self) -> None:
+        payload = _base_payload()
+        payload["load_trade_ticks"] = True
+        sanitized = app.validate_run_spec(payload)
+        self.assertTrue(sanitized["load_trade_ticks"])
+
+    def test_load_trade_ticks_string_rejected(self) -> None:
+        payload = _base_payload()
+        payload["load_trade_ticks"] = "false"
+        with self.assertRaises(ValueError):
+            app.validate_run_spec(payload)
+
     def test_fill_model_config_valid(self) -> None:
         payload = _base_payload()
         payload["fill_model_config"] = {
@@ -188,4 +200,5 @@ class TestRunSpecFillModelConfig(unittest.TestCase):
         sanitized = app.validate_run_spec(payload)
         self.assertNotIn("liquidity_consumption", sanitized)
         self.assertNotIn("trade_execution", sanitized)
+        self.assertNotIn("load_trade_ticks", sanitized)
         self.assertNotIn("fill_model_config", sanitized)
