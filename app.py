@@ -36,6 +36,7 @@ from services.scheduler import (
     select_backtest_docker,
 )
 from services.run_store_sqlite import SqliteRunStore
+from scripts.catalog_controls import parse_catalog_controls
 
 app = FastAPI()
 report_service: "ReportService | None" = None
@@ -306,6 +307,7 @@ OPTIONAL_FIELDS = {
     "load_trade_ticks",
     "optimize_file_loading",
     "fill_model_config",
+    "catalog_controls",
 }
 
 ALLOWED_FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
@@ -552,6 +554,8 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("optimize_file_loading must be a boolean")
     if "fill_model_config" in payload:
         payload["fill_model_config"] = parse_fill_model_config(payload["fill_model_config"])
+    if "catalog_controls" in payload:
+        payload["catalog_controls"] = parse_catalog_controls(payload["catalog_controls"])
 
     start_value = payload["start"]
     end_value = payload["end"]
@@ -606,6 +610,8 @@ def validate_run_spec(payload: dict[str, Any]) -> dict[str, Any]:
         sanitized["optimize_file_loading"] = payload["optimize_file_loading"]
     if "fill_model_config" in payload:
         sanitized["fill_model_config"] = payload["fill_model_config"]
+    if "catalog_controls" in payload:
+        sanitized["catalog_controls"] = payload["catalog_controls"]
     return sanitized
 
 

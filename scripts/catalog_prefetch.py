@@ -140,8 +140,10 @@ class LocalFileReadPrefetchBackend:
         }
 
 
-def build_prefetch_backend() -> PrefetchBackend:
-    mode = os.environ.get("BACKTEST_PREFETCH_BACKEND", "local-read").strip().lower()
+def build_prefetch_backend(mode: str | None = None) -> PrefetchBackend:
+    if mode is None:
+        mode = os.environ.get("BACKTEST_PREFETCH_BACKEND", "local-read")
+    mode = mode.strip().lower()
     if mode in {"", "off", "disabled", "none"}:
         return NoopPrefetchBackend()
     if mode == "local-read":

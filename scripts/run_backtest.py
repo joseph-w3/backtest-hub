@@ -50,16 +50,26 @@ from quant_trade_v1.model.objects import Quantity
 from quant_trade_v1.persistence.catalog import ParquetDataCatalog
 
 try:
+    from scripts.catalog_controls import CatalogControls
+    from scripts.catalog_controls import resolve_catalog_controls
     from scripts.catalog_prefetch import ReplayPrefetchController
     from scripts.catalog_prefetch import build_prefetch_backend
     from scripts.catalog_prefetch import build_windowed_files
     from scripts.catalog_prefetch import ns_to_iso
+    from scripts.prewarm_catalog_cache import build_manifest
+    from scripts.prewarm_catalog_cache import run_warmup
+    from scripts.prewarm_catalog_cache import write_manifest
     from scripts.catalog_prefetch import time_like_to_ns
 except ImportError:  # pragma: no cover - direct script execution path
+    from catalog_controls import CatalogControls
+    from catalog_controls import resolve_catalog_controls
     from catalog_prefetch import ReplayPrefetchController
     from catalog_prefetch import build_prefetch_backend
     from catalog_prefetch import build_windowed_files
     from catalog_prefetch import ns_to_iso
+    from prewarm_catalog_cache import build_manifest
+    from prewarm_catalog_cache import run_warmup
+    from prewarm_catalog_cache import write_manifest
     from catalog_prefetch import time_like_to_ns
 
 
@@ -1062,11 +1072,14 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             stage="before_query_result",
             rss_before_add_mb=_read_current_rss_mb(),
         )
+        prefetch_backend_mode, prefetch_ahead_hours, prefetch_max_files_per_batch = (
+            _prefetch_runtime_settings(run_spec)
+        )
         prefetch_controller = ReplayPrefetchController(
             files=build_windowed_files(prefetch_candidates),
-            backend=build_prefetch_backend(),
-            ahead_hours=int(os.environ.get("BACKTEST_PREFETCH_AHEAD_HOURS", "72")),
-            max_files_per_batch=int(os.environ.get("BACKTEST_PREFETCH_MAX_FILES_PER_BATCH", "4")),
+            backend=build_prefetch_backend(mode=prefetch_backend_mode),
+            ahead_hours=prefetch_ahead_hours,
+            max_files_per_batch=prefetch_max_files_per_batch,
         )
         self._emit_prefetch_probe(**prefetch_controller.advance(time_like_to_ns(start)))
         try:
@@ -1324,6 +1337,33 @@ def _load_trade_ticks_enabled(run_spec: dict) -> bool:
     return bool(value)
 
 
+def _catalog_controls(run_spec: dict) -> CatalogControls:
+    return resolve_catalog_controls(run_spec)
+
+
+def _catalog_prewarm_enabled(run_spec: dict) -> bool:
+    return _catalog_controls(run_spec).prewarm_before_run
+
+
+def _catalog_prewarm_threads(run_spec: dict) -> int:
+    return _catalog_controls(run_spec).prewarm_threads
+
+
+def _prefetch_runtime_settings(run_spec: dict) -> tuple[str | None, int, int]:
+    controls = _catalog_controls(run_spec)
+    ahead_hours = (
+        controls.prefetch_ahead_hours
+        if controls.prefetch_ahead_hours is not None
+        else int(os.environ.get("BACKTEST_PREFETCH_AHEAD_HOURS", "72"))
+    )
+    max_files_per_batch = (
+        controls.prefetch_max_files_per_batch
+        if controls.prefetch_max_files_per_batch is not None
+        else int(os.environ.get("BACKTEST_PREFETCH_MAX_FILES_PER_BATCH", "4"))
+    )
+    return controls.prefetch_backend, ahead_hours, max_files_per_batch
+
+
 def _spread_arb_v5_runtime_universe_run(run_spec: dict) -> bool:
     strategy_entry = run_spec.get("strategy_entry")
     if not isinstance(strategy_entry, str):
@@ -1406,6 +1446,7 @@ def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
         "strategy_entry": run_spec["strategy_entry"],
         "strategy_file": run_spec.get("strategy_file"),
         "strategy_bundle": run_spec.get("strategy_bundle"),
+        "catalog_controls": run_spec.get("catalog_controls"),
         "symbols": run_spec["symbols"],
         "symbol_count": len(run_spec["symbols"]),
         "start": run_spec["start"],
@@ -2120,12 +2161,55 @@ def main() -> int:
         spot_taker_fee = _parse_decimal("spot_taker_fee", run_spec["spot_taker_fee"])
         futures_maker_fee = _parse_decimal("futures_maker_fee", run_spec["futures_maker_fee"])
         futures_taker_fee = _parse_decimal("futures_taker_fee", run_spec["futures_taker_fee"])
+        catalog_controls = _catalog_controls(run_spec)
         # S3 catalog support (B2 or compatible S3 endpoint)
         _catalog_cfg = build_catalog_config()
         catalog_path_str = _catalog_cfg["catalog_path"]
         catalog_fs_protocol = _catalog_cfg["catalog_fs_protocol"]
         catalog_fs_storage_options = _catalog_cfg["catalog_fs_storage_options"]
         catalog_fs_rust_storage_options = _catalog_cfg["catalog_fs_rust_storage_options"]
+
+        if catalog_controls.prewarm_before_run:
+            if catalog_fs_protocol is not None:
+                raise ValueError(
+                    "catalog_controls.prewarm_before_run requires a worker-local catalog path"
+                )
+            catalog_root = Path(catalog_path_str)
+            manifest_path = log_dir / "catalog-prewarm-manifest.txt"
+            _write_status_snapshot(
+                status_path=status_path,
+                status=status,
+                status_lock=status_lock,
+                stdout_path=stdout_path,
+                updates={"init_step": "catalog_prewarm"},
+            )
+            prewarm_result = build_manifest(run_spec=run_spec, catalog_root=catalog_root)
+            if not prewarm_result.paths:
+                raise ValueError("No catalog files matched the supplied run_spec for prewarm.")
+            write_manifest(prewarm_result.paths, manifest_path)
+            prewarm_summary = {
+                "catalog_root": catalog_root.as_posix(),
+                "manifest_path": manifest_path.as_posix(),
+                "file_count": len(prewarm_result.paths),
+                "category_counts": prewarm_result.category_counts,
+                "missing_dir_count": len(prewarm_result.missing_dirs),
+                "missing_dir_sample": prewarm_result.missing_dirs[:10],
+                "threads": catalog_controls.prewarm_threads,
+            }
+            _write_status_snapshot(
+                status_path=status_path,
+                status=status,
+                status_lock=status_lock,
+                stdout_path=stdout_path,
+                updates={"catalog_prewarm": prewarm_summary},
+            )
+            warmup_rc = run_warmup(
+                manifest_path=manifest_path,
+                threads=catalog_controls.prewarm_threads,
+                background=False,
+            )
+            if warmup_rc != 0:
+                raise RuntimeError(f"catalog prewarm failed with exit code {warmup_rc}")
 
         _write_status_snapshot(
             status_path=status_path,

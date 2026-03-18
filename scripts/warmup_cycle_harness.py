@@ -11,12 +11,21 @@ import sys
 from typing import Any
 import zipfile
 
+try:
+    from scripts.catalog_controls import DEFAULT_CATALOG_PREFETCH_AHEAD_HOURS
+    from scripts.catalog_controls import DEFAULT_CATALOG_PREFETCH_MAX_FILES_PER_BATCH
+    from scripts.catalog_controls import DEFAULT_CATALOG_PREWARM_THREADS
+except ImportError:  # pragma: no cover - direct script execution path
+    from catalog_controls import DEFAULT_CATALOG_PREFETCH_AHEAD_HOURS
+    from catalog_controls import DEFAULT_CATALOG_PREFETCH_MAX_FILES_PER_BATCH
+    from catalog_controls import DEFAULT_CATALOG_PREWARM_THREADS
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CATALOG_ROOT = "/mnt/localB2fs/backtest/catalog"
-DEFAULT_PREFETCH_AHEAD_HOURS = 72
-DEFAULT_PREFETCH_MAX_FILES_PER_BATCH = 4
-DEFAULT_PREWARM_THREADS = 50
+DEFAULT_PREFETCH_AHEAD_HOURS = DEFAULT_CATALOG_PREFETCH_AHEAD_HOURS
+DEFAULT_PREFETCH_MAX_FILES_PER_BATCH = DEFAULT_CATALOG_PREFETCH_MAX_FILES_PER_BATCH
+DEFAULT_PREWARM_THREADS = DEFAULT_CATALOG_PREWARM_THREADS
 DEFAULT_CHUNK_SIZE = 200000
 DEFAULT_SCHEMA_VERSION = "1.0"
 DEFAULT_REQUESTED_BY = "researcher_001"
@@ -132,6 +141,9 @@ def _base_run_spec(
     end: str,
     bundle_relative_path: str,
     mode: HarnessMode,
+    prewarm_threads: int,
+    prefetch_ahead_hours: int,
+    prefetch_max_files_per_batch: int,
     load_trade_ticks: bool,
     optimize_file_loading: bool,
 ) -> dict[str, Any]:
@@ -165,6 +177,13 @@ def _base_run_spec(
         "strategy_bundle": bundle_relative_path,
         "load_trade_ticks": load_trade_ticks,
         "optimize_file_loading": optimize_file_loading,
+        "catalog_controls": {
+            "prewarm_before_run": mode.prewarm_before_run,
+            "prewarm_threads": prewarm_threads,
+            "prefetch_backend": mode.replay_prefetch_backend,
+            "prefetch_ahead_hours": prefetch_ahead_hours,
+            "prefetch_max_files_per_batch": prefetch_max_files_per_batch,
+        },
     }
 
 
@@ -175,13 +194,7 @@ def _render_env(mode: HarnessMode, args: argparse.Namespace) -> str:
         f'HARNESS_MODE="{mode.name}"',
         f'HARNESS_PYTHON="{sys.executable}"',
         f'HARNESS_RUNNER_PATH="{(REPO_ROOT / "scripts" / "run_backtest.py").as_posix()}"',
-        f'HARNESS_PREWARM_SCRIPT="{(REPO_ROOT / "scripts" / "prewarm_catalog_cache.py").as_posix()}"',
         f'HARNESS_CATALOG_ROOT="{args.catalog_root}"',
-        f"HARNESS_PREWARM_REQUIRED={'1' if mode.prewarm_before_run else '0'}",
-        f"HARNESS_PREWARM_THREADS={args.prewarm_threads}",
-        f"BACKTEST_PREFETCH_BACKEND={mode.replay_prefetch_backend}",
-        f"BACKTEST_PREFETCH_AHEAD_HOURS={args.prefetch_ahead_hours}",
-        f"BACKTEST_PREFETCH_MAX_FILES_PER_BATCH={args.prefetch_max_files_per_batch}",
         "set +a",
         "",
     ]
@@ -196,19 +209,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
 RUN_SPEC="${SCRIPT_DIR}/run_spec.json"
-MANIFEST="${SCRIPT_DIR}/catalog-prewarm-manifest.txt"
 export CATALOG_PATH="${HARNESS_CATALOG_ROOT}"
 export BACKTEST_LOGS_PATH="${SCRIPT_DIR}/logs"
 mkdir -p "${BACKTEST_LOGS_PATH}"
-
-if [[ "${HARNESS_PREWARM_REQUIRED}" == "1" ]]; then
-  "${HARNESS_PYTHON}" "${HARNESS_PREWARM_SCRIPT}" \
-    --run-spec "${RUN_SPEC}" \
-    --catalog-root "${HARNESS_CATALOG_ROOT}" \
-    --manifest "${MANIFEST}" \
-    --warmup \
-    --threads "${HARNESS_PREWARM_THREADS}"
-fi
 
 "${HARNESS_PYTHON}" "${HARNESS_RUNNER_PATH}" --run-spec "${RUN_SPEC}"
 """
@@ -249,12 +252,13 @@ def _render_readme(
             "",
             "Usage:",
             "",
-            "1. Run each mode on the same worker shape and same catalog root.",
+            "1. Submit each mode through the normal backtest-hub CLI/API path.",
+            "   Example: `python -m backtest_hub_cli.cli submit --run-spec no_warmup/run_spec.json --strategy-bundle bundle/strategies-harness.zip --name warmup-no-warmup --no-generate`",
             "2. If you want a true cold-start comparison, put each run on a fresh or explicitly reset cache state.",
             "3. Compare `before_query_result`, `first_chunk`, and post-first-chunk replay speed separately.",
-            "4. Each mode writes `status.json`, CSVs, and engine logs under its own `logs/` directory.",
+            "4. Each mode writes `status.json`, CSVs, and engine logs under its own `logs/` directory when run locally.",
             "",
-            "This harness does not manage mounts or cache eviction. It only generates a reproducible runner-local layout.",
+            "This harness does not manage mounts or cache eviction. It only generates reproducible mode directories and run_spec controls.",
             "",
         ]
     )
@@ -319,6 +323,9 @@ def generate_harness(
             end=end,
             bundle_relative_path=bundle_relative_path.replace(os.sep, "/"),
             mode=mode,
+            prewarm_threads=prewarm_threads,
+            prefetch_ahead_hours=prefetch_ahead_hours,
+            prefetch_max_files_per_batch=prefetch_max_files_per_batch,
             load_trade_ticks=load_trade_ticks,
             optimize_file_loading=optimize_file_loading,
         )

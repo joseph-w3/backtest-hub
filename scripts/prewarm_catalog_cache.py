@@ -202,7 +202,7 @@ def build_manifest(
     )
 
 
-def _write_manifest(paths: list[Path], manifest_path: Path) -> None:
+def write_manifest(paths: list[Path], manifest_path: Path) -> None:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     content = "".join(f"{path}\n" for path in paths)
     manifest_path.write_text(content, encoding="utf-8")
@@ -226,7 +226,7 @@ def _build_summary(
     }
 
 
-def _run_warmup(
+def run_warmup(
     *,
     manifest_path: Path,
     threads: int,
@@ -294,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     if not result.paths:
         raise ValueError("No catalog files matched the supplied run_spec.")
 
-    _write_manifest(result.paths, manifest_path)
+    write_manifest(result.paths, manifest_path)
     summary = _build_summary(
         result=result,
         run_spec_path=run_spec_path,
@@ -304,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(summary, ensure_ascii=True, indent=2))
 
     if args.warmup:
-        return _run_warmup(
+        return run_warmup(
             manifest_path=manifest_path,
             threads=args.threads,
             background=args.background,

@@ -182,6 +182,12 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             run_backtest = _load_run_backtest()
             self.assertTrue(run_backtest._load_trade_ticks_enabled({}))
             self.assertFalse(run_backtest._load_trade_ticks_enabled({"load_trade_ticks": False}))
+            self.assertFalse(run_backtest._catalog_prewarm_enabled({}))
+            self.assertEqual(run_backtest._catalog_prewarm_threads({}), 50)
+            self.assertEqual(
+                run_backtest._prefetch_runtime_settings({}),
+                (None, 72, 4),
+            )
             self.assertFalse(run_backtest._optimize_file_loading_enabled({}))
             self.assertTrue(
                 run_backtest._optimize_file_loading_enabled({"optimize_file_loading": True})
@@ -209,6 +215,20 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
                     {"optimize_file_loading": True},
                     run_backtest.FundingRateUpdate,
                 )
+            )
+            self.assertEqual(
+                run_backtest._prefetch_runtime_settings(
+                    {
+                        "catalog_controls": {
+                            "prewarm_before_run": True,
+                            "prewarm_threads": 25,
+                            "prefetch_backend": "off",
+                            "prefetch_ahead_hours": 48,
+                            "prefetch_max_files_per_batch": 3,
+                        }
+                    }
+                ),
+                ("off", 48, 3),
             )
         finally:
             sys.modules.pop("run_backtest_under_test", None)

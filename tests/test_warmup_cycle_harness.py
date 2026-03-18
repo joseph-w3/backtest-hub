@@ -83,22 +83,24 @@ class TestWarmupCycleHarness(unittest.TestCase):
                 self.assertFalse(run_spec["load_trade_ticks"])
                 self.assertFalse(run_spec["optimize_file_loading"])
                 self.assertEqual(run_spec["tags"]["mode"], mode.name)
+                self.assertEqual(
+                    run_spec["catalog_controls"],
+                    {
+                        "prewarm_before_run": mode.prewarm_before_run,
+                        "prewarm_threads": 25,
+                        "prefetch_backend": mode.replay_prefetch_backend,
+                        "prefetch_ahead_hours": 48,
+                        "prefetch_max_files_per_batch": 3,
+                    },
+                )
 
                 env_text = env_path.read_text()
-                expected_backend = f"BACKTEST_PREFETCH_BACKEND={mode.replay_prefetch_backend}"
-                self.assertIn(expected_backend, env_text)
-                self.assertIn(
-                    f"HARNESS_PREWARM_REQUIRED={'1' if mode.prewarm_before_run else '0'}",
-                    env_text,
-                )
-                self.assertIn("HARNESS_PREWARM_SCRIPT=", env_text)
                 self.assertIn("HARNESS_RUNNER_PATH=", env_text)
+                self.assertIn("HARNESS_CATALOG_ROOT=", env_text)
 
                 run_script = run_script_path.read_text()
-                self.assertIn('if [[ "${HARNESS_PREWARM_REQUIRED}" == "1" ]]', run_script)
                 self.assertIn('export CATALOG_PATH="${HARNESS_CATALOG_ROOT}"', run_script)
                 self.assertIn('export BACKTEST_LOGS_PATH="${SCRIPT_DIR}/logs"', run_script)
-                self.assertIn('"${HARNESS_PREWARM_SCRIPT}"', run_script)
                 self.assertIn('"${HARNESS_RUNNER_PATH}"', run_script)
 
 

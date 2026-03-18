@@ -2,7 +2,7 @@
 
 ## Goal
 
-Provide a small, reproducible runner-local harness for separating:
+Provide a small, reproducible backtest-hub harness for separating:
 
 1. no warmup
 2. launch-time prewarm completed before runner start
@@ -126,6 +126,22 @@ Interpretation should stay phase-aware:
 
 ## Explicit Non-Goals
 
+Mode semantics are encoded directly into each `run_spec.json` via
+`catalog_controls`, so the same mode directories can be:
+
+- submitted through the normal backtest-hub API/CLI path
+- or run locally against `scripts/run_backtest.py`
+
+Example API-style submit from the harness root:
+
+```bash
+python -m backtest_hub_cli.cli submit \
+  --run-spec no_warmup/run_spec.json \
+  --strategy-bundle bundle/strategies-harness.zip \
+  --name warmup-no-warmup \
+  --no-generate
+```
+
 This harness does **not**:
 
 - manage JuiceFS mounts
@@ -133,7 +149,7 @@ This harness does **not**:
 - reset or create worker-local cache directories
 - choose symbols for you based on data-health truth
 
-When executed via `run.sh`, the harness also exports:
+When executed via `run.sh`, the harness exports:
 
 - `CATALOG_PATH=<catalog_root>`
 - `BACKTEST_LOGS_PATH=<mode_dir>/logs`

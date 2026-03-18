@@ -135,6 +135,33 @@ class TestRunSpecFillModelConfig(unittest.TestCase):
         sanitized = app.validate_run_spec(payload)
         self.assertTrue(sanitized["optimize_file_loading"])
 
+    def test_catalog_controls_valid(self) -> None:
+        payload = _base_payload()
+        payload["catalog_controls"] = {
+            "prewarm_before_run": True,
+            "prewarm_threads": 25,
+            "prefetch_backend": "local-read",
+            "prefetch_ahead_hours": 48,
+            "prefetch_max_files_per_batch": 3,
+        }
+        sanitized = app.validate_run_spec(payload)
+        self.assertEqual(
+            sanitized["catalog_controls"],
+            {
+                "prewarm_before_run": True,
+                "prewarm_threads": 25,
+                "prefetch_backend": "local-read",
+                "prefetch_ahead_hours": 48,
+                "prefetch_max_files_per_batch": 3,
+            },
+        )
+
+    def test_catalog_controls_bad_backend_rejected(self) -> None:
+        payload = _base_payload()
+        payload["catalog_controls"] = {"prefetch_backend": "juicefs"}
+        with self.assertRaisesRegex(ValueError, "prefetch_backend"):
+            app.validate_run_spec(payload)
+
     def test_load_trade_ticks_string_rejected(self) -> None:
         payload = _base_payload()
         payload["load_trade_ticks"] = "false"
@@ -215,3 +242,4 @@ class TestRunSpecFillModelConfig(unittest.TestCase):
         self.assertNotIn("load_trade_ticks", sanitized)
         self.assertNotIn("optimize_file_loading", sanitized)
         self.assertNotIn("fill_model_config", sanitized)
+        self.assertNotIn("catalog_controls", sanitized)

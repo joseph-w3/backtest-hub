@@ -51,6 +51,10 @@ class TestCatalogPrefetch(unittest.TestCase):
             self.assertEqual(result["prefetched_bytes"], 768)
             self.assertEqual(result["skipped_files"], 0)
 
+    def test_build_prefetch_backend_accepts_explicit_mode(self) -> None:
+        backend = catalog_prefetch.build_prefetch_backend(mode="off")
+        self.assertEqual(backend.name, "disabled")
+
     def test_replay_prefetch_controller_advances_window_without_storage_coupling(self) -> None:
         backend = _RecordingBackend()
         controller = catalog_prefetch.ReplayPrefetchController(
