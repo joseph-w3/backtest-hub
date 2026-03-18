@@ -679,6 +679,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         *,
         node_probe_callback: Callable[..., None] | None = None,
         streaming_probe_callback: Callable[..., None] | None = None,
+        prepare_probe_callback: Callable[..., None] | None = None,
     ) -> None:
         super().__init__(configs)
         self.__class__._instrument_overrides = {
@@ -686,6 +687,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         }
         self._node_probe_callback = node_probe_callback
         self._streaming_probe_callback = streaming_probe_callback
+        self._prepare_probe_callback = prepare_probe_callback
 
     @classmethod
     def load_catalog(cls, config: BacktestDataConfig) -> ParquetDataCatalog:
@@ -736,6 +738,47 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             stage=stage,
             run_config_id=run_config_id,
             chunk_size=chunk_size,
+            rss_mb=rss_mb,
+        )
+
+    def _emit_prepare_probe(
+        self,
+        *,
+        stage: str,
+        config_index: int,
+        config_count: int,
+        data_type: str,
+        instrument_id: str | None,
+        identifier_count: int,
+        identifier_sample: list[str],
+        optimize_file_loading: bool,
+        cache_hit: bool | None = None,
+        file_list_count: int | None = None,
+        filter_file_count: int | None = None,
+        file_list_ms: float | None = None,
+        filter_files_ms: float | None = None,
+        register_session_ms: float | None = None,
+        total_ms: float | None = None,
+        rss_mb: float | None = None,
+    ) -> None:
+        if self._prepare_probe_callback is None:
+            return
+        self._prepare_probe_callback(
+            stage=stage,
+            config_index=config_index,
+            config_count=config_count,
+            data_type=data_type,
+            instrument_id=instrument_id,
+            identifier_count=identifier_count,
+            identifier_sample=identifier_sample,
+            optimize_file_loading=optimize_file_loading,
+            cache_hit=cache_hit,
+            file_list_count=file_list_count,
+            filter_file_count=filter_file_count,
+            file_list_ms=file_list_ms,
+            filter_files_ms=filter_files_ms,
+            register_session_ms=register_session_ms,
+            total_ms=total_ms,
             rss_mb=rss_mb,
         )
 
@@ -806,7 +849,8 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             rss_before_add_mb=_read_current_rss_mb(),
         )
 
-        for config in data_configs:
+        config_count = len(data_configs)
+        for config_index, config in enumerate(data_configs, start=1):
             catalog = self.load_catalog(config)
             used_start = config.start_time
             used_end = config.end_time
@@ -836,27 +880,104 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
                     for instrument_id in config.instrument_ids:
                         used_bar_types.append(f"{instrument_id}-{config.bar_spec}-EXTERNAL")
 
+            identifiers = used_bar_types or used_instrument_ids
             cache_key = (config.catalog_path, config.catalog_fs_protocol, config.data_type)
-            if cache_key not in cached_file_lists:
-                cached_file_lists[cache_key] = catalog.get_file_list_from_data_cls(config.data_type)
+            data_type_name = getattr(config.data_type, "__name__", str(config.data_type))
+            instrument_id = config.instrument_id.value if config.instrument_id is not None else None
+            identifier_values = [str(identifier) for identifier in identifiers]
+            identifier_sample = identifier_values[:3]
+            cache_hit = cache_key in cached_file_lists
+            prepare_started_at = time.perf_counter()
+            file_list_ms: float | None = None
+            filter_files_ms: float | None = None
+            register_session_ms: float | None = None
 
+            self._emit_prepare_probe(
+                stage="before_file_list",
+                config_index=config_index,
+                config_count=config_count,
+                data_type=data_type_name,
+                instrument_id=instrument_id,
+                identifier_count=len(identifier_values),
+                identifier_sample=identifier_sample,
+                optimize_file_loading=config.optimize_file_loading,
+                cache_hit=cache_hit,
+                rss_mb=_read_current_rss_mb(),
+            )
+            if not cache_hit:
+                file_list_started_at = time.perf_counter()
+                cached_file_lists[cache_key] = catalog.get_file_list_from_data_cls(config.data_type)
+                file_list_ms = round((time.perf_counter() - file_list_started_at) * 1000, 2)
+            self._emit_prepare_probe(
+                stage="after_file_list",
+                config_index=config_index,
+                config_count=config_count,
+                data_type=data_type_name,
+                instrument_id=instrument_id,
+                identifier_count=len(identifier_values),
+                identifier_sample=identifier_sample,
+                optimize_file_loading=config.optimize_file_loading,
+                cache_hit=cache_hit,
+                file_list_count=len(cached_file_lists[cache_key]),
+                file_list_ms=file_list_ms,
+                rss_mb=_read_current_rss_mb(),
+            )
+
+            filter_started_at = time.perf_counter()
             filter_files = catalog.filter_files(
                 data_cls=config.data_type,
                 file_paths=cached_file_lists[cache_key],
-                identifiers=(used_bar_types or used_instrument_ids),
+                identifiers=identifiers,
                 start=used_start,
                 end=used_end,
             )
+            filter_files_ms = round((time.perf_counter() - filter_started_at) * 1000, 2)
+            self._emit_prepare_probe(
+                stage="after_filter_files",
+                config_index=config_index,
+                config_count=config_count,
+                data_type=data_type_name,
+                instrument_id=instrument_id,
+                identifier_count=len(identifier_values),
+                identifier_sample=identifier_sample,
+                optimize_file_loading=config.optimize_file_loading,
+                cache_hit=cache_hit,
+                file_list_count=len(cached_file_lists[cache_key]),
+                filter_file_count=len(filter_files),
+                file_list_ms=file_list_ms,
+                filter_files_ms=filter_files_ms,
+                rss_mb=_read_current_rss_mb(),
+            )
 
+            register_started_at = time.perf_counter()
             session = _backend_session_with_optimize_fallback(
                 catalog=catalog,
                 data_cls=config.data_type,
-                identifiers=(used_bar_types or used_instrument_ids),
+                identifiers=identifiers,
                 start=used_start,
                 end=used_end,
                 session=session,
                 files=filter_files,
                 optimize_file_loading=config.optimize_file_loading,
+            )
+            register_session_ms = round((time.perf_counter() - register_started_at) * 1000, 2)
+            self._emit_prepare_probe(
+                stage="after_register_session",
+                config_index=config_index,
+                config_count=config_count,
+                data_type=data_type_name,
+                instrument_id=instrument_id,
+                identifier_count=len(identifier_values),
+                identifier_sample=identifier_sample,
+                optimize_file_loading=config.optimize_file_loading,
+                cache_hit=cache_hit,
+                file_list_count=len(cached_file_lists[cache_key]),
+                filter_file_count=len(filter_files),
+                file_list_ms=file_list_ms,
+                filter_files_ms=filter_files_ms,
+                register_session_ms=register_session_ms,
+                total_ms=round((time.perf_counter() - prepare_started_at) * 1000, 2),
+                rss_mb=_read_current_rss_mb(),
             )
 
         self._emit_streaming_probe(
@@ -1180,6 +1301,7 @@ def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
         "simulated_time": None,
         "node_probe": None,
         "streaming_probe": None,
+        "prepare_probe": None,
         "streaming_summary": {
             "chunks_seen": 0,
             "events_seen": 0,
@@ -1306,6 +1428,46 @@ def _build_node_probe_payload(
         "stage": stage,
         "run_config_id": run_config_id,
         "chunk_size": chunk_size,
+        "rss_mb": rss_mb,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _build_prepare_probe_payload(
+    *,
+    stage: str,
+    config_index: int,
+    config_count: int,
+    data_type: str,
+    instrument_id: str | None,
+    identifier_count: int,
+    identifier_sample: list[str],
+    optimize_file_loading: bool,
+    cache_hit: bool | None,
+    file_list_count: int | None,
+    filter_file_count: int | None,
+    file_list_ms: float | None,
+    filter_files_ms: float | None,
+    register_session_ms: float | None,
+    total_ms: float | None,
+    rss_mb: float | None,
+) -> dict:
+    return {
+        "stage": stage,
+        "config_index": config_index,
+        "config_count": config_count,
+        "data_type": data_type,
+        "instrument_id": instrument_id,
+        "identifier_count": identifier_count,
+        "identifier_sample": identifier_sample,
+        "optimize_file_loading": optimize_file_loading,
+        "cache_hit": cache_hit,
+        "file_list_count": file_list_count,
+        "filter_file_count": filter_file_count,
+        "file_list_ms": file_list_ms,
+        "filter_files_ms": filter_files_ms,
+        "register_session_ms": register_session_ms,
+        "total_ms": total_ms,
         "rss_mb": rss_mb,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1563,6 +1725,52 @@ def main() -> int:
                     rss_after_clear_mb=rss_after_clear_mb,
                 ),
                 "streaming_summary": dict(streaming_summary),
+            },
+        )
+
+    def _on_prepare_probe(
+        *,
+        stage: str,
+        config_index: int,
+        config_count: int,
+        data_type: str,
+        instrument_id: str | None,
+        identifier_count: int,
+        identifier_sample: list[str],
+        optimize_file_loading: bool,
+        cache_hit: bool | None = None,
+        file_list_count: int | None = None,
+        filter_file_count: int | None = None,
+        file_list_ms: float | None = None,
+        filter_files_ms: float | None = None,
+        register_session_ms: float | None = None,
+        total_ms: float | None = None,
+        rss_mb: float | None = None,
+    ) -> None:
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={
+                "prepare_probe": _build_prepare_probe_payload(
+                    stage=stage,
+                    config_index=config_index,
+                    config_count=config_count,
+                    data_type=data_type,
+                    instrument_id=instrument_id,
+                    identifier_count=identifier_count,
+                    identifier_sample=identifier_sample,
+                    optimize_file_loading=optimize_file_loading,
+                    cache_hit=cache_hit,
+                    file_list_count=file_list_count,
+                    filter_file_count=filter_file_count,
+                    file_list_ms=file_list_ms,
+                    filter_files_ms=filter_files_ms,
+                    register_session_ms=register_session_ms,
+                    total_ms=total_ms,
+                    rss_mb=rss_mb,
+                ),
             },
         )
 
@@ -1923,6 +2131,7 @@ def main() -> int:
             instruments=spot_instruments + futures_instruments,
             node_probe_callback=_on_node_probe,
             streaming_probe_callback=_on_streaming_probe,
+            prepare_probe_callback=_on_prepare_probe,
         )
         _write_status_snapshot(
             status_path=status_path,
