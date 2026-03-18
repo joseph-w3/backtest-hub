@@ -87,6 +87,60 @@ It failed during raw input loading in the orderbook builder:
 
 So the problem is not limited to the catalog output file alone.
 
+### User-space JuiceFS reads fail too, with explicit B2 cap errors
+
+To separate "FUSE mount/cache corruption" from "underlying object fetch failure",
+`juicefs sync` was run on `neo-256gb` using the metadata URL directly:
+
+- metadata:
+  `postgres://postgres:****@127.0.0.1:15432/b2fs`
+- source:
+  `jfs://myfs/depth-delta-a/binance/spot/2025-11-11/AAVEUSDT_snapshot.parquet`
+
+Result:
+
+- the read did **not** succeed through the user-space path either
+- the failure was explicit:
+  `download_cap_exceeded`
+- example slice/object failures:
+  - `chunks/5/5011/5011771_0_4`
+  - `chunks/5/5016/5016326_0_171675`
+  - `chunks/5/5016/5016327_0_1362`
+
+This is materially stronger than the earlier mount-level symptoms (`timeout`,
+`EIO`):
+
+- at least part of the current inability to read AAVE is caused by the backing
+  B2 account/bucket refusing further downloads due to cap limits
+- therefore some "corruption-like" behavior at the mount level can be a
+  secondary symptom of object-fetch refusal, not only of permanently bad file
+  contents
+
+### Different hosts show different symptoms because cache coverage differs
+
+Examples observed on `2026-03-18`:
+
+- `neo-256gb` current container:
+  - AAVE catalog file head could be read
+  - later offsets failed with `EIO`
+- `neo-test4` host mount:
+  - the same catalog file timed out even at offset `0`
+- `neo-256gb` local JuiceFS cache:
+  - contained only the first catalog chunk:
+    `8369253_0_4194304`
+- `neo-test4` and `neo-test1` local cache probes:
+  - did not contain the sampled AAVE snapshot/raw/catalog chunks
+
+This supports the following interpretation:
+
+- hosts are not seeing one perfectly uniform failure mode
+- cached slices can make a file appear "partially readable" on one node while
+  another node cannot read the same file at all
+- current symptoms are therefore a mix of:
+  - cached-chunk availability
+  - mount behavior
+  - and B2 download-cap refusal
+
 ### Raw AAVE backup files exist, but no healthy backup is confirmed yet
 
 Example backup files present on `neo-test4`:
@@ -107,6 +161,8 @@ Current working conclusion:
 - do not patch strategy or runner logic to "handle" this as if it were a normal
   symbol-level data gap
 - treat it as a storage/data readability problem first
-- the next recovery step is to identify a truly readable authoritative copy of
-  the affected AAVE raw/catalog objects, then rebuild and revalidate
-
+- the next recovery step is to obtain a readable authoritative copy of the
+  affected AAVE raw/catalog objects, which currently may require:
+  - resolving the B2 download cap issue
+  - or locating a host that still has the needed chunks hot in local cache
+  - then rebuilding and revalidating
