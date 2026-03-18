@@ -13,6 +13,7 @@
 - Changed default scheduler metrics source to `v1/system/metrics` in `docker-compose.yml` so worker selection uses host-level memory instead of docker cgroup memory unless explicitly overridden.
 - Changed bronze routing to use `BRONZE_PAIRS_THRESHOLD` (default `6`) based on pair-equivalent count, so runs up to 6 pairs prefer the bronze worker when both workers satisfy memory.
 - Added `docs/backtest_memory_probe_20260317.md` to record the 38-pair backtest RSS investigation, findings, probe runs, and the selective `optimize_file_loading` experiment.
+- Added `docs/backtest_worker_2x2_20260318.md` to record the current-worker 2x2 probe, the measured V4/V5 optimize on/off matrix, and the historical fast-run script pin to `bd569ed`.
 
 
 ## [Unreleased]
