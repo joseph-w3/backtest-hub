@@ -197,6 +197,9 @@ source "${SCRIPT_DIR}/env.sh"
 
 RUN_SPEC="${SCRIPT_DIR}/run_spec.json"
 MANIFEST="${SCRIPT_DIR}/catalog-prewarm-manifest.txt"
+export CATALOG_PATH="${HARNESS_CATALOG_ROOT}"
+export BACKTEST_LOGS_PATH="${SCRIPT_DIR}/logs"
+mkdir -p "${BACKTEST_LOGS_PATH}"
 
 if [[ "${HARNESS_PREWARM_REQUIRED}" == "1" ]]; then
   "${HARNESS_PYTHON}" "${HARNESS_PREWARM_SCRIPT}" \
@@ -249,6 +252,7 @@ def _render_readme(
             "1. Run each mode on the same worker shape and same catalog root.",
             "2. If you want a true cold-start comparison, put each run on a fresh or explicitly reset cache state.",
             "3. Compare `before_query_result`, `first_chunk`, and post-first-chunk replay speed separately.",
+            "4. Each mode writes `status.json`, CSVs, and engine logs under its own `logs/` directory.",
             "",
             "This harness does not manage mounts or cache eviction. It only generates a reproducible runner-local layout.",
             "",

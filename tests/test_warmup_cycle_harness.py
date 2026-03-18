@@ -96,6 +96,8 @@ class TestWarmupCycleHarness(unittest.TestCase):
 
                 run_script = run_script_path.read_text()
                 self.assertIn('if [[ "${HARNESS_PREWARM_REQUIRED}" == "1" ]]', run_script)
+                self.assertIn('export CATALOG_PATH="${HARNESS_CATALOG_ROOT}"', run_script)
+                self.assertIn('export BACKTEST_LOGS_PATH="${SCRIPT_DIR}/logs"', run_script)
                 self.assertIn('"${HARNESS_PREWARM_SCRIPT}"', run_script)
                 self.assertIn('"${HARNESS_RUNNER_PATH}"', run_script)
 

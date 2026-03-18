@@ -61,18 +61,22 @@ Output layout:
     env.sh
     run.sh
     run_spec.json
+    logs/                       # created after execution
   prewarm_gate_only/
     env.sh
     run.sh
     run_spec.json
+    logs/                       # created after execution
   replay_prefetch_only/
     env.sh
     run.sh
     run_spec.json
+    logs/                       # created after execution
   prewarm_gate_plus_replay_prefetch/
     env.sh
     run.sh
     run_spec.json
+    logs/                       # created after execution
 ```
 
 ## Mode Semantics
@@ -128,6 +132,11 @@ This harness does **not**:
 - clear Linux page cache
 - reset or create worker-local cache directories
 - choose symbols for you based on data-health truth
+
+When executed via `run.sh`, the harness also exports:
+
+- `CATALOG_PATH=<catalog_root>`
+- `BACKTEST_LOGS_PATH=<mode_dir>/logs`
 
 Those remain operator actions outside the harness.
 
