@@ -138,6 +138,44 @@ class TestSubmitStrategyBundle(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
+    def test_submit_strips_backtest_id_from_run_spec_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                bundle_path = Path(td) / "bundle.zip"
+                buffer = BytesIO()
+                with zipfile.ZipFile(buffer, "w") as zf:
+                    zf.writestr("bundle/__init__.py", "# ok\n")
+                bundle_path.write_bytes(buffer.getvalue())
+
+                run_spec = Path(td) / "run_spec.json"
+                run_spec.write_text(
+                    json.dumps({"backtest_id": "old-id", "strategy_bundle": "bundle.zip"}),
+                    encoding="utf-8",
+                )
+
+                captured: dict[str, object] = {}
+
+                def _fake_build_multipart_form(files):
+                    captured["files"] = files
+                    return b"BODY", "multipart/form-data; boundary=test"
+
+                def _fake_urlopen(req):
+                    return _DummyResponse(b'{"backtest_id":"x"}')
+
+                with patch.object(cli, "build_multipart_form", _fake_build_multipart_form), patch.object(
+                    cli.urllib.request, "urlopen", _fake_urlopen
+                ), patch.object(cli, "write_run_id_history", lambda *a, **k: None):
+                    rc = cli.command_submit(self._args(run_spec=str(run_spec)))
+
+                self.assertEqual(rc, 0)
+                files = captured["files"]
+                run_spec_payload = json.loads(files[0][3].decode("utf-8"))
+                self.assertNotIn("backtest_id", run_spec_payload)
+            finally:
+                os.chdir(cwd)
+
     def test_strategy_bundle_and_file_mutually_exclusive(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cwd = os.getcwd()

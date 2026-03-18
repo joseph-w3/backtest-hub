@@ -532,6 +532,9 @@ def command_submit(args: argparse.Namespace) -> int:
         payload = json.load(handle)
 
     payload_changed = False
+    if "backtest_id" in payload:
+        payload.pop("backtest_id", None)
+        payload_changed = True
     requested_by = os.getenv("JUPYTERHUB_USER")
     if requested_by and payload.get("requested_by") != requested_by:
         payload["requested_by"] = requested_by
