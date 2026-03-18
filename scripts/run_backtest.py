@@ -49,6 +49,19 @@ from quant_trade_v1.model.objects import Price
 from quant_trade_v1.model.objects import Quantity
 from quant_trade_v1.persistence.catalog import ParquetDataCatalog
 
+try:
+    from scripts.catalog_prefetch import ReplayPrefetchController
+    from scripts.catalog_prefetch import build_prefetch_backend
+    from scripts.catalog_prefetch import build_windowed_files
+    from scripts.catalog_prefetch import ns_to_iso
+    from scripts.catalog_prefetch import time_like_to_ns
+except ImportError:  # pragma: no cover - direct script execution path
+    from catalog_prefetch import ReplayPrefetchController
+    from catalog_prefetch import build_prefetch_backend
+    from catalog_prefetch import build_windowed_files
+    from catalog_prefetch import ns_to_iso
+    from catalog_prefetch import time_like_to_ns
+
 
 def build_catalog_config() -> dict:
     """Return catalog configuration derived from environment variables.
@@ -680,6 +693,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         node_probe_callback: Callable[..., None] | None = None,
         streaming_probe_callback: Callable[..., None] | None = None,
         prepare_probe_callback: Callable[..., None] | None = None,
+        prefetch_probe_callback: Callable[..., None] | None = None,
     ) -> None:
         super().__init__(configs)
         self.__class__._instrument_overrides = {
@@ -688,6 +702,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         self._node_probe_callback = node_probe_callback
         self._streaming_probe_callback = streaming_probe_callback
         self._prepare_probe_callback = prepare_probe_callback
+        self._prefetch_probe_callback = prefetch_probe_callback
 
     @classmethod
     def load_catalog(cls, config: BacktestDataConfig) -> ParquetDataCatalog:
@@ -710,6 +725,16 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         rss_after_add_mb: float | None = None,
         rss_after_run_mb: float | None = None,
         rss_after_clear_mb: float | None = None,
+        materialize_ms: float | None = None,
+        add_ms: float | None = None,
+        run_ms: float | None = None,
+        clear_ms: float | None = None,
+        chunk_wall_ms: float | None = None,
+        chunk_start_time: str | None = None,
+        chunk_end_time: str | None = None,
+        chunk_span_seconds: float | None = None,
+        events_per_second: float | None = None,
+        simulated_seconds_per_wall_second: float | None = None,
     ) -> None:
         if self._streaming_probe_callback is None:
             return
@@ -722,6 +747,16 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             rss_after_add_mb=rss_after_add_mb,
             rss_after_run_mb=rss_after_run_mb,
             rss_after_clear_mb=rss_after_clear_mb,
+            materialize_ms=materialize_ms,
+            add_ms=add_ms,
+            run_ms=run_ms,
+            clear_ms=clear_ms,
+            chunk_wall_ms=chunk_wall_ms,
+            chunk_start_time=chunk_start_time,
+            chunk_end_time=chunk_end_time,
+            chunk_span_seconds=chunk_span_seconds,
+            events_per_second=events_per_second,
+            simulated_seconds_per_wall_second=simulated_seconds_per_wall_second,
         )
 
     def _emit_node_probe(
@@ -780,6 +815,41 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             register_session_ms=register_session_ms,
             total_ms=total_ms,
             rss_mb=rss_mb,
+        )
+
+    def _emit_prefetch_probe(
+        self,
+        *,
+        stage: str,
+        backend: str,
+        ahead_hours: int,
+        max_files_per_batch: int,
+        cursor_time: str | None = None,
+        window_end_time: str | None = None,
+        pending_files: int | None = None,
+        prefetched_files: int | None = None,
+        requested_files_total: int | None = None,
+        completed_files_total: int | None = None,
+        last_batch_files: int | None = None,
+        last_batch_bytes: int | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        if getattr(self, "_prefetch_probe_callback", None) is None:
+            return
+        self._prefetch_probe_callback(
+            stage=stage,
+            backend=backend,
+            ahead_hours=ahead_hours,
+            max_files_per_batch=max_files_per_batch,
+            cursor_time=cursor_time,
+            window_end_time=window_end_time,
+            pending_files=pending_files,
+            prefetched_files=prefetched_files,
+            requested_files_total=requested_files_total,
+            completed_files_total=completed_files_total,
+            last_batch_files=last_batch_files,
+            last_batch_bytes=last_batch_bytes,
+            last_error=last_error,
         )
 
     def run(self) -> list[object]:
@@ -843,6 +913,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
 
         session = DataBackendSession(chunk_size=chunk_size)
         cached_file_lists: dict[tuple[str, str | None, type], list[str]] = {}
+        prefetch_candidates: list[str] = []
         self._emit_streaming_probe(
             chunk_index=-1,
             stage="before_prepare_queries",
@@ -932,6 +1003,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
                 end=used_end,
             )
             filter_files_ms = round((time.perf_counter() - filter_started_at) * 1000, 2)
+            prefetch_candidates.extend(str(path) for path in filter_files)
             self._emit_prepare_probe(
                 stage="after_filter_files",
                 config_index=config_index,
@@ -990,51 +1062,95 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             stage="before_query_result",
             rss_before_add_mb=_read_current_rss_mb(),
         )
-        for chunk_index, chunk in enumerate(session.to_query_result()):
-            events = capsule_to_list(chunk)
-            event_count = len(events)
-            event_type_counts = _summarize_chunk_type_counts(events)
-            rss_before_add_mb = _read_current_rss_mb()
-            self._emit_streaming_probe(
-                chunk_index=chunk_index,
-                stage="after_materialize",
-                event_count=event_count,
-                event_type_counts=event_type_counts,
-                rss_before_add_mb=rss_before_add_mb,
-            )
-            engine.add_data(
-                data=events,
-                validate=False,
-                sort=True,
-            )
-            rss_after_add_mb = _read_current_rss_mb()
-            self._emit_streaming_probe(
-                chunk_index=chunk_index,
-                stage="after_add",
-                event_count=event_count,
-                event_type_counts=event_type_counts,
-                rss_before_add_mb=rss_before_add_mb,
-                rss_after_add_mb=rss_after_add_mb,
-            )
-            engine.run(
-                start=start,
-                end=end,
-                run_config_id=run_config_id,
-                streaming=True,
-            )
-            rss_after_run_mb = _read_current_rss_mb()
-            engine.clear_data()
-            rss_after_clear_mb = _read_current_rss_mb()
-            self._emit_streaming_probe(
-                chunk_index=chunk_index,
-                stage="after_clear",
-                event_count=event_count,
-                event_type_counts=event_type_counts,
-                rss_before_add_mb=rss_before_add_mb,
-                rss_after_add_mb=rss_after_add_mb,
-                rss_after_run_mb=rss_after_run_mb,
-                rss_after_clear_mb=rss_after_clear_mb,
-            )
+        prefetch_controller = ReplayPrefetchController(
+            files=build_windowed_files(prefetch_candidates),
+            backend=build_prefetch_backend(),
+            ahead_hours=int(os.environ.get("BACKTEST_PREFETCH_AHEAD_HOURS", "72")),
+            max_files_per_batch=int(os.environ.get("BACKTEST_PREFETCH_MAX_FILES_PER_BATCH", "4")),
+        )
+        self._emit_prefetch_probe(**prefetch_controller.advance(time_like_to_ns(start)))
+        try:
+            for chunk_index, chunk in enumerate(session.to_query_result()):
+                chunk_started_at = time.perf_counter()
+                events = capsule_to_list(chunk)
+                materialize_ms = round((time.perf_counter() - chunk_started_at) * 1000, 2)
+                chunk_start_ns, chunk_end_ns = _chunk_time_window_ns(events)
+                event_count = len(events)
+                event_type_counts = _summarize_chunk_type_counts(events)
+                rss_before_add_mb = _read_current_rss_mb()
+                self._emit_streaming_probe(
+                    chunk_index=chunk_index,
+                    stage="after_materialize",
+                    event_count=event_count,
+                    event_type_counts=event_type_counts,
+                    rss_before_add_mb=rss_before_add_mb,
+                    materialize_ms=materialize_ms,
+                    chunk_start_time=ns_to_iso(chunk_start_ns),
+                    chunk_end_time=ns_to_iso(chunk_end_ns),
+                )
+                add_started_at = time.perf_counter()
+                engine.add_data(
+                    data=events,
+                    validate=False,
+                    sort=True,
+                )
+                add_ms = round((time.perf_counter() - add_started_at) * 1000, 2)
+                rss_after_add_mb = _read_current_rss_mb()
+                self._emit_streaming_probe(
+                    chunk_index=chunk_index,
+                    stage="after_add",
+                    event_count=event_count,
+                    event_type_counts=event_type_counts,
+                    rss_before_add_mb=rss_before_add_mb,
+                    rss_after_add_mb=rss_after_add_mb,
+                    materialize_ms=materialize_ms,
+                    add_ms=add_ms,
+                    chunk_start_time=ns_to_iso(chunk_start_ns),
+                    chunk_end_time=ns_to_iso(chunk_end_ns),
+                )
+                run_started_at = time.perf_counter()
+                engine.run(
+                    start=start,
+                    end=end,
+                    run_config_id=run_config_id,
+                    streaming=True,
+                )
+                run_ms = round((time.perf_counter() - run_started_at) * 1000, 2)
+                rss_after_run_mb = _read_current_rss_mb()
+                clear_started_at = time.perf_counter()
+                engine.clear_data()
+                clear_ms = round((time.perf_counter() - clear_started_at) * 1000, 2)
+                rss_after_clear_mb = _read_current_rss_mb()
+                chunk_wall_ms = round((time.perf_counter() - chunk_started_at) * 1000, 2)
+                chunk_span_seconds = _chunk_span_seconds(chunk_start_ns, chunk_end_ns)
+                self._emit_prefetch_probe(
+                    **prefetch_controller.advance(chunk_end_ns or chunk_start_ns)
+                )
+                self._emit_streaming_probe(
+                    chunk_index=chunk_index,
+                    stage="after_clear",
+                    event_count=event_count,
+                    event_type_counts=event_type_counts,
+                    rss_before_add_mb=rss_before_add_mb,
+                    rss_after_add_mb=rss_after_add_mb,
+                    rss_after_run_mb=rss_after_run_mb,
+                    rss_after_clear_mb=rss_after_clear_mb,
+                    materialize_ms=materialize_ms,
+                    add_ms=add_ms,
+                    run_ms=run_ms,
+                    clear_ms=clear_ms,
+                    chunk_wall_ms=chunk_wall_ms,
+                    chunk_start_time=ns_to_iso(chunk_start_ns),
+                    chunk_end_time=ns_to_iso(chunk_end_ns),
+                    chunk_span_seconds=chunk_span_seconds,
+                    events_per_second=_per_second(event_count, chunk_wall_ms),
+                    simulated_seconds_per_wall_second=_per_second(
+                        chunk_span_seconds, chunk_wall_ms
+                    ),
+                )
+        finally:
+            self._emit_prefetch_probe(**prefetch_controller.snapshot())
+            prefetch_controller.close()
 
         engine.end()
 
@@ -1302,6 +1418,7 @@ def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
         "node_probe": None,
         "streaming_probe": None,
         "prepare_probe": None,
+        "prefetch_probe": None,
         "streaming_summary": {
             "chunks_seen": 0,
             "events_seen": 0,
@@ -1388,6 +1505,33 @@ def _rss_delta_mb(after_mb: float | None, before_mb: float | None) -> float | No
     return round(after_mb - before_mb, 2)
 
 
+def _event_timestamp_ns(event: object) -> int | None:
+    value = getattr(event, "ts_event", None)
+    if value is None:
+        return None
+    return time_like_to_ns(value)
+
+
+def _chunk_time_window_ns(events: list[object]) -> tuple[int | None, int | None]:
+    if not events:
+        return None, None
+    start_ns = _event_timestamp_ns(events[0])
+    end_ns = _event_timestamp_ns(events[-1])
+    return start_ns, end_ns
+
+
+def _chunk_span_seconds(start_ns: int | None, end_ns: int | None) -> float | None:
+    if start_ns is None or end_ns is None or end_ns < start_ns:
+        return None
+    return round((end_ns - start_ns) / 1_000_000_000, 6)
+
+
+def _per_second(value: int | float | None, elapsed_ms: float | None) -> float | None:
+    if value is None or elapsed_ms is None or elapsed_ms <= 0:
+        return None
+    return round(float(value) / (elapsed_ms / 1000.0), 6)
+
+
 def _build_streaming_probe_payload(
     *,
     chunk_index: int,
@@ -1398,6 +1542,16 @@ def _build_streaming_probe_payload(
     rss_after_add_mb: float | None,
     rss_after_run_mb: float | None,
     rss_after_clear_mb: float | None,
+    materialize_ms: float | None = None,
+    add_ms: float | None = None,
+    run_ms: float | None = None,
+    clear_ms: float | None = None,
+    chunk_wall_ms: float | None = None,
+    chunk_start_time: str | None = None,
+    chunk_end_time: str | None = None,
+    chunk_span_seconds: float | None = None,
+    events_per_second: float | None = None,
+    simulated_seconds_per_wall_second: float | None = None,
 ) -> dict:
     payload = {
         "chunk_index": chunk_index,
@@ -1408,6 +1562,16 @@ def _build_streaming_probe_payload(
         "rss_after_add_mb": rss_after_add_mb,
         "rss_after_run_mb": rss_after_run_mb,
         "rss_after_clear_mb": rss_after_clear_mb,
+        "materialize_ms": materialize_ms,
+        "add_ms": add_ms,
+        "run_ms": run_ms,
+        "clear_ms": clear_ms,
+        "chunk_wall_ms": chunk_wall_ms,
+        "chunk_start_time": chunk_start_time,
+        "chunk_end_time": chunk_end_time,
+        "chunk_span_seconds": chunk_span_seconds,
+        "events_per_second": events_per_second,
+        "simulated_seconds_per_wall_second": simulated_seconds_per_wall_second,
         "rss_delta_add_mb": _rss_delta_mb(rss_after_add_mb, rss_before_add_mb),
         "rss_delta_run_mb": _rss_delta_mb(rss_after_run_mb, rss_after_add_mb),
         "rss_delta_clear_mb": _rss_delta_mb(rss_after_clear_mb, rss_after_run_mb),
@@ -1469,6 +1633,40 @@ def _build_prepare_probe_payload(
         "register_session_ms": register_session_ms,
         "total_ms": total_ms,
         "rss_mb": rss_mb,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _build_prefetch_probe_payload(
+    *,
+    stage: str,
+    backend: str,
+    ahead_hours: int,
+    max_files_per_batch: int,
+    cursor_time: str | None,
+    window_end_time: str | None,
+    pending_files: int | None,
+    prefetched_files: int | None,
+    requested_files_total: int | None,
+    completed_files_total: int | None,
+    last_batch_files: int | None,
+    last_batch_bytes: int | None,
+    last_error: str | None,
+) -> dict:
+    return {
+        "stage": stage,
+        "backend": backend,
+        "ahead_hours": ahead_hours,
+        "max_files_per_batch": max_files_per_batch,
+        "cursor_time": cursor_time,
+        "window_end_time": window_end_time,
+        "pending_files": pending_files,
+        "prefetched_files": prefetched_files,
+        "requested_files_total": requested_files_total,
+        "completed_files_total": completed_files_total,
+        "last_batch_files": last_batch_files,
+        "last_batch_bytes": last_batch_bytes,
+        "last_error": last_error,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1704,6 +1902,16 @@ def main() -> int:
         rss_after_add_mb: float | None = None,
         rss_after_run_mb: float | None = None,
         rss_after_clear_mb: float | None = None,
+        materialize_ms: float | None = None,
+        add_ms: float | None = None,
+        run_ms: float | None = None,
+        clear_ms: float | None = None,
+        chunk_wall_ms: float | None = None,
+        chunk_start_time: str | None = None,
+        chunk_end_time: str | None = None,
+        chunk_span_seconds: float | None = None,
+        events_per_second: float | None = None,
+        simulated_seconds_per_wall_second: float | None = None,
     ) -> None:
         if stage == "after_materialize" and event_count is not None:
             streaming_summary["chunks_seen"] = chunk_index + 1
@@ -1723,6 +1931,16 @@ def main() -> int:
                     rss_after_add_mb=rss_after_add_mb,
                     rss_after_run_mb=rss_after_run_mb,
                     rss_after_clear_mb=rss_after_clear_mb,
+                    materialize_ms=materialize_ms,
+                    add_ms=add_ms,
+                    run_ms=run_ms,
+                    clear_ms=clear_ms,
+                    chunk_wall_ms=chunk_wall_ms,
+                    chunk_start_time=chunk_start_time,
+                    chunk_end_time=chunk_end_time,
+                    chunk_span_seconds=chunk_span_seconds,
+                    events_per_second=events_per_second,
+                    simulated_seconds_per_wall_second=simulated_seconds_per_wall_second,
                 ),
                 "streaming_summary": dict(streaming_summary),
             },
@@ -1792,6 +2010,46 @@ def main() -> int:
                     run_config_id=run_config_id,
                     chunk_size=chunk_size,
                     rss_mb=rss_mb,
+                ),
+            },
+        )
+
+    def _on_prefetch_probe(
+        *,
+        stage: str,
+        backend: str,
+        ahead_hours: int,
+        max_files_per_batch: int,
+        cursor_time: str | None = None,
+        window_end_time: str | None = None,
+        pending_files: int | None = None,
+        prefetched_files: int | None = None,
+        requested_files_total: int | None = None,
+        completed_files_total: int | None = None,
+        last_batch_files: int | None = None,
+        last_batch_bytes: int | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        _write_status_snapshot(
+            status_path=status_path,
+            status=status,
+            status_lock=status_lock,
+            stdout_path=stdout_path,
+            updates={
+                "prefetch_probe": _build_prefetch_probe_payload(
+                    stage=stage,
+                    backend=backend,
+                    ahead_hours=ahead_hours,
+                    max_files_per_batch=max_files_per_batch,
+                    cursor_time=cursor_time,
+                    window_end_time=window_end_time,
+                    pending_files=pending_files,
+                    prefetched_files=prefetched_files,
+                    requested_files_total=requested_files_total,
+                    completed_files_total=completed_files_total,
+                    last_batch_files=last_batch_files,
+                    last_batch_bytes=last_batch_bytes,
+                    last_error=last_error,
                 ),
             },
         )
@@ -2132,6 +2390,7 @@ def main() -> int:
             node_probe_callback=_on_node_probe,
             streaming_probe_callback=_on_streaming_probe,
             prepare_probe_callback=_on_prepare_probe,
+            prefetch_probe_callback=_on_prefetch_probe,
         )
         _write_status_snapshot(
             status_path=status_path,

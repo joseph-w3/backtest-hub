@@ -9,6 +9,8 @@ This is meant for the shared worker hosts that already mount:
 - catalog root: `/mnt/localB2fs/backtest/catalog`
 - shared JuiceFS cache dir behind that mount: `/hdd16/jfscache`
 
+Separately, the worker runner now has a replay-time prefetch hook. That path is intentionally **not** hard-coded to JuiceFS. It uses a backend abstraction so the control plane can keep the same API when the catalog moves away from JuiceFS-backed local mounts.
+
 ## What The Script Includes
 
 Given a run spec, the script resolves the same symbol universe shape the worker uses:
@@ -79,3 +81,23 @@ If `file_count = 0`, the script exits with an error instead of silently running 
 - `load_trade_ticks=false` will intentionally exclude `trade_tick` files from the manifest, matching the worker's reduced-memory path.
 - Missing directories are reported but do not fail the script by themselves. This keeps the workflow safe across partial catalog populations.
 - This is a cache accelerator only. It does not change the run spec, scheduler reservation, or replay semantics.
+
+## Replay-Time Prefetch
+
+For long runs, `scripts/run_backtest.py` can now advance a replay-time prefetch window using the same filtered parquet file list already prepared for the run.
+
+Current knobs:
+
+- `BACKTEST_PREFETCH_BACKEND`
+  - `local-read` (default): background full-file reads for local paths
+  - `off`: disable replay-time prefetch
+- `BACKTEST_PREFETCH_AHEAD_HOURS`
+  - default `72`
+- `BACKTEST_PREFETCH_MAX_FILES_PER_BATCH`
+  - default `4`
+
+Design note:
+
+- The runner talks to a generic prefetch backend, not directly to `juicefs warmup`.
+- Today the default backend is `local-read` because it works for the current mounted-file path.
+- If the data pipeline later moves to direct B2/S3 access, we should add a new backend implementation behind the same runner/control-plane API instead of changing backtest orchestration semantics.

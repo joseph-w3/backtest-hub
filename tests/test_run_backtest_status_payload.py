@@ -121,6 +121,7 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
             self.assertIsNone(payload["simulated_time"])
             self.assertIsNone(payload["node_probe"])
             self.assertIsNone(payload["streaming_probe"])
+            self.assertIsNone(payload["prefetch_probe"])
             self.assertEqual(payload["streaming_summary"], {"chunks_seen": 0, "events_seen": 0})
         finally:
             sys.modules.pop("run_backtest_under_test", None)
@@ -166,6 +167,7 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
                 self.assertEqual(payload["simulated_time"], "2026-03-13T21:06:53.925544242Z")
                 self.assertEqual(payload["phase"], "initializing")
                 self.assertIsNone(payload["node_probe"])
+                self.assertIsNone(payload["prefetch_probe"])
                 self.assertEqual(payload["streaming_summary"], {"chunks_seen": 0, "events_seen": 0})
         finally:
             sys.modules.pop("run_backtest_under_test", None)
@@ -471,6 +473,16 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
                 rss_after_add_mb=130.5,
                 rss_after_run_mb=140.25,
                 rss_after_clear_mb=125.0,
+                materialize_ms=12.5,
+                add_ms=50.0,
+                run_ms=250.0,
+                clear_ms=10.25,
+                chunk_wall_ms=322.75,
+                chunk_start_time="2025-11-10T00:00:00.000000000Z",
+                chunk_end_time="2025-11-10T00:10:00.000000000Z",
+                chunk_span_seconds=600.0,
+                events_per_second=154.918667,
+                simulated_seconds_per_wall_second=1.858249,
             )
 
             self.assertEqual(payload["chunk_index"], 7)
@@ -480,6 +492,14 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             self.assertEqual(payload["rss_delta_run_mb"], 9.75)
             self.assertEqual(payload["rss_delta_clear_mb"], -15.25)
             self.assertEqual(payload["rss_delta_chunk_mb"], 25.0)
+            self.assertEqual(payload["materialize_ms"], 12.5)
+            self.assertEqual(payload["add_ms"], 50.0)
+            self.assertEqual(payload["run_ms"], 250.0)
+            self.assertEqual(payload["clear_ms"], 10.25)
+            self.assertEqual(payload["chunk_wall_ms"], 322.75)
+            self.assertEqual(payload["chunk_span_seconds"], 600.0)
+            self.assertEqual(payload["events_per_second"], 154.918667)
+            self.assertEqual(payload["simulated_seconds_per_wall_second"], 1.858249)
             self.assertIn("updated_at", payload)
         finally:
             sys.modules.pop("run_backtest_under_test", None)
