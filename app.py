@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import uuid
 import threading
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
@@ -232,6 +234,13 @@ BACKTEST_METRICS_PATH = env_or_default("BACKTEST_METRICS_PATH", "v1/system/metri
 BACKTEST_METRICS_TIMEOUT_SECONDS = float(os.getenv("BACKTEST_METRICS_TIMEOUT_SECONDS", "3"))
 
 RUNNER_PATH = Path(env_or_default("BACKTEST_RUNNER_PATH", str(BASE_DIR / "scripts" / "run_backtest.py")))
+RUNNER_SUPPORT_PATH = BASE_DIR / "scripts"
+RUNNER_SUPPORT_FILENAMES = (
+    "catalog_controls.py",
+    "catalog_prefetch.py",
+    "prewarm_catalog_cache.py",
+)
+RUNNER_SUPPORT_BUNDLE_FILENAME = "runner-support-bundle.zip"
 
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "150"))
 MAX_RANGE_DAYS = int(os.getenv("MAX_RANGE_DAYS", "90"))
@@ -906,14 +915,26 @@ def submit_to_backtest(
     bundle_filename: str | None,
     bundle_bytes: bytes | None,
     runner_bytes: bytes,
+    runner_support_bundle_filename: str | None = None,
+    runner_support_bundle_bytes: bytes | None = None,
 ) -> str:
     url = normalize_join_url(base_url, BACKTEST_SUBMIT_PATH)
     logger.info("submit_to_backtest start backtest_id=%s url=%s", backtest_id, url)
-    # backtest docker 最新接口字段名：backtest_id / runer / strategies / strategy_bundle / configs
+    # backtest docker 最新接口字段名:
+    # backtest_id / runer / runner_support_bundle / strategies / strategy_bundle / configs
     files = [
         ("runer", "run_backtest.py", "text/x-python", runner_bytes),
         ("configs", "run_spec.json", "application/json", run_spec_bytes),
     ]
+    if runner_support_bundle_filename and runner_support_bundle_bytes is not None:
+        files.append(
+            (
+                "runner_support_bundle",
+                runner_support_bundle_filename,
+                "application/zip",
+                runner_support_bundle_bytes,
+            )
+        )
     if bundle_filename and bundle_bytes is not None:
         files.append(("strategy_bundle", bundle_filename, "application/zip", bundle_bytes))
     elif strategy_filename and strategy_bytes is not None:
@@ -1002,7 +1023,29 @@ def load_run_spec_payload(backtest_id: str) -> dict[str, Any]:
     return parse_run_spec_bytes(run_spec_bytes)
 
 
-def load_run_assets(backtest_id: str) -> tuple[bytes, str | None, bytes | None, str | None, bytes | None, bytes]:
+def build_runner_support_bundle_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name in RUNNER_SUPPORT_FILENAMES:
+            source = RUNNER_SUPPORT_PATH / name
+            if not source.is_file():
+                raise FileNotFoundError(f"runner support file not found: {source}")
+            zf.writestr(name, source.read_bytes())
+    return buffer.getvalue()
+
+
+def load_run_assets(
+    backtest_id: str,
+) -> tuple[
+    bytes,
+    str | None,
+    bytes | None,
+    str | None,
+    bytes | None,
+    bytes,
+    str | None,
+    bytes | None,
+]:
     run_dir = RUN_STORAGE_PATH / backtest_id
     run_spec_path = run_dir / "run_spec.json"
     run_spec_bytes = run_spec_path.read_bytes()
@@ -1024,7 +1067,22 @@ def load_run_assets(backtest_id: str) -> tuple[bytes, str | None, bytes | None, 
     if not RUNNER_PATH.is_file():
         raise FileNotFoundError(f"run_backtest.py not found: {RUNNER_PATH}")
     runner_bytes = RUNNER_PATH.read_bytes()
-    return run_spec_bytes, strategy_filename, strategy_bytes, bundle_filename, bundle_bytes, runner_bytes
+    runner_support_bundle_path = run_dir / RUNNER_SUPPORT_BUNDLE_FILENAME
+    runner_support_bundle_filename: str | None = None
+    runner_support_bundle_bytes: bytes | None = None
+    if runner_support_bundle_path.is_file():
+        runner_support_bundle_filename = RUNNER_SUPPORT_BUNDLE_FILENAME
+        runner_support_bundle_bytes = runner_support_bundle_path.read_bytes()
+    return (
+        run_spec_bytes,
+        strategy_filename,
+        strategy_bytes,
+        bundle_filename,
+        bundle_bytes,
+        runner_bytes,
+        runner_support_bundle_filename,
+        runner_support_bundle_bytes,
+    )
 
 
 async def pick_backtest_target(
@@ -1244,6 +1302,8 @@ async def queue_scheduler() -> None:
                         bundle_filename,
                         bundle_bytes,
                         runner_bytes,
+                        runner_support_bundle_filename,
+                        runner_support_bundle_bytes,
                     ) = await asyncio.to_thread(load_run_assets, backtest_id)
                     backtest_docker_run_id = await asyncio.to_thread(
                         submit_to_backtest,
@@ -1255,6 +1315,8 @@ async def queue_scheduler() -> None:
                         bundle_filename,
                         bundle_bytes,
                         runner_bytes,
+                        runner_support_bundle_filename,
+                        runner_support_bundle_bytes,
                     )
                     update_mapping(
                         backtest_id,
@@ -1423,6 +1485,12 @@ async def create_run(
         logger.error("create_run_missing_runner backtest_id=%s path=%s", backtest_id, RUNNER_PATH)
         raise HTTPException(status_code=500, detail="run_backtest.py not found")
     runner_bytes = RUNNER_PATH.read_bytes()
+    try:
+        runner_support_bundle_bytes = build_runner_support_bundle_bytes()
+    except FileNotFoundError as exc:
+        logger.error("create_run_missing_runner_support backtest_id=%s error=%s", backtest_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    (run_dir / RUNNER_SUPPORT_BUNDLE_FILENAME).write_bytes(runner_support_bundle_bytes)
 
     # 7) 调用 backtest docker 提交任务，获取 backtest_docker_run_id
     hub_status, backtest_docker_run_id = await submit_with_queue_control(

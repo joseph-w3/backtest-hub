@@ -132,6 +132,10 @@ Mode semantics are encoded directly into each `run_spec.json` via
 - submitted through the normal backtest-hub API/CLI path
 - or run locally against `scripts/run_backtest.py`
 
+When submitted through backtest-hub, the hub now ships the runner helper
+modules as a formal `runner_support_bundle`, so API-native harness runs do not
+depend on worker-local copies of the repo's `scripts/` tree.
+
 Example API-style submit from the harness root:
 
 ```bash
