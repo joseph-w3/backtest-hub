@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import importlib.util
 import sys
+from unittest import mock
 import unittest
 
 os.environ.setdefault("BACKTEST_API_BASES", "http://dummy:10001")
@@ -18,6 +19,35 @@ SPEC.loader.exec_module(run_warmup_cycle_serial)
 
 
 class TestRunWarmupCycleSerial(unittest.TestCase):
+    def test_sample_worker_cache_stats_parses_successful_ssh_output(self) -> None:
+        completed = mock.Mock(stdout="1\t4096\n", stderr="", returncode=0)
+        with mock.patch.object(run_warmup_cycle_serial.subprocess, "run", return_value=completed):
+            snapshot = run_warmup_cycle_serial._sample_worker_cache_stats(
+                ssh_target="root@test-host",
+                cache_dir="/tmp/cache",
+            )
+
+        self.assertEqual(snapshot["ssh_target"], "root@test-host")
+        self.assertEqual(snapshot["cache_dir"], "/tmp/cache")
+        self.assertTrue(snapshot["exists"])
+        self.assertEqual(snapshot["bytes"], 4096)
+        self.assertIsNone(snapshot["error"])
+
+    def test_sample_worker_cache_stats_reports_error_without_raising(self) -> None:
+        with mock.patch.object(
+            run_warmup_cycle_serial.subprocess,
+            "run",
+            side_effect=RuntimeError("ssh failed"),
+        ):
+            snapshot = run_warmup_cycle_serial._sample_worker_cache_stats(
+                ssh_target="root@test-host",
+                cache_dir="/tmp/cache",
+            )
+
+        self.assertEqual(snapshot["ssh_target"], "root@test-host")
+        self.assertIsNone(snapshot["bytes"])
+        self.assertIn("ssh failed", snapshot["error"])
+
     def test_collect_unique_chunk_probes_deduplicates_updated_at(self) -> None:
         rows = [
             {
@@ -207,6 +237,45 @@ class TestRunWarmupCycleSerial(unittest.TestCase):
         self.assertEqual(summary["progress_file_touch_active_ratio"], 1.0)
         self.assertEqual(summary["final_file_touch_files_total"], 20)
         self.assertEqual(summary["final_file_touch_files_touched"], 15)
+
+    def test_summarize_progress_rows_reports_cache_dir_growth(self) -> None:
+        rows = [
+            {
+                "progress": {
+                    "last_progress_at": "2026-03-19T01:00:00.000000+00:00",
+                    "simulated_time": "2025-11-10T00:00:00.000000000Z",
+                    "streaming_probe": {"chunk_index": 10},
+                    "streaming_summary": {"events_seen": 2_000_000},
+                },
+                "cache_stats": {"bytes": 1_000},
+            },
+            {
+                "progress": {
+                    "last_progress_at": "2026-03-19T01:00:10.000000+00:00",
+                    "simulated_time": "2025-11-10T00:05:00.000000000Z",
+                    "streaming_probe": {"chunk_index": 12},
+                    "streaming_summary": {"events_seen": 3_500_000},
+                },
+                "cache_stats": {"bytes": 1_600},
+            },
+            {
+                "progress": {
+                    "last_progress_at": "2026-03-19T01:00:20.000000+00:00",
+                    "simulated_time": "2025-11-10T00:10:30.000000000Z",
+                    "streaming_probe": {"chunk_index": 14},
+                    "streaming_summary": {"events_seen": 5_000_000},
+                },
+                "cache_stats": {"bytes": 2_000},
+            },
+        ]
+
+        summary = run_warmup_cycle_serial.summarize_progress_rows(rows, skip_initial_chunks=10)
+
+        self.assertEqual(summary["progress_cache_dir_bytes_growth_sample_count"], 2)
+        self.assertEqual(summary["progress_cache_dir_bytes_growth_total"], 1000)
+        self.assertEqual(summary["progress_cache_dir_bytes_growth_median"], 500.0)
+        self.assertEqual(summary["progress_cache_dir_growth_active_ratio"], 1.0)
+        self.assertEqual(summary["final_cache_dir_bytes"], 2000)
 
 
 if __name__ == "__main__":

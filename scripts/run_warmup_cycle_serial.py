@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import shlex
 import secrets
 import statistics
 import subprocess
@@ -87,6 +88,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_SKIP_INITIAL_CHUNKS,
         help="Ignore chunk probes at or below this index when computing stable replay metrics",
+    )
+    parser.add_argument(
+        "--cache-stats-ssh-target",
+        default=None,
+        help=(
+            "If set, sample the worker-local JuiceFS cache dir over ssh on each poll. "
+            "Defaults to --reset-ssh-target when omitted and a reset target is provided."
+        ),
     )
     parser.add_argument(
         "--reset-ssh-target",
@@ -219,6 +228,55 @@ def _reset_worker_cache(
     }
 
 
+def _sample_worker_cache_stats(
+    *,
+    ssh_target: str,
+    cache_dir: str,
+) -> dict[str, Any]:
+    sampled_at = _utc_timestamp_id()
+    started_at = time.perf_counter()
+    quoted_cache_dir = shlex.quote(cache_dir)
+    command = " && ".join(
+        [
+            "set -euo pipefail",
+            (
+                f"if [ -d {quoted_cache_dir} ]; then "
+                f"exists=1; bytes=$(du -sb {quoted_cache_dir} | cut -f1); "
+                "else exists=0; bytes=0; fi"
+            ),
+            "printf '%s\\t%s\\n' \"$exists\" \"$bytes\"",
+        ]
+    )
+    try:
+        completed = subprocess.run(
+            ["ssh", ssh_target, command],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        line = completed.stdout.strip().splitlines()[-1]
+        exists_raw, bytes_raw = line.split("\t", 1)
+        return {
+            "ssh_target": ssh_target,
+            "cache_dir": cache_dir,
+            "sampled_at": sampled_at,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "exists": bool(int(exists_raw)),
+            "bytes": int(bytes_raw),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "ssh_target": ssh_target,
+            "cache_dir": cache_dir,
+            "sampled_at": sampled_at,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            "exists": None,
+            "bytes": None,
+            "error": repr(exc),
+        }
+
+
 def _mode_order(raw: str) -> list[str]:
     known = {mode.name for mode in MODES}
     parsed = [item.strip() for item in raw.split(",") if item.strip()]
@@ -271,7 +329,10 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def _progress_point(progress: dict[str, Any] | None) -> dict[str, Any] | None:
+def _progress_point(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    progress = row.get("progress")
     if not isinstance(progress, dict):
         return None
     probe = progress.get("streaming_probe")
@@ -280,6 +341,9 @@ def _progress_point(progress: dict[str, Any] | None) -> dict[str, Any] | None:
     summary = progress.get("streaming_summary")
     if not isinstance(summary, dict):
         summary = {}
+    cache_stats = row.get("cache_stats")
+    if not isinstance(cache_stats, dict):
+        cache_stats = {}
     last_progress_at = progress.get("last_progress_at")
     simulated_time = progress.get("simulated_time")
     if not isinstance(last_progress_at, str) or not isinstance(simulated_time, str):
@@ -315,6 +379,11 @@ def _progress_point(progress: dict[str, Any] | None) -> dict[str, Any] | None:
             if isinstance(summary.get("file_touch_bytes_total"), int)
             else None
         ),
+        "cache_dir_bytes": (
+            int(cache_stats["bytes"])
+            if isinstance(cache_stats.get("bytes"), int)
+            else None
+        ),
     }
 
 
@@ -322,7 +391,7 @@ def _progress_delta_samples(progress_rows: list[dict[str, Any]], *, skip_initial
     samples: list[dict[str, float]] = []
     previous_point: dict[str, Any] | None = None
     for row in progress_rows:
-        point = _progress_point(row.get("progress"))
+        point = _progress_point(row)
         if point is None:
             continue
         if previous_point is not None:
@@ -376,6 +445,13 @@ def _progress_delta_sample(
             and point["file_touch_bytes_touched"] >= previous_point["file_touch_bytes_touched"]
             else None
         ),
+        "cache_dir_bytes_growth": (
+            point["cache_dir_bytes"] - previous_point["cache_dir_bytes"]
+            if isinstance(previous_point.get("cache_dir_bytes"), int)
+            and isinstance(point.get("cache_dir_bytes"), int)
+            and point["cache_dir_bytes"] >= previous_point["cache_dir_bytes"]
+            else None
+        ),
     }
 
 
@@ -410,7 +486,7 @@ def summarize_progress_rows(
     progress_points = [
         point
         for row in progress_rows
-        if (point := _progress_point(row.get("progress"))) is not None
+        if (point := _progress_point(row)) is not None
     ]
     last_progress_point = progress_points[-1] if progress_points else None
     probes = _collect_unique_chunk_probes(progress_rows)
@@ -448,6 +524,11 @@ def summarize_progress_rows(
         for sample in progress_deltas
         if isinstance(sample.get("new_bytes_touched"), (int, float))
     ]
+    progress_cache_dir_bytes_growth = [
+        int(sample["cache_dir_bytes_growth"])
+        for sample in progress_deltas
+        if isinstance(sample.get("cache_dir_bytes_growth"), (int, float))
+    ]
     return {
         "unique_chunk_probe_count": len(probes),
         "stable_chunk_probe_count": len(stable),
@@ -476,6 +557,25 @@ def summarize_progress_rows(
             sum(1 for value in progress_new_files_touched if value > 0) / len(progress_new_files_touched)
             if progress_new_files_touched
             else None
+        ),
+        "progress_cache_dir_bytes_growth_sample_count": len(progress_cache_dir_bytes_growth),
+        "progress_cache_dir_bytes_growth_total": (
+            sum(progress_cache_dir_bytes_growth) if progress_cache_dir_bytes_growth else None
+        ),
+        "progress_cache_dir_bytes_growth_median": (
+            statistics.median(progress_cache_dir_bytes_growth)
+            if progress_cache_dir_bytes_growth
+            else None
+        ),
+        "progress_cache_dir_bytes_growth_p90": _percentile(progress_cache_dir_bytes_growth, 0.9),
+        "progress_cache_dir_growth_active_ratio": (
+            sum(1 for value in progress_cache_dir_bytes_growth if value > 0)
+            / len(progress_cache_dir_bytes_growth)
+            if progress_cache_dir_bytes_growth
+            else None
+        ),
+        "final_cache_dir_bytes": (
+            last_progress_point.get("cache_dir_bytes") if last_progress_point is not None else None
         ),
         "final_file_touch_files_total": last_progress_point.get("file_touch_files_total") if last_progress_point is not None else None,
         "final_file_touch_bytes_total": last_progress_point.get("file_touch_bytes_total") if last_progress_point is not None else None,
@@ -521,6 +621,8 @@ def _poll_until_complete(
     progress_log_path: Path,
     skip_initial_chunks: int,
     min_stable_progress_samples: int | None,
+    cache_stats_ssh_target: str | None,
+    cache_dir: str,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
     rows: list[dict[str, Any]] = []
     last_report_monotonic = 0.0
@@ -538,10 +640,19 @@ def _poll_until_complete(
                 if exc.code != 404:
                     raise
                 progress_payload = {"backtest_id": backtest_id, "progress": None}
+            cache_stats = (
+                _sample_worker_cache_stats(
+                    ssh_target=cache_stats_ssh_target,
+                    cache_dir=cache_dir,
+                )
+                if cache_stats_ssh_target
+                else None
+            )
             row = {
                 "polled_at": polled_at,
                 "status": status_payload,
                 "progress": progress_payload.get("progress"),
+                "cache_stats": cache_stats,
             }
             handle.write(json.dumps(row, ensure_ascii=True) + "\n")
             handle.flush()
@@ -554,9 +665,10 @@ def _poll_until_complete(
             probe = progress.get("streaming_probe")
             if not isinstance(probe, dict):
                 probe = {}
-            point = _progress_point(progress)
+            point = _progress_point(row)
             progress_events_per_second = None
             progress_simulated_seconds_per_wall_second = None
+            progress_cache_dir_bytes_growth = None
             if point is not None and previous_point is not None:
                 sample = _progress_delta_sample(previous_point, point, skip_initial_chunks=skip_initial_chunks)
                 if sample is not None:
@@ -566,6 +678,8 @@ def _poll_until_complete(
                         sample["simulated_seconds_per_wall_second"],
                         6,
                     )
+                    if isinstance(sample.get("cache_dir_bytes_growth"), (int, float)):
+                        progress_cache_dir_bytes_growth = int(sample["cache_dir_bytes_growth"])
             if (
                 not last_report_monotonic
                 or (now_monotonic - last_report_monotonic) >= 60.0
@@ -584,6 +698,12 @@ def _poll_until_complete(
                             "simulated_seconds_per_wall_second": probe.get("simulated_seconds_per_wall_second"),
                             "progress_events_per_second": progress_events_per_second,
                             "progress_simulated_seconds_per_wall_second": progress_simulated_seconds_per_wall_second,
+                            "cache_dir_bytes": (
+                                cache_stats.get("bytes")
+                                if isinstance(cache_stats, dict)
+                                else None
+                            ),
+                            "progress_cache_dir_bytes_growth": progress_cache_dir_bytes_growth,
                             "polled_at": polled_at,
                         },
                         ensure_ascii=True,
@@ -644,6 +764,7 @@ def run_serial_harness(args: argparse.Namespace) -> dict[str, Any]:
     results_dir = Path(args.results_dir).expanduser().resolve()
     results_dir.mkdir(parents=True, exist_ok=True)
     modes = _mode_order(args.modes)
+    cache_stats_ssh_target = args.cache_stats_ssh_target or args.reset_ssh_target
 
     config = {
         "harness_dir": str(harness_dir),
@@ -652,6 +773,7 @@ def run_serial_harness(args: argparse.Namespace) -> dict[str, Any]:
         "modes": modes,
         "poll_seconds": args.poll_seconds,
         "skip_initial_chunks": args.skip_initial_chunks,
+        "cache_stats_ssh_target": cache_stats_ssh_target,
         "reset_ssh_target": args.reset_ssh_target,
         "cache_dir": args.cache_dir,
         "drop_page_cache": bool(args.drop_page_cache),
@@ -697,6 +819,14 @@ def run_serial_harness(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         backtest_id = _make_backtest_id(mode)
+        cache_stats_before_submit = (
+            _sample_worker_cache_stats(
+                ssh_target=cache_stats_ssh_target,
+                cache_dir=args.cache_dir,
+            )
+            if cache_stats_ssh_target
+            else None
+        )
         run_spec, bundle_name, bundle_bytes, runner_bytes, runner_support_bundle_bytes = _load_submission_assets(
             harness_dir,
             mode,
@@ -735,8 +865,18 @@ def run_serial_harness(args: argparse.Namespace) -> dict[str, Any]:
             progress_log_path=mode_dir / "progress.jsonl",
             skip_initial_chunks=args.skip_initial_chunks,
             min_stable_progress_samples=args.min_stable_progress_samples,
+            cache_stats_ssh_target=cache_stats_ssh_target,
+            cache_dir=args.cache_dir,
         )
         log_text = _worker_logs(args.worker_base_url, backtest_id)
+        cache_stats_after_run = (
+            _sample_worker_cache_stats(
+                ssh_target=cache_stats_ssh_target,
+                cache_dir=args.cache_dir,
+            )
+            if cache_stats_ssh_target
+            else None
+        )
         (mode_dir / "worker.log").write_text(log_text, encoding="utf-8")
         (mode_dir / "final_status.json").write_text(
             json.dumps(final_status, ensure_ascii=True, indent=2) + "\n",
@@ -774,6 +914,8 @@ def run_serial_harness(args: argparse.Namespace) -> dict[str, Any]:
             "total_seconds": _total_seconds(started_at, finished_at),
             "warmup_lines": _extract_warmup_lines(log_text),
             "cache_reset": reset_summary,
+            "cache_stats_before_submit": cache_stats_before_submit,
+            "cache_stats_after_run": cache_stats_after_run,
             "stop_rule": stop_rule_summary,
             "progress_summary": progress_summary,
         }
