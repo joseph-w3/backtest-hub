@@ -240,6 +240,7 @@ OPTIONAL_FIELDS = {
     "trade_execution",
     "load_trade_ticks",
     "optimize_file_loading",
+    "catalog_controls",
     "fill_model_config",
 }
 

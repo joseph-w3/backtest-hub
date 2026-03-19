@@ -176,6 +176,54 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
 
 
 class TestRunBacktestMarketDataProfile(unittest.TestCase):
+    def test_validate_run_spec_accepts_catalog_controls(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory() as td:
+                root = Path(td)
+                bundle_path = root / "bundle.zip"
+                bundle_path.write_bytes(b"placeholder")
+                run_spec_path = root / "run_spec.json"
+                run_spec = {
+                    "backtest_id": "bt-1",
+                    "schema_version": "1.0",
+                    "requested_by": "tester",
+                    "strategy_entry": "strategies.s:Strategy",
+                    "strategy_config_path": "strategies.s:StrategyConfig",
+                    "strategy_config": {},
+                    "strategy_bundle": str(bundle_path),
+                    "margin_init": 0.05,
+                    "margin_maint": 0.025,
+                    "spot_maker_fee": 0.001,
+                    "spot_taker_fee": 0.001,
+                    "futures_maker_fee": 0.001,
+                    "futures_taker_fee": 0.001,
+                    "symbols": ["ACTUSDT"],
+                    "start": "2025-11-10T00:00:00.000Z",
+                    "end": "2025-11-11T00:00:00.000Z",
+                    "chunk_size": 200000,
+                    "seed": 12345,
+                    "tags": {"purpose": "test"},
+                    "catalog_controls": {
+                        "prewarm_before_run": True,
+                        "prewarm_threads": 25,
+                        "prefetch_backend": "off",
+                        "prefetch_ahead_hours": 48,
+                        "prefetch_max_files_per_batch": 3,
+                    },
+                }
+                run_spec_path.write_text(json.dumps(run_spec), encoding="utf-8")
+
+                _, resolved_bundle_path = run_backtest._validate_run_spec(run_spec, run_spec_path)
+                self.assertEqual(resolved_bundle_path, bundle_path)
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
     def test_load_trade_ticks_defaults_true(self) -> None:
         added_modules = _install_quant_trade_stubs()
         try:
