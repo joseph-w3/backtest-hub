@@ -1312,10 +1312,16 @@ def _load_or_create_instrument(
     taker_fee: Decimal,
     margin_init: Decimal | None = None,
     margin_maint: Decimal | None = None,
+    preloaded_instruments: dict[str, CurrencyPair | CryptoPerpetual] | None = None,
 ) -> CurrencyPair | CryptoPerpetual:
-    instruments = catalog.instruments(instrument_ids=[instrument_id.value])
-    if instruments:
-        instrument = instruments[0]
+    instrument: CurrencyPair | CryptoPerpetual | None = None
+    if preloaded_instruments is not None:
+        instrument = preloaded_instruments.get(instrument_id.value)
+    else:
+        instruments = catalog.instruments(instrument_ids=[instrument_id.value])
+        if instruments:
+            instrument = instruments[0]
+    if instrument is not None:
         if market == "spot":
             if not isinstance(instrument, CurrencyPair):
                 raise ValueError(f"Instrument {instrument_id} is not a spot CurrencyPair.")
@@ -1393,6 +1399,24 @@ def _load_or_create_instrument(
         maker_fee=maker_fee,
         taker_fee=taker_fee,
     )
+
+
+def _catalog_instruments_by_id(
+    catalog: ParquetDataCatalog,
+    instrument_ids: list[InstrumentId],
+) -> dict[str, CurrencyPair | CryptoPerpetual]:
+    if not instrument_ids:
+        return {}
+    # Batch metadata lookup once per market to avoid repeated catalog glob/query
+    # work while building the run config on remote-backed mounts.
+    instruments = catalog.instruments(
+        instrument_ids=[instrument_id.value for instrument_id in instrument_ids]
+    )
+    return {
+        instrument.id.value: instrument
+        for instrument in instruments
+        if isinstance(instrument, (CurrencyPair, CryptoPerpetual))
+    }
 
 
 def _migrate_instrument_data(
@@ -2447,6 +2471,14 @@ def main() -> int:
             stdout_path=stdout_path,
             updates={"init_step": "load_spot_instruments"},
         )
+        spot_instrument_ids = [
+            InstrumentId(Symbol(data_symbol), BINANCE_SPOT_VENUE)
+            for data_symbol in spot_symbols
+        ]
+        spot_catalog_instruments = _catalog_instruments_by_id(
+            data_catalog,
+            spot_instrument_ids,
+        )
         for data_symbol in spot_symbols:
             base_code, symbol_quote_code = _resolve_base_quote(data_symbol)
             if quote_code is None:
@@ -2467,6 +2499,7 @@ def main() -> int:
                 size_precision=SIZE_PRECISION,
                 maker_fee=spot_maker_fee,
                 taker_fee=spot_taker_fee,
+                preloaded_instruments=spot_catalog_instruments,
             )
             spot_instruments.append(spot_instrument)
 
@@ -2476,6 +2509,14 @@ def main() -> int:
             status_lock=status_lock,
             stdout_path=stdout_path,
             updates={"init_step": "load_futures_instruments"},
+        )
+        futures_instrument_ids = [
+            InstrumentId(Symbol(f"{base_symbol}-PERP"), BINANCE_FUTURES_VENUE)
+            for base_symbol in futures_symbols
+        ]
+        futures_catalog_instruments = _catalog_instruments_by_id(
+            data_catalog,
+            futures_instrument_ids,
         )
         for base_symbol in futures_symbols:
             base_code, symbol_quote_code = _resolve_base_quote(base_symbol)
@@ -2500,6 +2541,7 @@ def main() -> int:
                 taker_fee=futures_taker_fee,
                 margin_init=margin_init,
                 margin_maint=margin_maint,
+                preloaded_instruments=futures_catalog_instruments,
             )
             futures_instruments.append(futures_instrument)
 

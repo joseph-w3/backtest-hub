@@ -5,6 +5,7 @@ import sys
 import threading
 import types
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -886,6 +887,117 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             self.assertEqual(payload["chunk_size"], 50000)
             self.assertEqual(payload["rss_mb"], 1234.56)
             self.assertIn("updated_at", payload)
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_catalog_instruments_by_id_batches_lookup(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            class FakeCurrencyPair:
+                def __init__(self, instrument_id) -> None:
+                    self.id = instrument_id
+
+            class FakeCryptoPerpetual(FakeCurrencyPair):
+                pass
+
+            run_backtest.CurrencyPair = FakeCurrencyPair
+            run_backtest.CryptoPerpetual = FakeCryptoPerpetual
+
+            class FakeCatalog:
+                def __init__(self) -> None:
+                    self.calls: list[list[str]] = []
+
+                def instruments(self, instrument_ids=None):
+                    ids = list(instrument_ids or [])
+                    self.calls.append(ids)
+                    return [FakeCurrencyPair(types.SimpleNamespace(value=value)) for value in ids]
+
+            catalog = FakeCatalog()
+            instrument_ids = [
+                types.SimpleNamespace(value="ACTUSDT.BINANCE_SPOT"),
+                types.SimpleNamespace(value="AAVEUSDT.BINANCE_SPOT"),
+            ]
+
+            mapping = run_backtest._catalog_instruments_by_id(catalog, instrument_ids)
+
+            self.assertEqual(
+                catalog.calls,
+                [["ACTUSDT.BINANCE_SPOT", "AAVEUSDT.BINANCE_SPOT"]],
+            )
+            self.assertEqual(
+                sorted(mapping.keys()),
+                ["AAVEUSDT.BINANCE_SPOT", "ACTUSDT.BINANCE_SPOT"],
+            )
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_load_or_create_instrument_uses_preloaded_instruments(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            class FakeCurrencyPair:
+                def __init__(self, **kwargs) -> None:
+                    for key, value in kwargs.items():
+                        setattr(self, key, value)
+                    self.id = kwargs["instrument_id"]
+
+            class FakeCryptoPerpetual(FakeCurrencyPair):
+                pass
+
+            run_backtest.CurrencyPair = FakeCurrencyPair
+            run_backtest.CryptoPerpetual = FakeCryptoPerpetual
+
+            existing = FakeCurrencyPair(
+                instrument_id=types.SimpleNamespace(value="ACTUSDT.BINANCE_SPOT"),
+                raw_symbol="ACTUSDT",
+                base_currency="ACT",
+                quote_currency="USDT",
+                price_precision=4,
+                size_precision=3,
+                price_increment="0.0001",
+                size_increment="0.001",
+                ts_event=0,
+                ts_init=0,
+                lot_size=None,
+                max_quantity=None,
+                min_quantity=None,
+                max_notional=None,
+                min_notional="5",
+                max_price=None,
+                min_price=None,
+                margin_init=Decimal("0"),
+                margin_maint=Decimal("0"),
+                maker_fee=Decimal("0.01"),
+                taker_fee=Decimal("0.02"),
+            )
+
+            class FailingCatalog:
+                def instruments(self, instrument_ids=None):
+                    raise AssertionError("catalog.instruments should not be called")
+
+            instrument = run_backtest._load_or_create_instrument(
+                catalog=FailingCatalog(),
+                instrument_id=types.SimpleNamespace(value="ACTUSDT.BINANCE_SPOT"),
+                market="spot",
+                base_code="ACT",
+                quote_code="USDT",
+                price_precision=4,
+                size_precision=3,
+                maker_fee=Decimal("0.001"),
+                taker_fee=Decimal("0.002"),
+                preloaded_instruments={"ACTUSDT.BINANCE_SPOT": existing},
+            )
+
+            self.assertEqual(instrument.id.value, "ACTUSDT.BINANCE_SPOT")
+            self.assertEqual(instrument.maker_fee, Decimal("0.001"))
+            self.assertEqual(instrument.taker_fee, Decimal("0.002"))
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:

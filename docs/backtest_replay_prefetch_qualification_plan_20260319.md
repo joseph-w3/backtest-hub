@@ -27,6 +27,29 @@ Relevant references:
 - maintained 38-pair source of truth:
   `/home/joe/clawd-workspace/clawd/tbdtbd/strategy/configs/live/v5_runtime_universe_backtest_38pairs.yaml`
 
+## 2026-03-19 Qualification Notes
+
+Observed on the first 38-pair `no_warmup` qualification run:
+
+- `phase` stayed at `initializing`
+- `init_step` stayed at `load_spot_instruments`
+- `streaming_probe` and `prepare_probe` stayed `null`
+- the isolated cache still grew to about `30.55 GB` before replay started
+
+Implications:
+
+1. cold demand is materially front-loaded before stable replay
+2. replay-prefetch cannot be judged from that run alone
+3. `load_spot_instruments` itself must stay cheap, because any repeated catalog
+   metadata lookup there directly distorts the startup-side experiment
+
+Mitigation landed in code:
+
+- [run_backtest.py](/home/joe/clawd-workspace/clawd/tbdtbd/backtest-hub/scripts/run_backtest.py)
+  now batches spot/futures instrument metadata lookup once per market before
+  overriding fees and margins, instead of re-querying the catalog once per
+  symbol
+
 ## Correct Experiment Definition
 
 The qualification run must satisfy both:
