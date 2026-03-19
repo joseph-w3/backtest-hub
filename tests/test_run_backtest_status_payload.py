@@ -7,6 +7,7 @@ import types
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 
 class _Dummy:
@@ -187,6 +188,38 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
                 self.assertIsNone(payload["node_probe"])
                 self.assertIsNone(payload["prefetch_probe"])
                 self.assertEqual(payload["streaming_summary"], self._expected_streaming_summary())
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_write_status_uses_atomic_replace(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            from tempfile import TemporaryDirectory
+
+            with TemporaryDirectory() as td:
+                status_path = Path(td) / "status.json"
+                status_path.write_text('{"old": true}', encoding="utf-8")
+                replace_call: dict[str, Path] = {}
+                real_replace = os.replace
+
+                def _replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+                    replace_call["src"] = Path(src)
+                    replace_call["dst"] = Path(dst)
+                    assert replace_call["src"].exists()
+                    real_replace(src, dst)
+
+                with patch("run_backtest_under_test.os.replace", side_effect=_replace):
+                    run_backtest._write_status(status_path, {"status": "running", "phase": "engine_running"})
+
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["status"], "running")
+                self.assertEqual(payload["phase"], "engine_running")
+                self.assertEqual(replace_call["dst"], status_path)
+                self.assertNotEqual(replace_call["src"], status_path)
+                self.assertFalse(any(Path(td).glob(".status.json.*.tmp")))
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
