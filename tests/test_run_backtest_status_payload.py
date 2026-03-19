@@ -283,6 +283,103 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             for name in added_modules:
                 sys.modules.pop(name, None)
 
+    def test_run_streaming_uses_node_run_spec_for_prefetch_settings(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            class FakeSession:
+                def __init__(self, chunk_size: int) -> None:
+                    self.chunk_size = chunk_size
+
+                def to_query_result(self) -> list[object]:
+                    return []
+
+            class FakeController:
+                instances: list["FakeController"] = []
+
+                def __init__(self, *, files, backend, ahead_hours, max_files_per_batch) -> None:
+                    self.files = files
+                    self.backend = backend
+                    self.ahead_hours = ahead_hours
+                    self.max_files_per_batch = max_files_per_batch
+                    self.advance_calls: list[int | None] = []
+                    self.__class__.instances.append(self)
+
+                def advance(self, cursor_ns):
+                    self.advance_calls.append(cursor_ns)
+                    return {
+                        "stage": "advance",
+                        "backend": self.backend,
+                        "ahead_hours": self.ahead_hours,
+                        "max_files_per_batch": self.max_files_per_batch,
+                    }
+
+                def snapshot(self):
+                    return {
+                        "stage": "snapshot",
+                        "backend": self.backend,
+                        "ahead_hours": self.ahead_hours,
+                        "max_files_per_batch": self.max_files_per_batch,
+                    }
+
+                def close(self) -> None:
+                    return None
+
+            run_backtest.DataBackendSession = FakeSession
+            run_backtest.ReplayPrefetchController = FakeController
+            run_backtest.build_windowed_files = lambda files: list(files)
+            run_backtest.build_prefetch_backend = lambda mode: f"backend:{mode}"
+            run_backtest.time_like_to_ns = lambda value: 123
+            run_backtest._read_current_rss_mb = lambda: 1.0
+
+            backtest_node_mod = sys.modules["quant_trade_v1.backtest.node"]
+            backtest_node_mod.Bar = type("Bar", (), {})
+            backtest_node_mod.DataBackendSession = FakeSession
+            backtest_node_mod.capsule_to_list = lambda chunk: list(chunk)
+            backtest_node_mod.get_instrument_ids = lambda config: []
+            backtest_node_mod.max_date = lambda a, b: None
+            backtest_node_mod.min_date = lambda a, b: None
+
+            node = run_backtest._InstrumentOverrideBacktestNode(
+                configs=[],
+                instruments=[],
+                run_spec={
+                    "catalog_controls": {
+                        "prefetch_backend": "off",
+                        "prefetch_ahead_hours": 48,
+                        "prefetch_max_files_per_batch": 3,
+                    }
+                },
+            )
+
+            class FakeEngine:
+                def add_data(self, events) -> None:
+                    raise AssertionError("no events expected for empty session")
+
+                def end(self) -> None:
+                    return None
+
+            node._run_streaming(
+                run_config_id="rc1",
+                engine=FakeEngine(),
+                data_configs=[],
+                chunk_size=10,
+                start="2025-11-10T00:00:00.000Z",
+                end="2025-11-11T00:00:00.000Z",
+            )
+
+            self.assertEqual(len(FakeController.instances), 1)
+            controller = FakeController.instances[0]
+            self.assertEqual(controller.backend, "backend:off")
+            self.assertEqual(controller.ahead_hours, 48)
+            self.assertEqual(controller.max_files_per_batch, 3)
+            self.assertEqual(controller.advance_calls, [123])
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
     def test_optimize_file_loading_auto_enabled_for_large_long_v5_spread_arb(self) -> None:
         added_modules = _install_quant_trade_stubs()
         try:

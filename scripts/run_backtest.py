@@ -701,6 +701,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         configs: list[BacktestRunConfig],
         instruments: list[CurrencyPair | CryptoPerpetual],
         *,
+        run_spec: dict[str, Any] | None = None,
         node_probe_callback: Callable[..., None] | None = None,
         streaming_probe_callback: Callable[..., None] | None = None,
         prepare_probe_callback: Callable[..., None] | None = None,
@@ -714,6 +715,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         self._streaming_probe_callback = streaming_probe_callback
         self._prepare_probe_callback = prepare_probe_callback
         self._prefetch_probe_callback = prefetch_probe_callback
+        self._run_spec = dict(run_spec or {})
 
     @classmethod
     def load_catalog(cls, config: BacktestDataConfig) -> ParquetDataCatalog:
@@ -1074,7 +1076,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             rss_before_add_mb=_read_current_rss_mb(),
         )
         prefetch_backend_mode, prefetch_ahead_hours, prefetch_max_files_per_batch = (
-            _prefetch_runtime_settings(run_spec)
+            _prefetch_runtime_settings(self._run_spec)
         )
         prefetch_controller = ReplayPrefetchController(
             files=build_windowed_files(prefetch_candidates),
@@ -2472,6 +2474,7 @@ def main() -> int:
         node = _InstrumentOverrideBacktestNode(
             configs=[run_config],
             instruments=spot_instruments + futures_instruments,
+            run_spec=run_spec,
             node_probe_callback=_on_node_probe,
             streaming_probe_callback=_on_streaming_probe,
             prepare_probe_callback=_on_prepare_probe,
