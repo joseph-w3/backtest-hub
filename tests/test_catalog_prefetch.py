@@ -51,6 +51,39 @@ class TestCatalogPrefetch(unittest.TestCase):
             self.assertEqual(result["prefetched_bytes"], 768)
             self.assertEqual(result["skipped_files"], 0)
 
+    def test_replay_file_touch_observer_tracks_new_files_and_bytes(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            file_a = (
+                root
+                / "2025-11-10T00-00-00-000000000Z_2025-11-10T23-59-59-000000000Z.parquet"
+            )
+            file_b = (
+                root
+                / "2025-11-11T00-00-00-000000000Z_2025-11-11T23-59-59-000000000Z.parquet"
+            )
+            _write_bytes(file_a, 256)
+            _write_bytes(file_b, 512)
+            observer = catalog_prefetch.ReplayFileTouchObserver(
+                files=catalog_prefetch.build_windowed_files([str(file_a), str(file_b)])
+            )
+            snapshot = observer.advance(
+                catalog_prefetch.time_like_to_ns("2025-11-10T12:00:00.000Z")
+            )
+            self.assertEqual(snapshot["files_total"], 2)
+            self.assertEqual(snapshot["bytes_total"], 768)
+            self.assertEqual(snapshot["files_touched"], 1)
+            self.assertEqual(snapshot["new_files_touched"], 1)
+            self.assertEqual(snapshot["new_bytes_touched"], 256)
+
+            snapshot = observer.advance(
+                catalog_prefetch.time_like_to_ns("2025-11-11T12:00:00.000Z")
+            )
+            self.assertEqual(snapshot["files_touched"], 2)
+            self.assertEqual(snapshot["bytes_touched"], 768)
+            self.assertEqual(snapshot["new_files_touched"], 1)
+            self.assertEqual(snapshot["new_bytes_touched"], 512)
+
     def test_build_prefetch_backend_accepts_explicit_mode(self) -> None:
         backend = catalog_prefetch.build_prefetch_backend(mode="off")
         self.assertEqual(backend.name, "disabled")

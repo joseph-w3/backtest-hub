@@ -151,6 +151,63 @@ class TestRunWarmupCycleSerial(unittest.TestCase):
         self.assertEqual(summary["progress_events_per_second_median"], 150000.0)
         self.assertEqual(summary["progress_simulated_seconds_per_wall_second_median"], 31.5)
 
+    def test_summarize_progress_rows_reports_file_touch_deltas(self) -> None:
+        rows = [
+            {
+                "progress": {
+                    "last_progress_at": "2026-03-19T01:00:00.000000+00:00",
+                    "simulated_time": "2025-11-10T00:00:00.000000000Z",
+                    "streaming_probe": {"chunk_index": 10},
+                    "streaming_summary": {
+                        "events_seen": 2_000_000,
+                        "file_touch_files_total": 20,
+                        "file_touch_bytes_total": 10_000,
+                        "file_touch_files_touched": 10,
+                        "file_touch_bytes_touched": 4_000,
+                    },
+                }
+            },
+            {
+                "progress": {
+                    "last_progress_at": "2026-03-19T01:00:10.000000+00:00",
+                    "simulated_time": "2025-11-10T00:05:00.000000000Z",
+                    "streaming_probe": {"chunk_index": 12},
+                    "streaming_summary": {
+                        "events_seen": 3_500_000,
+                        "file_touch_files_total": 20,
+                        "file_touch_bytes_total": 10_000,
+                        "file_touch_files_touched": 12,
+                        "file_touch_bytes_touched": 4_500,
+                    },
+                }
+            },
+            {
+                "progress": {
+                    "last_progress_at": "2026-03-19T01:00:20.000000+00:00",
+                    "simulated_time": "2025-11-10T00:10:30.000000000Z",
+                    "streaming_probe": {"chunk_index": 14},
+                    "streaming_summary": {
+                        "events_seen": 5_000_000,
+                        "file_touch_files_total": 20,
+                        "file_touch_bytes_total": 10_000,
+                        "file_touch_files_touched": 15,
+                        "file_touch_bytes_touched": 5_100,
+                    },
+                }
+            },
+        ]
+
+        summary = run_warmup_cycle_serial.summarize_progress_rows(rows, skip_initial_chunks=10)
+
+        self.assertEqual(summary["progress_file_touch_delta_sample_count"], 2)
+        self.assertEqual(summary["progress_new_files_touched_total"], 5)
+        self.assertEqual(summary["progress_new_files_touched_median"], 2.5)
+        self.assertEqual(summary["progress_new_bytes_touched_total"], 1100)
+        self.assertEqual(summary["progress_new_bytes_touched_median"], 550.0)
+        self.assertEqual(summary["progress_file_touch_active_ratio"], 1.0)
+        self.assertEqual(summary["final_file_touch_files_total"], 20)
+        self.assertEqual(summary["final_file_touch_files_touched"], 15)
+
 
 if __name__ == "__main__":
     unittest.main()

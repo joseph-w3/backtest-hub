@@ -66,6 +66,7 @@ class CatalogWindowedFile:
     end_ns: int | None
     data_type: str | None
     instrument_id: str | None
+    size_bytes: int | None
 
 
 def build_windowed_files(file_paths: list[str]) -> list[CatalogWindowedFile]:
@@ -75,6 +76,12 @@ def build_windowed_files(file_paths: list[str]) -> list[CatalogWindowedFile]:
         start_ns, end_ns = parse_parquet_window_ns(path)
         data_type = path.parent.parent.name if path.parent.parent != path.parent else None
         instrument_id = path.parent.name if path.parent != path else None
+        size_bytes: int | None = None
+        try:
+            if path.is_file():
+                size_bytes = path.stat().st_size
+        except OSError:
+            size_bytes = None
         records.append(
             CatalogWindowedFile(
                 path=str(path),
@@ -82,6 +89,7 @@ def build_windowed_files(file_paths: list[str]) -> list[CatalogWindowedFile]:
                 end_ns=end_ns,
                 data_type=data_type,
                 instrument_id=instrument_id,
+                size_bytes=size_bytes,
             )
         )
     records.sort(
@@ -91,6 +99,67 @@ def build_windowed_files(file_paths: list[str]) -> list[CatalogWindowedFile]:
         )
     )
     return records
+
+
+class ReplayFileTouchObserver:
+    def __init__(self, *, files: list[CatalogWindowedFile]) -> None:
+        unique: dict[str, CatalogWindowedFile] = {}
+        for record in files:
+            unique.setdefault(record.path, record)
+        self._files = sorted(
+            unique.values(),
+            key=lambda record: (
+                record.start_ns if record.start_ns is not None else -1,
+                record.path,
+            ),
+        )
+        self._next_index = 0
+        self._files_total = len(self._files)
+        self._bytes_total = sum(int(record.size_bytes or 0) for record in self._files)
+        self._files_touched = 0
+        self._bytes_touched = 0
+        self._state = {
+            "cursor_time": None,
+            "files_total": self._files_total,
+            "bytes_total": self._bytes_total,
+            "files_touched": 0,
+            "bytes_touched": 0,
+            "new_files_touched": 0,
+            "new_bytes_touched": 0,
+            "remaining_files": self._files_total,
+            "remaining_bytes": self._bytes_total,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def advance(self, cursor_ns: int | None) -> dict:
+        new_files_touched = 0
+        new_bytes_touched = 0
+        if cursor_ns is not None:
+            while self._next_index < len(self._files):
+                record = self._files[self._next_index]
+                if record.start_ns is not None and record.start_ns > cursor_ns:
+                    break
+                self._next_index += 1
+                new_files_touched += 1
+                new_bytes_touched += int(record.size_bytes or 0)
+        self._files_touched += new_files_touched
+        self._bytes_touched += new_bytes_touched
+        self._state = {
+            "cursor_time": ns_to_iso(cursor_ns),
+            "files_total": self._files_total,
+            "bytes_total": self._bytes_total,
+            "files_touched": self._files_touched,
+            "bytes_touched": self._bytes_touched,
+            "new_files_touched": new_files_touched,
+            "new_bytes_touched": new_bytes_touched,
+            "remaining_files": self._files_total - self._files_touched,
+            "remaining_bytes": self._bytes_total - self._bytes_touched,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return dict(self._state)
+
+    def snapshot(self) -> dict:
+        return dict(self._state)
 
 
 class PrefetchBackend(Protocol):

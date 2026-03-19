@@ -295,6 +295,26 @@ def _progress_point(progress: dict[str, Any] | None) -> dict[str, Any] | None:
         "sim_time": sim_time,
         "chunk_index": int(chunk_index) if isinstance(chunk_index, int) else None,
         "events_seen": int(summary["events_seen"]) if isinstance(summary.get("events_seen"), int) else None,
+        "file_touch_files_touched": (
+            int(summary["file_touch_files_touched"])
+            if isinstance(summary.get("file_touch_files_touched"), int)
+            else None
+        ),
+        "file_touch_bytes_touched": (
+            int(summary["file_touch_bytes_touched"])
+            if isinstance(summary.get("file_touch_bytes_touched"), int)
+            else None
+        ),
+        "file_touch_files_total": (
+            int(summary["file_touch_files_total"])
+            if isinstance(summary.get("file_touch_files_total"), int)
+            else None
+        ),
+        "file_touch_bytes_total": (
+            int(summary["file_touch_bytes_total"])
+            if isinstance(summary.get("file_touch_bytes_total"), int)
+            else None
+        ),
     }
 
 
@@ -342,6 +362,20 @@ def _progress_delta_sample(
         "events_per_second": float(curr_events - prev_events) / wall_delta,
         "simulated_seconds_per_wall_second": sim_delta / wall_delta,
         "chunks_per_second": chunk_delta / wall_delta if chunk_delta is not None else 0.0,
+        "new_files_touched": (
+            point["file_touch_files_touched"] - previous_point["file_touch_files_touched"]
+            if isinstance(previous_point.get("file_touch_files_touched"), int)
+            and isinstance(point.get("file_touch_files_touched"), int)
+            and point["file_touch_files_touched"] >= previous_point["file_touch_files_touched"]
+            else None
+        ),
+        "new_bytes_touched": (
+            point["file_touch_bytes_touched"] - previous_point["file_touch_bytes_touched"]
+            if isinstance(previous_point.get("file_touch_bytes_touched"), int)
+            and isinstance(point.get("file_touch_bytes_touched"), int)
+            and point["file_touch_bytes_touched"] >= previous_point["file_touch_bytes_touched"]
+            else None
+        ),
     }
 
 
@@ -373,6 +407,12 @@ def summarize_progress_rows(
     *,
     skip_initial_chunks: int,
 ) -> dict[str, Any]:
+    progress_points = [
+        point
+        for row in progress_rows
+        if (point := _progress_point(row.get("progress"))) is not None
+    ]
+    last_progress_point = progress_points[-1] if progress_points else None
     probes = _collect_unique_chunk_probes(progress_rows)
     stable = [
         probe
@@ -398,6 +438,16 @@ def summarize_progress_rows(
     progress_events_per_second = [sample["events_per_second"] for sample in progress_deltas]
     progress_sim_per_wall = [sample["simulated_seconds_per_wall_second"] for sample in progress_deltas]
     progress_chunks_per_second = [sample["chunks_per_second"] for sample in progress_deltas]
+    progress_new_files_touched = [
+        int(sample["new_files_touched"])
+        for sample in progress_deltas
+        if isinstance(sample.get("new_files_touched"), (int, float))
+    ]
+    progress_new_bytes_touched = [
+        int(sample["new_bytes_touched"])
+        for sample in progress_deltas
+        if isinstance(sample.get("new_bytes_touched"), (int, float))
+    ]
     return {
         "unique_chunk_probe_count": len(probes),
         "stable_chunk_probe_count": len(stable),
@@ -415,6 +465,22 @@ def summarize_progress_rows(
         "progress_simulated_seconds_per_wall_second_median": statistics.median(progress_sim_per_wall) if progress_sim_per_wall else None,
         "progress_simulated_seconds_per_wall_second_p90": _percentile(progress_sim_per_wall, 0.9),
         "progress_chunks_per_second_median": statistics.median(progress_chunks_per_second) if progress_chunks_per_second else None,
+        "progress_file_touch_delta_sample_count": len(progress_new_files_touched),
+        "progress_new_files_touched_total": sum(progress_new_files_touched) if progress_new_files_touched else None,
+        "progress_new_files_touched_median": statistics.median(progress_new_files_touched) if progress_new_files_touched else None,
+        "progress_new_files_touched_p90": _percentile(progress_new_files_touched, 0.9),
+        "progress_new_bytes_touched_total": sum(progress_new_bytes_touched) if progress_new_bytes_touched else None,
+        "progress_new_bytes_touched_median": statistics.median(progress_new_bytes_touched) if progress_new_bytes_touched else None,
+        "progress_new_bytes_touched_p90": _percentile(progress_new_bytes_touched, 0.9),
+        "progress_file_touch_active_ratio": (
+            sum(1 for value in progress_new_files_touched if value > 0) / len(progress_new_files_touched)
+            if progress_new_files_touched
+            else None
+        ),
+        "final_file_touch_files_total": last_progress_point.get("file_touch_files_total") if last_progress_point is not None else None,
+        "final_file_touch_bytes_total": last_progress_point.get("file_touch_bytes_total") if last_progress_point is not None else None,
+        "final_file_touch_files_touched": last_progress_point.get("file_touch_files_touched") if last_progress_point is not None else None,
+        "final_file_touch_bytes_touched": last_progress_point.get("file_touch_bytes_touched") if last_progress_point is not None else None,
     }
 
 

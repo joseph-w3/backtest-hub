@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import threading
 import types
@@ -97,6 +98,22 @@ def _load_run_backtest() -> types.ModuleType:
 
 
 class TestRunBacktestStatusPayload(unittest.TestCase):
+    @staticmethod
+    def _expected_streaming_summary() -> dict:
+        return {
+            "chunks_seen": 0,
+            "events_seen": 0,
+            "file_touch_files_total": None,
+            "file_touch_bytes_total": None,
+            "file_touch_files_touched": 0,
+            "file_touch_bytes_touched": 0,
+            "file_touch_new_files_last_advance": 0,
+            "file_touch_new_bytes_last_advance": 0,
+            "file_touch_remaining_files": None,
+            "file_touch_remaining_bytes": None,
+            "file_touch_progress_samples_with_new_files": 0,
+        }
+
     def test_status_payload_allows_strategy_bundle(self) -> None:
         added_modules = _install_quant_trade_stubs()
         try:
@@ -122,7 +139,7 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
             self.assertIsNone(payload["node_probe"])
             self.assertIsNone(payload["streaming_probe"])
             self.assertIsNone(payload["prefetch_probe"])
-            self.assertEqual(payload["streaming_summary"], {"chunks_seen": 0, "events_seen": 0})
+            self.assertEqual(payload["streaming_summary"], self._expected_streaming_summary())
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
@@ -168,13 +185,13 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
                 self.assertEqual(payload["phase"], "initializing")
                 self.assertIsNone(payload["node_probe"])
                 self.assertIsNone(payload["prefetch_probe"])
-                self.assertEqual(payload["streaming_summary"], {"chunks_seen": 0, "events_seen": 0})
+                self.assertEqual(payload["streaming_summary"], self._expected_streaming_summary())
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
                 sys.modules.pop(name, None)
 
-    def test_build_prefetch_probe_payload_preserves_updated_at(self) -> None:
+    def test_build_prefetch_probe_payload_preserves_updated_at_and_disable_reason(self) -> None:
         added_modules = _install_quant_trade_stubs()
         try:
             run_backtest = _load_run_backtest()
@@ -193,8 +210,10 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
                 last_batch_files=1,
                 last_batch_bytes=1024,
                 last_error=None,
+                disable_reason="disabled for test",
             )
             self.assertEqual(payload["updated_at"], "2026-03-19T00:00:00Z")
+            self.assertEqual(payload["disable_reason"], "disabled for test")
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
@@ -260,7 +279,7 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             self.assertEqual(run_backtest._catalog_prewarm_threads({}), 50)
             self.assertEqual(
                 run_backtest._prefetch_runtime_settings({}),
-                (None, 72, 4),
+                (None, 72, 4, None),
             )
             self.assertFalse(run_backtest._optimize_file_loading_enabled({}))
             self.assertTrue(
@@ -302,9 +321,48 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
                         }
                     }
                 ),
-                ("off", 48, 3),
+                ("off", 48, 3, None),
             )
         finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_prefetch_runtime_settings_disable_local_read_when_prewarm_enabled(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        original_backend = os.environ.get("BACKTEST_PREFETCH_BACKEND")
+        try:
+            run_backtest = _load_run_backtest()
+            os.environ.pop("BACKTEST_PREFETCH_BACKEND", None)
+            backend, ahead_hours, max_files_per_batch, disable_reason = (
+                run_backtest._prefetch_runtime_settings(
+                    {
+                        "catalog_controls": {
+                            "prewarm_before_run": True,
+                            "prefetch_backend": "local-read",
+                        }
+                    }
+                )
+            )
+            self.assertEqual((backend, ahead_hours, max_files_per_batch), ("off", 72, 4))
+            self.assertIn("prewarm_before_run disables replay prefetch backend", disable_reason)
+
+            backend, ahead_hours, max_files_per_batch, disable_reason = (
+                run_backtest._prefetch_runtime_settings(
+                    {
+                        "catalog_controls": {
+                            "prewarm_before_run": True,
+                        }
+                    }
+                )
+            )
+            self.assertEqual((backend, ahead_hours, max_files_per_batch), ("off", 72, 4))
+            self.assertIn("local-read", disable_reason)
+        finally:
+            if original_backend is None:
+                os.environ.pop("BACKTEST_PREFETCH_BACKEND", None)
+            else:
+                os.environ["BACKTEST_PREFETCH_BACKEND"] = original_backend
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
                 sys.modules.pop(name, None)
@@ -403,6 +461,107 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             self.assertEqual(controller.ahead_hours, 48)
             self.assertEqual(controller.max_files_per_batch, 3)
             self.assertEqual(controller.advance_calls, [123])
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
+    def test_run_streaming_disables_local_read_prefetch_when_prewarm_enabled(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+
+            class FakeSession:
+                def __init__(self, chunk_size: int) -> None:
+                    self.chunk_size = chunk_size
+
+                def to_query_result(self) -> list[object]:
+                    return []
+
+            class FakeController:
+                instances: list["FakeController"] = []
+
+                def __init__(self, *, files, backend, ahead_hours, max_files_per_batch) -> None:
+                    self.files = files
+                    self.backend = backend
+                    self.ahead_hours = ahead_hours
+                    self.max_files_per_batch = max_files_per_batch
+                    self.__class__.instances.append(self)
+
+                def advance(self, cursor_ns):
+                    return {
+                        "stage": "disabled",
+                        "backend": self.backend,
+                        "ahead_hours": self.ahead_hours,
+                        "max_files_per_batch": self.max_files_per_batch,
+                        "updated_at": "2026-03-19T00:00:00Z",
+                    }
+
+                def snapshot(self):
+                    return {
+                        "stage": "disabled",
+                        "backend": self.backend,
+                        "ahead_hours": self.ahead_hours,
+                        "max_files_per_batch": self.max_files_per_batch,
+                        "updated_at": "2026-03-19T00:00:01Z",
+                    }
+
+                def close(self) -> None:
+                    return None
+
+            observed_prefetch_probes: list[dict] = []
+
+            run_backtest.DataBackendSession = FakeSession
+            run_backtest.ReplayPrefetchController = FakeController
+            run_backtest.build_windowed_files = lambda files: list(files)
+            run_backtest.build_prefetch_backend = lambda mode: f"backend:{mode}"
+            run_backtest.time_like_to_ns = lambda value: 123
+            run_backtest._read_current_rss_mb = lambda: 1.0
+
+            backtest_node_mod = sys.modules["quant_trade_v1.backtest.node"]
+            backtest_node_mod.Bar = type("Bar", (), {})
+            backtest_node_mod.DataBackendSession = FakeSession
+            backtest_node_mod.capsule_to_list = lambda chunk: list(chunk)
+            backtest_node_mod.get_instrument_ids = lambda config: []
+            backtest_node_mod.max_date = lambda a, b: None
+            backtest_node_mod.min_date = lambda a, b: None
+
+            node = run_backtest._InstrumentOverrideBacktestNode(
+                configs=[],
+                instruments=[],
+                run_spec={
+                    "catalog_controls": {
+                        "prewarm_before_run": True,
+                        "prefetch_backend": "local-read",
+                    }
+                },
+                prefetch_probe_callback=lambda **payload: observed_prefetch_probes.append(payload),
+            )
+
+            class FakeEngine:
+                def add_data(self, events) -> None:
+                    raise AssertionError("no events expected for empty session")
+
+                def end(self) -> None:
+                    return None
+
+            node._run_streaming(
+                run_config_id="rc1",
+                engine=FakeEngine(),
+                data_configs=[],
+                chunk_size=10,
+                start="2025-11-10T00:00:00.000Z",
+                end="2025-11-11T00:00:00.000Z",
+            )
+
+            self.assertEqual(len(FakeController.instances), 1)
+            controller = FakeController.instances[0]
+            self.assertEqual(controller.backend, "backend:off")
+            self.assertTrue(observed_prefetch_probes)
+            self.assertIn(
+                "prewarm_before_run disables replay prefetch backend",
+                observed_prefetch_probes[0]["disable_reason"],
+            )
         finally:
             sys.modules.pop("run_backtest_under_test", None)
             for name in added_modules:
@@ -676,6 +835,16 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
                 chunk_span_seconds=600.0,
                 events_per_second=154.918667,
                 simulated_seconds_per_wall_second=1.858249,
+                file_touch_summary={
+                    "files_total": 12,
+                    "bytes_total": 4096,
+                    "files_touched": 3,
+                    "bytes_touched": 1024,
+                    "new_files_touched": 1,
+                    "new_bytes_touched": 256,
+                    "remaining_files": 9,
+                    "remaining_bytes": 3072,
+                },
             )
 
             self.assertEqual(payload["chunk_index"], 7)
@@ -693,6 +862,7 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
             self.assertEqual(payload["chunk_span_seconds"], 600.0)
             self.assertEqual(payload["events_per_second"], 154.918667)
             self.assertEqual(payload["simulated_seconds_per_wall_second"], 1.858249)
+            self.assertEqual(payload["file_touch_summary"]["new_files_touched"], 1)
             self.assertIn("updated_at", payload)
         finally:
             sys.modules.pop("run_backtest_under_test", None)

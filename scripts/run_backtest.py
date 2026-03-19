@@ -60,6 +60,10 @@ try:
     from scripts.prewarm_catalog_cache import run_warmup
     from scripts.prewarm_catalog_cache import write_manifest
     from scripts.catalog_prefetch import time_like_to_ns
+    try:
+        from scripts.catalog_prefetch import ReplayFileTouchObserver as _ImportedReplayFileTouchObserver
+    except ImportError:
+        _ImportedReplayFileTouchObserver = None
 except ImportError:  # pragma: no cover - direct script execution path
     from catalog_controls import CatalogControls
     from catalog_controls import resolve_catalog_controls
@@ -71,6 +75,93 @@ except ImportError:  # pragma: no cover - direct script execution path
     from prewarm_catalog_cache import run_warmup
     from prewarm_catalog_cache import write_manifest
     from catalog_prefetch import time_like_to_ns
+    try:
+        from catalog_prefetch import ReplayFileTouchObserver as _ImportedReplayFileTouchObserver
+    except ImportError:
+        _ImportedReplayFileTouchObserver = None
+
+
+class _ReplayFileTouchObserverFallback:
+    def __init__(self, *, files: list[object]) -> None:
+        unique_paths: set[str] = set()
+        normalized: list[object] = []
+        for record in files:
+            path = getattr(record, "path", None)
+            if not isinstance(path, str) or path in unique_paths:
+                continue
+            unique_paths.add(path)
+            normalized.append(record)
+        self._files = sorted(
+            normalized,
+            key=lambda record: (
+                getattr(record, "start_ns", None) if getattr(record, "start_ns", None) is not None else -1,
+                getattr(record, "path", ""),
+            ),
+        )
+        self._next_index = 0
+        self._files_total = len(self._files)
+        self._bytes_total = sum(self._record_size_bytes(record) for record in self._files)
+        self._files_touched = 0
+        self._bytes_touched = 0
+        self._state = {
+            "cursor_time": None,
+            "files_total": self._files_total,
+            "bytes_total": self._bytes_total,
+            "files_touched": 0,
+            "bytes_touched": 0,
+            "new_files_touched": 0,
+            "new_bytes_touched": 0,
+            "remaining_files": self._files_total,
+            "remaining_bytes": self._bytes_total,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _record_size_bytes(record: object) -> int:
+        size_bytes = getattr(record, "size_bytes", None)
+        if isinstance(size_bytes, int):
+            return size_bytes
+        path = getattr(record, "path", None)
+        if not isinstance(path, str):
+            return 0
+        try:
+            return Path(path).stat().st_size
+        except OSError:
+            return 0
+
+    def advance(self, cursor_ns: int | None) -> dict:
+        new_files_touched = 0
+        new_bytes_touched = 0
+        if cursor_ns is not None:
+            while self._next_index < len(self._files):
+                record = self._files[self._next_index]
+                start_ns = getattr(record, "start_ns", None)
+                if start_ns is not None and start_ns > cursor_ns:
+                    break
+                self._next_index += 1
+                new_files_touched += 1
+                new_bytes_touched += self._record_size_bytes(record)
+        self._files_touched += new_files_touched
+        self._bytes_touched += new_bytes_touched
+        self._state = {
+            "cursor_time": ns_to_iso(cursor_ns),
+            "files_total": self._files_total,
+            "bytes_total": self._bytes_total,
+            "files_touched": self._files_touched,
+            "bytes_touched": self._bytes_touched,
+            "new_files_touched": new_files_touched,
+            "new_bytes_touched": new_bytes_touched,
+            "remaining_files": self._files_total - self._files_touched,
+            "remaining_bytes": self._bytes_total - self._bytes_touched,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return dict(self._state)
+
+    def snapshot(self) -> dict:
+        return dict(self._state)
+
+
+ReplayFileTouchObserver = _ImportedReplayFileTouchObserver or _ReplayFileTouchObserverFallback
 
 
 def build_catalog_config() -> dict:
@@ -748,6 +839,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         chunk_span_seconds: float | None = None,
         events_per_second: float | None = None,
         simulated_seconds_per_wall_second: float | None = None,
+        file_touch_summary: dict | None = None,
     ) -> None:
         if self._streaming_probe_callback is None:
             return
@@ -770,6 +862,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             chunk_span_seconds=chunk_span_seconds,
             events_per_second=events_per_second,
             simulated_seconds_per_wall_second=simulated_seconds_per_wall_second,
+            file_touch_summary=file_touch_summary,
         )
 
     def _emit_node_probe(
@@ -847,6 +940,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
         last_batch_files: int | None = None,
         last_batch_bytes: int | None = None,
         last_error: str | None = None,
+        disable_reason: str | None = None,
     ) -> None:
         if getattr(self, "_prefetch_probe_callback", None) is None:
             return
@@ -865,6 +959,7 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             last_batch_files=last_batch_files,
             last_batch_bytes=last_batch_bytes,
             last_error=last_error,
+            disable_reason=disable_reason,
         )
 
     def run(self) -> list[object]:
@@ -1072,21 +1167,43 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
             stage="after_prepare_queries",
             rss_before_add_mb=_read_current_rss_mb(),
         )
+        (
+            prefetch_backend_mode,
+            prefetch_ahead_hours,
+            prefetch_max_files_per_batch,
+            prefetch_disable_reason,
+        ) = (
+            _prefetch_runtime_settings(self._run_spec)
+        )
+        if prefetch_disable_reason is not None:
+            print(f"[PREFETCH] {prefetch_disable_reason}")
+        windowed_files = build_windowed_files(prefetch_candidates)
+        file_touch_observer = (
+            ReplayFileTouchObserver(files=windowed_files)
+            if not windowed_files or hasattr(windowed_files[0], "path")
+            else None
+        )
+        initial_file_touch_summary = (
+            file_touch_observer.advance(time_like_to_ns(start))
+            if file_touch_observer is not None
+            else None
+        )
         self._emit_streaming_probe(
             chunk_index=-1,
             stage="before_query_result",
             rss_before_add_mb=_read_current_rss_mb(),
-        )
-        prefetch_backend_mode, prefetch_ahead_hours, prefetch_max_files_per_batch = (
-            _prefetch_runtime_settings(self._run_spec)
+            file_touch_summary=initial_file_touch_summary,
         )
         prefetch_controller = ReplayPrefetchController(
-            files=build_windowed_files(prefetch_candidates),
+            files=windowed_files,
             backend=build_prefetch_backend(mode=prefetch_backend_mode),
             ahead_hours=prefetch_ahead_hours,
             max_files_per_batch=prefetch_max_files_per_batch,
         )
-        self._emit_prefetch_probe(**prefetch_controller.advance(time_like_to_ns(start)))
+        self._emit_prefetch_probe(
+            **prefetch_controller.advance(time_like_to_ns(start)),
+            disable_reason=prefetch_disable_reason,
+        )
         try:
             for chunk_index, chunk in enumerate(session.to_query_result()):
                 chunk_started_at = time.perf_counter()
@@ -1141,8 +1258,14 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
                 rss_after_clear_mb = _read_current_rss_mb()
                 chunk_wall_ms = round((time.perf_counter() - chunk_started_at) * 1000, 2)
                 chunk_span_seconds = _chunk_span_seconds(chunk_start_ns, chunk_end_ns)
+                file_touch_summary = (
+                    file_touch_observer.advance(chunk_end_ns or chunk_start_ns)
+                    if file_touch_observer is not None
+                    else None
+                )
                 self._emit_prefetch_probe(
-                    **prefetch_controller.advance(chunk_end_ns or chunk_start_ns)
+                    **prefetch_controller.advance(chunk_end_ns or chunk_start_ns),
+                    disable_reason=prefetch_disable_reason,
                 )
                 self._emit_streaming_probe(
                     chunk_index=chunk_index,
@@ -1165,9 +1288,13 @@ class _InstrumentOverrideBacktestNode(BacktestNode):
                     simulated_seconds_per_wall_second=_per_second(
                         chunk_span_seconds, chunk_wall_ms
                     ),
+                    file_touch_summary=file_touch_summary,
                 )
         finally:
-            self._emit_prefetch_probe(**prefetch_controller.snapshot())
+            self._emit_prefetch_probe(
+                **prefetch_controller.snapshot(),
+                disable_reason=prefetch_disable_reason,
+            )
             prefetch_controller.close()
 
         engine.end()
@@ -1354,7 +1481,22 @@ def _catalog_prewarm_threads(run_spec: dict) -> int:
     return _catalog_controls(run_spec).prewarm_threads
 
 
-def _prefetch_runtime_settings(run_spec: dict) -> tuple[str | None, int, int]:
+_PREWARM_LOCAL_READ_PREFETCH_DISABLE_REASON = (
+    "catalog_controls.prewarm_before_run disables replay prefetch backend "
+    "'local-read' because full-file background reads against the same worker-local "
+    "catalog mount have triggered JuiceFS I/O errors after prewarm; using backend "
+    "'off' instead."
+)
+
+
+def _resolved_prefetch_backend_mode(run_spec: dict) -> str:
+    controls = _catalog_controls(run_spec)
+    if controls.prefetch_backend is not None:
+        return controls.prefetch_backend.strip().lower()
+    return os.environ.get("BACKTEST_PREFETCH_BACKEND", "local-read").strip().lower()
+
+
+def _prefetch_runtime_settings(run_spec: dict) -> tuple[str | None, int, int, str | None]:
     controls = _catalog_controls(run_spec)
     ahead_hours = (
         controls.prefetch_ahead_hours
@@ -1366,7 +1508,16 @@ def _prefetch_runtime_settings(run_spec: dict) -> tuple[str | None, int, int]:
         if controls.prefetch_max_files_per_batch is not None
         else int(os.environ.get("BACKTEST_PREFETCH_MAX_FILES_PER_BATCH", "4"))
     )
-    return controls.prefetch_backend, ahead_hours, max_files_per_batch
+    disable_reason: str | None = None
+    effective_backend = controls.prefetch_backend
+    # `local-read` prefetch performs full file reads on the same mount that replay
+    # is actively consuming. After a launch-time JuiceFS warmup, that combination
+    # has triggered mount-layer I/O errors on worker-local catalogs, so keep the
+    # runtime on the safe path until the backend is redesigned.
+    if controls.prewarm_before_run and _resolved_prefetch_backend_mode(run_spec) == "local-read":
+        effective_backend = "off"
+        disable_reason = _PREWARM_LOCAL_READ_PREFETCH_DISABLE_REASON
+    return effective_backend, ahead_hours, max_files_per_batch, disable_reason
 
 
 def _spread_arb_v5_runtime_universe_run(run_spec: dict) -> bool:
@@ -1468,6 +1619,15 @@ def _build_status_payload(backtest_id: str, run_spec: dict) -> dict:
         "streaming_summary": {
             "chunks_seen": 0,
             "events_seen": 0,
+            "file_touch_files_total": None,
+            "file_touch_bytes_total": None,
+            "file_touch_files_touched": 0,
+            "file_touch_bytes_touched": 0,
+            "file_touch_new_files_last_advance": 0,
+            "file_touch_new_bytes_last_advance": 0,
+            "file_touch_remaining_files": None,
+            "file_touch_remaining_bytes": None,
+            "file_touch_progress_samples_with_new_files": 0,
         },
     }
 
@@ -1598,6 +1758,7 @@ def _build_streaming_probe_payload(
     chunk_span_seconds: float | None = None,
     events_per_second: float | None = None,
     simulated_seconds_per_wall_second: float | None = None,
+    file_touch_summary: dict | None = None,
 ) -> dict:
     payload = {
         "chunk_index": chunk_index,
@@ -1622,6 +1783,7 @@ def _build_streaming_probe_payload(
         "rss_delta_run_mb": _rss_delta_mb(rss_after_run_mb, rss_after_add_mb),
         "rss_delta_clear_mb": _rss_delta_mb(rss_after_clear_mb, rss_after_run_mb),
         "rss_delta_chunk_mb": _rss_delta_mb(rss_after_clear_mb, rss_before_add_mb),
+        "file_touch_summary": file_touch_summary,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     return payload
@@ -1699,6 +1861,7 @@ def _build_prefetch_probe_payload(
     last_batch_files: int | None,
     last_batch_bytes: int | None,
     last_error: str | None,
+    disable_reason: str | None,
 ) -> dict:
     return {
         "stage": stage,
@@ -1714,6 +1877,7 @@ def _build_prefetch_probe_payload(
         "last_batch_files": last_batch_files,
         "last_batch_bytes": last_batch_bytes,
         "last_error": last_error,
+        "disable_reason": disable_reason,
         "updated_at": updated_at or datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1937,7 +2101,19 @@ def main() -> int:
     status_lock = threading.Lock()
     stdout_path_raw = os.environ.get("BACKTEST_STDOUT_PATH")
     stdout_path = Path(stdout_path_raw).expanduser() if stdout_path_raw else None
-    streaming_summary = {"chunks_seen": 0, "events_seen": 0}
+    streaming_summary = {
+        "chunks_seen": 0,
+        "events_seen": 0,
+        "file_touch_files_total": None,
+        "file_touch_bytes_total": None,
+        "file_touch_files_touched": 0,
+        "file_touch_bytes_touched": 0,
+        "file_touch_new_files_last_advance": 0,
+        "file_touch_new_bytes_last_advance": 0,
+        "file_touch_remaining_files": None,
+        "file_touch_remaining_bytes": None,
+        "file_touch_progress_samples_with_new_files": 0,
+    }
 
     def _on_streaming_probe(
         *,
@@ -1959,10 +2135,34 @@ def main() -> int:
         chunk_span_seconds: float | None = None,
         events_per_second: float | None = None,
         simulated_seconds_per_wall_second: float | None = None,
+        file_touch_summary: dict | None = None,
     ) -> None:
         if stage == "after_materialize" and event_count is not None:
             streaming_summary["chunks_seen"] = chunk_index + 1
             streaming_summary["events_seen"] += event_count
+        if isinstance(file_touch_summary, dict):
+            streaming_summary["file_touch_files_total"] = file_touch_summary.get("files_total")
+            streaming_summary["file_touch_bytes_total"] = file_touch_summary.get("bytes_total")
+            streaming_summary["file_touch_files_touched"] = file_touch_summary.get(
+                "files_touched", 0
+            )
+            streaming_summary["file_touch_bytes_touched"] = file_touch_summary.get(
+                "bytes_touched", 0
+            )
+            streaming_summary["file_touch_new_files_last_advance"] = file_touch_summary.get(
+                "new_files_touched", 0
+            )
+            streaming_summary["file_touch_new_bytes_last_advance"] = file_touch_summary.get(
+                "new_bytes_touched", 0
+            )
+            streaming_summary["file_touch_remaining_files"] = file_touch_summary.get(
+                "remaining_files"
+            )
+            streaming_summary["file_touch_remaining_bytes"] = file_touch_summary.get(
+                "remaining_bytes"
+            )
+            if int(file_touch_summary.get("new_files_touched", 0) or 0) > 0:
+                streaming_summary["file_touch_progress_samples_with_new_files"] += 1
         _write_status_snapshot(
             status_path=status_path,
             status=status,
@@ -1988,6 +2188,7 @@ def main() -> int:
                     chunk_span_seconds=chunk_span_seconds,
                     events_per_second=events_per_second,
                     simulated_seconds_per_wall_second=simulated_seconds_per_wall_second,
+                    file_touch_summary=file_touch_summary,
                 ),
                 "streaming_summary": dict(streaming_summary),
             },
@@ -2077,6 +2278,7 @@ def main() -> int:
         last_batch_files: int | None = None,
         last_batch_bytes: int | None = None,
         last_error: str | None = None,
+        disable_reason: str | None = None,
     ) -> None:
         _write_status_snapshot(
             status_path=status_path,
@@ -2099,6 +2301,7 @@ def main() -> int:
                     last_batch_files=last_batch_files,
                     last_batch_bytes=last_batch_bytes,
                     last_error=last_error,
+                    disable_reason=disable_reason,
                 ),
             },
         )

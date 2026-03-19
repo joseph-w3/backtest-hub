@@ -101,3 +101,15 @@ Design note:
 - The runner talks to a generic prefetch backend, not directly to `juicefs warmup`.
 - Today the default backend is `local-read` because it works for the current mounted-file path.
 - If the data pipeline later moves to direct B2/S3 access, we should add a new backend implementation behind the same runner/control-plane API instead of changing backtest orchestration semantics.
+
+Current safety rule:
+
+- If `catalog_controls.prewarm_before_run=true`, the runner now forces replay-time
+  `local-read` prefetch to `off` at runtime, even if the backend was selected
+  implicitly through the default environment.
+- Reason: on worker-local JuiceFS catalog mounts, the combination of launch-time
+  `juicefs warmup` plus replay-time full-file background reads has already
+  triggered mount-layer `Input/output error (os error 5)` failures during replay.
+- This guard keeps the worker on the safe path. A future combined-mode
+  implementation needs a different backend design, not more concurrent full-file
+  reads on the same mounted catalog path.
