@@ -313,6 +313,7 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
                         "backend": self.backend,
                         "ahead_hours": self.ahead_hours,
                         "max_files_per_batch": self.max_files_per_batch,
+                        "updated_at": "2026-03-19T00:00:00Z",
                     }
 
                 def snapshot(self):
@@ -321,6 +322,7 @@ class TestRunBacktestMarketDataProfile(unittest.TestCase):
                         "backend": self.backend,
                         "ahead_hours": self.ahead_hours,
                         "max_files_per_batch": self.max_files_per_batch,
+                        "updated_at": "2026-03-19T00:00:01Z",
                     }
 
                 def close(self) -> None:
