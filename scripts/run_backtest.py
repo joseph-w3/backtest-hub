@@ -1689,6 +1689,7 @@ def _build_prefetch_probe_payload(
     backend: str,
     ahead_hours: int,
     max_files_per_batch: int,
+    updated_at: str | None,
     cursor_time: str | None,
     window_end_time: str | None,
     pending_files: int | None,
@@ -1713,7 +1714,7 @@ def _build_prefetch_probe_payload(
         "last_batch_files": last_batch_files,
         "last_batch_bytes": last_batch_bytes,
         "last_error": last_error,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": updated_at or datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -2066,6 +2067,7 @@ def main() -> int:
         backend: str,
         ahead_hours: int,
         max_files_per_batch: int,
+        updated_at: str | None = None,
         cursor_time: str | None = None,
         window_end_time: str | None = None,
         pending_files: int | None = None,
@@ -2087,6 +2089,7 @@ def main() -> int:
                     backend=backend,
                     ahead_hours=ahead_hours,
                     max_files_per_batch=max_files_per_batch,
+                    updated_at=updated_at,
                     cursor_time=cursor_time,
                     window_end_time=window_end_time,
                     pending_files=pending_files,

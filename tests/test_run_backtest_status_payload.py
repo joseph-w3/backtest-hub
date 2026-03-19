@@ -174,6 +174,32 @@ class TestRunBacktestStatusPayload(unittest.TestCase):
             for name in added_modules:
                 sys.modules.pop(name, None)
 
+    def test_build_prefetch_probe_payload_preserves_updated_at(self) -> None:
+        added_modules = _install_quant_trade_stubs()
+        try:
+            run_backtest = _load_run_backtest()
+            payload = run_backtest._build_prefetch_probe_payload(
+                stage="advance",
+                backend="local-read",
+                ahead_hours=48,
+                max_files_per_batch=3,
+                updated_at="2026-03-19T00:00:00Z",
+                cursor_time="2025-11-10T00:00:00Z",
+                window_end_time="2025-11-13T00:00:00Z",
+                pending_files=1,
+                prefetched_files=2,
+                requested_files_total=3,
+                completed_files_total=2,
+                last_batch_files=1,
+                last_batch_bytes=1024,
+                last_error=None,
+            )
+            self.assertEqual(payload["updated_at"], "2026-03-19T00:00:00Z")
+        finally:
+            sys.modules.pop("run_backtest_under_test", None)
+            for name in added_modules:
+                sys.modules.pop(name, None)
+
 
 class TestRunBacktestMarketDataProfile(unittest.TestCase):
     def test_validate_run_spec_accepts_catalog_controls(self) -> None:
