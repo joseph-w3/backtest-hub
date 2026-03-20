@@ -2,25 +2,112 @@ name: CICD
 
 on:
   push:
-    branches: ['main']
+    branches: ["main"]
 
 jobs:
   deploy-backend:
-    uses: TBDTBD-git/terraform_config/.github/workflows/reusable-deploy.yml@main
-    with:
-      server_host: "neo-test1"
-      server_user: "root"
-      source_path: "."
-      target_path: "/home/trade/backtest-hub/"
-      commands: |
-        set -e
-        cd /home/trade/backtest-hub/
-        docker-compose down
-        docker-compose build --no-cache
-        docker-compose up -d
-        docker builder prune -f && docker image prune -f
-    secrets:
-      SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY_NEO_TEST1_SERVER }}
-      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-      SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify server mapping
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY_NEO_TEST1_SERVER }}
+        run: |
+          if [ -z "$SSH_KEY" ]; then
+            echo "SSH key for neo-test1 is not configured"
+            exit 1
+          fi
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          version: latest
+
+      - name: Wait for connectivity
+        run: |
+          echo "Waiting for connectivity to neo-test1..."
+          timeout 2m bash -c 'until tailscale ping -c 1 neo-test1 | grep "pong"; do echo "Still waiting..."; sleep 5; done'
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY_NEO_TEST1_SERVER }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H neo-test1 >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Ensure rsync exists on remote
+        run: |
+          ssh -o StrictHostKeyChecking=no root@neo-test1 << 'RSYNC_CHECK_EOF'
+          set -e
+          if command -v rsync >/dev/null 2>&1; then
+            exit 0
+          fi
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y rsync
+            exit 0
+          fi
+          if command -v yum >/dev/null 2>&1; then
+            yum install -y rsync
+            exit 0
+          fi
+          if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache rsync
+            exit 0
+          fi
+          echo "No supported package manager found for rsync install"
+          exit 1
+          RSYNC_CHECK_EOF
+
+      - name: Sync repository contents
+        run: |
+          ssh -o StrictHostKeyChecking=no root@neo-test1 "mkdir -p /home/trade/backtest-hub/"
+          rsync -avz \
+            -e "ssh -o StrictHostKeyChecking=no" \
+            ./ \
+            root@neo-test1:/home/trade/backtest-hub/
+
+      - name: Deploy on remote
+        run: |
+          ssh -o StrictHostKeyChecking=no root@neo-test1 << 'DEPLOY_EOF'
+          set -e
+          cd /home/trade/backtest-hub/
+          docker-compose down
+          docker-compose build --no-cache
+          docker-compose up -d
+          docker builder prune -f && docker image prune -f
+          DEPLOY_EOF
+
+      - name: Slack notification success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ✅ *Deploy Success*
+            📦 Repo: `${{ github.repository }}`
+            🖥️ Server: `neo-test1`
+            🌿 Branch: `${{ github.ref_name }}`
+            🧑 Author: `${{ github.actor }}`
+            🔗 Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Slack notification failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          slack-message: |
+            ❌ *Deploy Failed*
+            📦 Repo: `${{ github.repository }}`
+            🖥️ Server: `neo-test1`
+            🌿 Branch: `${{ github.ref_name }}`
+            🧑 Author: `${{ github.actor }}`
+            🔗 Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            <@U09V8T5PN6B>
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
