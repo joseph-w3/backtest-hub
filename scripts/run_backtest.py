@@ -59,6 +59,7 @@ try:
     from scripts.prewarm_catalog_cache import build_manifest
     from scripts.prewarm_catalog_cache import run_warmup
     from scripts.prewarm_catalog_cache import write_manifest
+    from scripts.runtime_paths import normalize_backtest_runtime_paths
     from scripts.catalog_prefetch import time_like_to_ns
     try:
         from scripts.catalog_prefetch import ReplayFileTouchObserver as _ImportedReplayFileTouchObserver
@@ -74,6 +75,7 @@ except ImportError:  # pragma: no cover - direct script execution path
     from prewarm_catalog_cache import build_manifest
     from prewarm_catalog_cache import run_warmup
     from prewarm_catalog_cache import write_manifest
+    from runtime_paths import normalize_backtest_runtime_paths
     from catalog_prefetch import time_like_to_ns
     try:
         from catalog_prefetch import ReplayFileTouchObserver as _ImportedReplayFileTouchObserver
@@ -2647,6 +2649,23 @@ def main() -> int:
 
         strategy_config = dict(run_spec["strategy_config"])
         book_type = DEFAULT_BOOK_TYPE
+        runtime_root = log_dir / "runtime"
+        strategy_config, runtime_path_overrides = normalize_backtest_runtime_paths(
+            strategy_config,
+            runtime_root=runtime_root,
+        )
+        if runtime_path_overrides:
+            runtime_root.mkdir(parents=True, exist_ok=True)
+            _write_status_snapshot(
+                status_path=status_path,
+                status=status,
+                status_lock=status_lock,
+                stdout_path=stdout_path,
+                updates={
+                    "runtime_root": runtime_root.as_posix(),
+                    "runtime_path_overrides": runtime_path_overrides,
+                },
+            )
 
         liquidity_consumption = run_spec.get("liquidity_consumption", False)
         trade_execution = run_spec.get("trade_execution", False)
