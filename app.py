@@ -87,11 +87,10 @@ async def _recover_submitted_tasks() -> None:
                     try:
                         status_resp = await asyncio.to_thread(fetch_backtest_status, base_url, bid)
                         worker_status = status_resp.get("status")
-                        _TERMINAL_STATUSES = {"completed", "succeeded", "failed", "terminated", "stopped"}
                         if worker_status == "running":
                             store.upsert_run(bid, {"status": "running"})
                             logger.info("recovered_orphan_task_running id=%s worker_status=%s", bid, worker_status)
-                        elif worker_status in _TERMINAL_STATUSES:
+                        elif worker_status in WORKER_TERMINAL_STATUSES:
                             if worker_status in ("terminated", "stopped"):
                                 final_status = "failed"
                             elif worker_status == "succeeded":
@@ -333,6 +332,8 @@ INFLIGHT_COUNTS: dict[str, int] = {}
 # scheduler decisions should rely on host memory_used/free and not double count
 # the same run from SQLite.
 ACTIVE_RUN_STATUSES = ("submitted",)
+RECONCILEABLE_RUN_STATUSES = {"submitted", "running", "stopping"}
+WORKER_TERMINAL_STATUSES = {"completed", "succeeded", "failed", "terminated", "stopped"}
 
 
 def utc_now() -> str:
@@ -685,6 +686,81 @@ def require_api_key(api_key: str | None) -> None:
 def update_mapping(backtest_id: str, updates: dict[str, Any]) -> None:
     store = get_run_store()
     store.upsert_run(backtest_id, updates)
+
+
+def build_worker_status_updates(payload: dict[str, Any]) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    worker_status = payload.get("status")
+    if isinstance(worker_status, str) and worker_status:
+        updates["status"] = "completed" if worker_status == "succeeded" else worker_status
+    for field in ("pid", "started_at", "finished_at", "return_code", "error"):
+        value = payload.get(field)
+        if value is not None:
+            updates[field] = value
+    return updates
+
+
+def reconcile_active_run_entry(backtest_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    base_url = entry.get("backtest_api_base")
+    status = entry.get("status")
+    if status not in RECONCILEABLE_RUN_STATUSES:
+        return entry
+    if not isinstance(base_url, str) or not base_url:
+        return entry
+
+    try:
+        payload = fetch_backtest_status(base_url, backtest_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            updates = {
+                "status": "failed",
+                "last_error": "task_not_found_on_worker",
+                "last_error_at": utc_now(),
+            }
+            update_mapping(backtest_id, updates)
+            merged = dict(entry)
+            merged.update(updates)
+            logger.warning(
+                "get_run_reconciled_missing_worker_run backtest_id=%s base_url=%s stored_status=%s",
+                backtest_id,
+                base_url,
+                status,
+            )
+            return merged
+        logger.warning(
+            "get_run_reconcile_http_error backtest_id=%s base_url=%s status_code=%s",
+            backtest_id,
+            base_url,
+            exc.status_code,
+        )
+        return entry
+    except Exception as exc:
+        logger.warning(
+            "get_run_reconcile_failed backtest_id=%s base_url=%s error=%s",
+            backtest_id,
+            base_url,
+            exc,
+        )
+        return entry
+
+    updates = build_worker_status_updates(payload)
+    if not updates:
+        return entry
+
+    changed = any(entry.get(key) != value for key, value in updates.items())
+    if not changed:
+        return entry
+
+    update_mapping(backtest_id, updates)
+    merged = dict(entry)
+    merged.update(updates)
+    logger.info(
+        "get_run_reconciled backtest_id=%s stored_status=%s worker_status=%s",
+        backtest_id,
+        status,
+        merged.get("status"),
+    )
+    return merged
 
 
 def normalize_join_url(base_url: str, path: str) -> str:
@@ -1622,6 +1698,7 @@ async def get_run(backtest_id: str) -> JSONResponse:
     if not entry:
         logger.warning("get_run_not_found backtest_id=%s", backtest_id)
         raise HTTPException(status_code=404, detail="backtest_id not found")
+    entry = reconcile_active_run_entry(backtest_id, entry)
     payload = {"backtest_id": backtest_id, **entry}
     return JSONResponse(payload)
 
@@ -1811,4 +1888,7 @@ async def kill_backtest_run(backtest_id: str) -> JSONResponse:
 
     if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail="backtest kill invalid response")
+    updates = build_worker_status_updates(payload)
+    if updates:
+        update_mapping(backtest_id, updates)
     return JSONResponse(payload)

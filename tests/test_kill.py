@@ -84,7 +84,7 @@ class TestKillEndpoint(unittest.TestCase):
         self.assertEqual(updated_mappings["bt_queued"]["status"], "cancelled")
 
     def test_kill_success_proxies_response(self) -> None:
-        """When backtest docker returns success, proxy the response."""
+        """When backtest docker returns success, proxy the response and sync store."""
         mock_entry = {
             "status": "submitted",
             "backtest_api_base": "http://backtest-docker:8000",
@@ -93,19 +93,33 @@ class TestKillEndpoint(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps({
             "run_id": "run_123",
-            "status": "stopping",
-            "message": "Kill signal sent"
+            "status": "stopped",
+            "finished_at": "2026-03-20T00:14:57.787736Z",
+            "message": "Kill signal sent",
         }).encode("utf-8")
         mock_response.__enter__ = MagicMock(return_value=mock_response)
         mock_response.__exit__ = MagicMock(return_value=False)
+        updated_mappings = {}
+
+        def mock_update_mapping(bid, updates):
+            updated_mappings[bid] = updates
 
         with patch.object(app, "get_mapping_entry", return_value=mock_entry):
-            with patch("urllib.request.urlopen", return_value=mock_response):
-                response = self.client.post("/runs/backtest/bt_running/kill")
-                self.assertEqual(response.status_code, 200)
-                data = response.json()
-                self.assertEqual(data["run_id"], "run_123")
-                self.assertEqual(data["status"], "stopping")
+            with patch.object(app, "update_mapping", side_effect=mock_update_mapping):
+                with patch("urllib.request.urlopen", return_value=mock_response):
+                    response = self.client.post("/runs/backtest/bt_running/kill")
+                    self.assertEqual(response.status_code, 200)
+                    data = response.json()
+                    self.assertEqual(data["run_id"], "run_123")
+                    self.assertEqual(data["status"], "stopped")
+
+        self.assertEqual(
+            updated_mappings["bt_running"],
+            {
+                "status": "stopped",
+                "finished_at": "2026-03-20T00:14:57.787736Z",
+            },
+        )
 
     def test_kill_upstream_http_error_forwarded(self) -> None:
         """When backtest docker returns HTTP error, forward it."""
@@ -178,13 +192,84 @@ class TestKillEndpoint(unittest.TestCase):
             return mock_response
 
         with patch.object(app, "get_mapping_entry", return_value=mock_entry):
-            with patch("urllib.request.urlopen", side_effect=capture_request):
-                self.client.post("/runs/backtest/bt_123/kill")
+            with patch.object(app, "update_mapping"):
+                with patch("urllib.request.urlopen", side_effect=capture_request):
+                    self.client.post("/runs/backtest/bt_123/kill")
 
         self.assertIn("url", captured_request)
         self.assertIn("bt_123", captured_request["url"])
         self.assertIn("/kill", captured_request["url"])
         self.assertEqual(captured_request["method"], "POST")
+
+
+class TestGetRunReconcile(unittest.TestCase):
+    """Test /runs/{backtest_id} active-status reconciliation."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app.app)
+
+    def test_get_run_reconciles_stale_running_status_from_worker(self) -> None:
+        """Top-level run detail must sync stale active status from the worker."""
+        mock_entry = {
+            "status": "running",
+            "backtest_api_base": "http://backtest-docker:8000",
+        }
+        updated_mappings = {}
+
+        def mock_update_mapping(bid, updates):
+            updated_mappings[bid] = updates
+
+        worker_status = {
+            "status": "stopped",
+            "pid": 12345,
+            "started_at": "2026-03-19T23:24:44.000000Z",
+            "finished_at": "2026-03-20T00:14:57.787736Z",
+        }
+
+        with patch.object(app, "get_mapping_entry", return_value=mock_entry):
+            with patch.object(app, "fetch_backtest_status", return_value=worker_status):
+                with patch.object(app, "update_mapping", side_effect=mock_update_mapping):
+                    response = self.client.get("/runs/bt_running")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "stopped")
+        self.assertEqual(data["pid"], 12345)
+        self.assertEqual(
+            updated_mappings["bt_running"],
+            {
+                "status": "stopped",
+                "pid": 12345,
+                "started_at": "2026-03-19T23:24:44.000000Z",
+                "finished_at": "2026-03-20T00:14:57.787736Z",
+            },
+        )
+
+    def test_get_run_marks_missing_worker_run_failed(self) -> None:
+        """Top-level run detail must not stay running if the worker lost the run."""
+        mock_entry = {
+            "status": "running",
+            "backtest_api_base": "http://backtest-docker:8000",
+        }
+        updated_mappings = {}
+
+        def mock_update_mapping(bid, updates):
+            updated_mappings[bid] = updates
+
+        from fastapi import HTTPException
+
+        with patch.object(app, "get_mapping_entry", return_value=mock_entry):
+            with patch.object(app, "fetch_backtest_status", side_effect=HTTPException(status_code=404, detail="missing")):
+                with patch.object(app, "update_mapping", side_effect=mock_update_mapping):
+                    response = self.client.get("/runs/bt_missing")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["last_error"], "task_not_found_on_worker")
+        self.assertEqual(updated_mappings["bt_missing"]["status"], "failed")
+        self.assertEqual(updated_mappings["bt_missing"]["last_error"], "task_not_found_on_worker")
+        self.assertIn("last_error_at", updated_mappings["bt_missing"])
 
 
 if __name__ == "__main__":
